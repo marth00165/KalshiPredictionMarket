@@ -19,7 +19,7 @@ class APIConfig:
     
     claude_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
-    batch_size: int = 50
+    batch_size: int = 5
     api_cost_limit_per_cycle: float = 5.0
     
     def validate(self) -> None:

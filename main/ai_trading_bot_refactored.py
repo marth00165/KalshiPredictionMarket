@@ -23,6 +23,7 @@ import asyncio
 import time
 from datetime import datetime
 from typing import List, Optional
+from pathlib import Path
 
 import aiohttp
 
@@ -519,6 +520,59 @@ class AdvancedTradingBot:
         """
         
         self.cycle_count += 1
+
+        # Report container (written to JSON at end of cycle)
+        cycle_started_at = datetime.now().isoformat()
+        report: dict = {
+            "cycle": self.cycle_count,
+            "started_at": cycle_started_at,
+            "finished_at": None,
+            "config": {
+                "analysis_provider": self.config.analysis_provider,
+                "dry_run": self.config.is_dry_run,
+                "api": {
+                    "batch_size": self.config.api.batch_size,
+                    "api_cost_limit_per_cycle": self.config.api.api_cost_limit_per_cycle,
+                },
+                "platforms": {
+                    "polymarket": {
+                        "enabled": self.config.platforms.polymarket.enabled,
+                        "max_markets": self.config.platforms.polymarket.max_markets,
+                    },
+                    "kalshi": {
+                        "enabled": self.config.platforms.kalshi.enabled,
+                        "max_markets": self.config.platforms.kalshi.max_markets,
+                    },
+                },
+                "filters": {
+                    "min_volume": self.config.filters.min_volume,
+                    "min_liquidity": self.config.filters.min_liquidity,
+                    "price_bounds": {"min": 0.01, "max": 0.99},
+                },
+                "strategy": {
+                    "min_edge": self.config.strategy.min_edge,
+                    "min_confidence": self.config.strategy.min_confidence,
+                },
+                "risk": {
+                    "max_kelly_fraction": self.config.risk.max_kelly_fraction,
+                    "max_positions": self.config.risk.max_positions,
+                    "max_position_size": self.config.risk.max_position_size,
+                },
+            },
+            "counts": {
+                "scanned": 0,
+                "passed_filters": 0,
+                "analyzed": 0,
+                "estimates": 0,
+                "opportunities": 0,
+                "signals": 0,
+                "executed": 0,
+            },
+            "api_cost": None,
+            "markets": [],
+            "signals": [],
+            "errors": [],
+        }
         
         logger.info("=" * 80)
         logger.info(f"🤖 CYCLE {self.cycle_count}: STARTING TRADING CYCLE")
@@ -528,11 +582,48 @@ class AdvancedTradingBot:
         cycle_report = self.error_reporter.create_report(
             f"Trading Cycle #{self.cycle_count}"
         )
+
+        markets: List[MarketData] = []
+        filtered: List[MarketData] = []
+        analyzed_markets: List[MarketData] = []
+        estimates: List[FairValueEstimate] = []
+        opportunities = []
+        signals: List[TradeSignal] = []
+        execution_results: List[bool] = []
         
         try:
             # Step 1: Scan markets
             logger.info("\n📊 Step 1: Scanning markets...")
             markets = await self.scanner.scan_all_markets()
+
+            # Initialize market rows for report
+            market_rows_by_id = {}
+            for m in markets:
+                evaluation = self.strategy.evaluate_market_filters(m)
+                row = {
+                    "market_id": m.market_id,
+                    "platform": m.platform,
+                    "title": m.title,
+                    "description": m.description,
+                    "category": m.category,
+                    "end_date": str(m.end_date),
+                    "prices": {
+                        "yes": m.yes_price,
+                        "no": m.no_price,
+                    },
+                    "stats": {
+                        "volume": m.volume,
+                        "liquidity": m.liquidity,
+                    },
+                    "filters": evaluation,
+                    "analysis": None,
+                    "opportunity": None,
+                    "signal": None,
+                    "execution": None,
+                }
+                market_rows_by_id[m.market_id] = row
+            report["markets"] = list(market_rows_by_id.values())
+            report["counts"]["scanned"] = len(markets)
             
             if not markets:
                 logger.warning("No markets found, aborting cycle")
@@ -542,6 +633,7 @@ class AdvancedTradingBot:
             logger.info("\n🔬 Step 2: Filtering markets...")
             filtered = self.strategy.filter_markets(markets)
             logger.info(f"   {len(filtered)} markets passed filters")
+            report["counts"]["passed_filters"] = len(filtered)
             
             # Step 3: Analyze with LLM (in batches)
             provider = (self.config.analysis_provider or "claude").strip().lower()
@@ -549,9 +641,6 @@ class AdvancedTradingBot:
 
             batch_size = max(1, int(self.config.api.batch_size))
             cost_limit = float(self.config.api.api_cost_limit_per_cycle)
-
-            analyzed_markets: List[MarketData] = []
-            estimates: List[FairValueEstimate] = []
 
             total_batches = (len(filtered) + batch_size - 1) // batch_size
             for batch_index in range(total_batches):
@@ -568,6 +657,22 @@ class AdvancedTradingBot:
                 estimates.extend(batch_estimates)
                 analyzed_markets.extend(batch)
 
+                report["counts"]["analyzed"] = len(analyzed_markets)
+                report["counts"]["estimates"] = len(estimates)
+
+                # Attach estimates onto market rows as they arrive
+                for est in batch_estimates:
+                    row = market_rows_by_id.get(est.market_id)
+                    if row is not None:
+                        row["analysis"] = {
+                            "estimated_probability": est.estimated_probability,
+                            "confidence": est.confidence_level,
+                            "edge": est.edge,
+                            "reasoning": est.reasoning,
+                            "key_factors": est.key_factors,
+                            "data_sources": est.data_sources,
+                        }
+
                 # Stop early if we hit the configured API spend limit.
                 try:
                     stats = self.analyzer.get_api_stats()
@@ -581,6 +686,12 @@ class AdvancedTradingBot:
                         "Stopping analysis early."
                     )
                     break
+
+            # Snapshot cost stats if available
+            try:
+                report["api_cost"] = self.analyzer.get_api_stats()
+            except Exception:
+                report["api_cost"] = None
             
             if not estimates:
                 logger.warning("No estimates generated")
@@ -589,10 +700,20 @@ class AdvancedTradingBot:
             # Step 4: Find mispricings
             logger.info("\n💰 Step 4: Finding mispricings...")
             opportunities = self.strategy.find_opportunities(estimates, analyzed_markets)
+            report["counts"]["opportunities"] = len(opportunities)
             logger.info(
                 f"   Found {len(opportunities)} opportunities with "
                 f">{self.config.min_edge_percentage:.0f}% edge"
             )
+
+            for market, est in opportunities:
+                row = market_rows_by_id.get(market.market_id)
+                if row is not None:
+                    row["opportunity"] = {
+                        "edge": est.edge,
+                        "confidence": est.confidence_level,
+                        "estimated_probability": est.estimated_probability,
+                    }
             
             # Step 5: Generate trade signals
             logger.info("\n📐 Step 5: Calculating position sizes (Kelly)...")
@@ -608,6 +729,27 @@ class AdvancedTradingBot:
                     cycle_report, e, "signal generation"
                 )
                 signals = []
+
+            report["counts"]["signals"] = len(signals)
+
+            # Attach signals to markets and keep a list
+            for s in signals:
+                row = market_rows_by_id.get(s.market.market_id)
+                signal_row = {
+                    "market_id": s.market.market_id,
+                    "platform": s.market.platform,
+                    "action": s.action,
+                    "fair_value": s.fair_value,
+                    "market_price": s.market_price,
+                    "edge": s.edge,
+                    "kelly_fraction": s.kelly_fraction,
+                    "position_size": s.position_size,
+                    "expected_value": s.expected_value,
+                    "reasoning": s.reasoning,
+                }
+                report["signals"].append(signal_row)
+                if row is not None:
+                    row["signal"] = signal_row
             
             # Step 6: Execute trades
             logger.info("\n⚡ Step 6: Executing trades...")
@@ -624,14 +766,28 @@ class AdvancedTradingBot:
                 
                 # Execute trades
                 try:
-                    results = await self.executor.execute_signals(signals)
-                    successful = sum(results)
+                    execution_results = await self.executor.execute_signals(signals)
+                    successful = sum(execution_results)
                     logger.info(f"Executed {successful}/{len(signals)} trades")
+                    report["counts"]["executed"] = int(successful)
+
+                    for s, ok in zip(signals, execution_results):
+                        row = market_rows_by_id.get(s.market.market_id)
+                        if row is not None:
+                            row["execution"] = {
+                                "success": bool(ok),
+                                "dry_run": self.config.is_dry_run,
+                            }
                 except ExecutionError as e:
                     logger.error(f"Execution error: {e}")
                     self.error_reporter.add_error_to_report(
                         cycle_report, e, "trade execution"
                     )
+                    report["errors"].append({
+                        "type": type(e).__name__,
+                        "message": str(e),
+                        "stage": "trade execution",
+                    })
             else:
                 logger.info("No signals to execute")
             
@@ -644,8 +800,27 @@ class AdvancedTradingBot:
             self.error_reporter.add_error_to_report(
                 cycle_report, e, "trading cycle"
             )
+
+            report["errors"].append({
+                "type": type(e).__name__,
+                "message": str(e),
+                "stage": "trading cycle",
+            })
         
         finally:
+            # Finish and write JSON report
+            report["finished_at"] = datetime.now().isoformat()
+            try:
+                reports_dir = Path(__file__).resolve().parent.parent / "reports"
+                reports_dir.mkdir(parents=True, exist_ok=True)
+
+                safe_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                report_path = reports_dir / f"cycle_{self.cycle_count}_{safe_ts}.json"
+                report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+                logger.info(f"🧾 Wrote cycle report: {report_path}")
+            except Exception as e:
+                logger.warning(f"Failed to write JSON report: {e}")
+
             # Log any errors from this cycle
             cycle_report.log_summary()
             if cycle_report.has_errors():

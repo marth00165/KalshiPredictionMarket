@@ -122,6 +122,34 @@ class Strategy:
         
         logger.debug(f"Filtered {len(markets)} → {len(filtered)} markets")
         return filtered
+
+    def evaluate_market_filters(self, market: MarketData) -> dict:
+        """Return detailed filter pass/fail info for a single market."""
+        min_volume = self.config.filters.min_volume
+        min_liquidity = self.config.filters.min_liquidity
+
+        volume_ok = market.volume >= min_volume
+        liquidity_ok = market.liquidity >= min_liquidity
+        price_ok = 0.01 < market.yes_price < 0.99
+
+        passed = bool(volume_ok and liquidity_ok and price_ok)
+        reasons = []
+        if not volume_ok:
+            reasons.append(f"volume<{min_volume}")
+        if not liquidity_ok:
+            reasons.append(f"liquidity<{min_liquidity}")
+        if not price_ok:
+            reasons.append("price_out_of_bounds")
+
+        return {
+            "passed": passed,
+            "checks": {
+                "volume_ok": volume_ok,
+                "liquidity_ok": liquidity_ok,
+                "price_ok": price_ok,
+            },
+            "reasons": reasons,
+        }
     
     # ========================================================================
     # OPPORTUNITY FINDING
