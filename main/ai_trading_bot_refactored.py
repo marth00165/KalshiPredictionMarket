@@ -24,6 +24,8 @@ import time
 from datetime import datetime
 from typing import List, Optional
 
+import aiohttp
+
 # Import configuration management
 from utils.config_manager import ConfigManager
 
@@ -197,22 +199,117 @@ Think step-by-step and be thorough."""
     
     async def _call_claude_api(self, prompt: str) -> dict:
         """
-        Call Claude API with prompt
+        Call Claude API with prompt using BaseAPIClient
         
-        Note: This is a placeholder. Real implementation would use
-        the actual Claude API with aiohttp session from base_client.
+        Args:
+            prompt: Market analysis prompt for Claude
+        
+        Returns:
+            Dictionary with 'content_text' key containing Claude's response
+        
+        Raises:
+            APIError: If API call fails after retries
         """
-        logger.warning("⚠️  Claude API call stubbed - implement with actual API")
         
-        # Placeholder response
-        return {
-            'content_text': json.dumps({
-                'probability': 50,
-                'confidence': 50,
-                'reasoning': 'Placeholder analysis',
-                'data_sources': []
-            })
+        # Ensure session is initialized
+        if not self.client.session:
+            logger.error("Claude client session not initialized")
+            raise RuntimeError("Cannot call Claude API without initialized session")
+        
+        # Build Claude API payload
+        payload = {
+            "model": self.config.claude.model,
+            "max_tokens": self.config.claude.max_tokens,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": self.config.claude.temperature
         }
+        
+        # Build URL and headers
+        url = f"{self.client.base_url}/messages"
+        headers = self.client._build_headers(
+            auth_type="x-api-key",
+            additional_headers={
+                "anthropic-version": "2023-06-01"
+            }
+        )
+        
+        logger.debug(f"Calling Claude API: {self.config.claude.model}")
+        
+        # Make API call with retry logic
+        async def make_request():
+            async with self.client.session.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=self.client.timeout_seconds)
+            ) as response:
+                # Check for HTTP errors
+                await self.client._handle_response_status(response)
+                return await response.json()
+        
+        try:
+            response = await self.client._call_with_retry(
+                make_request,
+                operation_name="Claude API analysis"
+            )
+            
+            # Track API usage/cost
+            if 'usage' in response:
+                self.client.record_usage(
+                    operation="Market analysis",
+                    input_tokens=response['usage'].get('input_tokens', 0),
+                    output_tokens=response['usage'].get('output_tokens', 0)
+                )
+                
+                logger.debug(
+                    f"Claude usage: "
+                    f"{response['usage'].get('input_tokens', 0)} in, "
+                    f"{response['usage'].get('output_tokens', 0)} out"
+                )
+            
+            # Extract text from Claude response format
+            # Claude returns: {"content": [{"type": "text", "text": "..."}], "usage": {...}}
+            content = response.get('content', [])
+            if not content:
+                logger.error(f"No content in Claude response: {response}")
+                raise APIError(
+                    platform="claude",
+                    operation="Parse response",
+                    message="Empty content array in response"
+                )
+            
+            text = content[0].get('text', '')
+            
+            if not text:
+                logger.error("No text in Claude response content")
+                raise APIError(
+                    platform="claude",
+                    operation="Parse response",
+                    message="Empty text in response"
+                )
+            
+            logger.debug(f"Claude response received: {len(text)} characters")
+            
+            return {
+                'content_text': text,
+                'usage': response.get('usage', {})
+            }
+        
+        except APIError as e:
+            logger.error(f"Claude API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error calling Claude API: {e}")
+            raise APIError(
+                platform="claude",
+                operation="API call",
+                message=str(e)
+            )
     
     def get_api_stats(self) -> dict:
         """Get API usage statistics from cost tracker"""

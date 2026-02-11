@@ -35,6 +35,7 @@ python main/ai_trading_bot_refactored.py
 ```
 
 In **dry-run mode**:
+
 - ✅ Scans all markets from Polymarket and Kalshi
 - ✅ Analyzes with Claude AI (costs money for API calls)
 - ✅ Generates trade signals with position sizing
@@ -106,13 +107,13 @@ Key settings in `advanced_config.json`:
 
 ### Dry-Run vs Live Mode
 
-| Phase | Dry-Run | Live |
-|-------|---------|------|
-| Market Scanning | ✅ Real data | ✅ Real data |
-| Claude Analysis | ✅ Real calls | ✅ Real calls |
-| Signal Generation | ✅ Normal | ✅ Normal |
+| Phase               | Dry-Run        | Live               |
+| ------------------- | -------------- | ------------------ |
+| Market Scanning     | ✅ Real data   | ✅ Real data       |
+| Claude Analysis     | ✅ Real calls  | ✅ Real calls      |
+| Signal Generation   | ✅ Normal      | ✅ Normal          |
 | **Trade Execution** | **❌ Blocked** | **✅ Places bets** |
-| Money Risk | None | **Real money!** |
+| Money Risk          | None           | **Real money!**    |
 
 **Safe Workflow**: Always test with `dry_run: true` first, then change one flag to go live.
 
