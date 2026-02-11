@@ -72,6 +72,11 @@ class ClaudeAnalyzer:
     def __init__(self, config: Dict):
         self.api_url = "https://api.anthropic.com/v1/messages"
         self.model = "claude-sonnet-4-20250514"
+        self.api_key = config.get('api', {}).get('claude_api_key')
+        
+        if not self.api_key:
+            raise ValueError("Claude API key not found in config. Add 'claude_api_key' to config['api']")
+        
         self.total_api_cost = 0.0
         self.requests_made = 0
         
@@ -173,7 +178,10 @@ Think step-by-step and be thorough."""
         
         async with session.post(
             self.api_url,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": self.api_key
+            },
             json=payload
         ) as response:
             data = await response.json()
@@ -313,6 +321,10 @@ class MarketScanner:
         self.config = config
         self.polymarket_url = "https://gamma-api.polymarket.com"
         self.kalshi_url = "https://api.elections.kalshi.com/trade-api/v2"
+        
+        # Extract API keys
+        self.polymarket_key = config.get('platforms', {}).get('polymarket', {}).get('api_key')
+        self.kalshi_key = config.get('platforms', {}).get('kalshi', {}).get('api_key')
     
     async def scan_all_markets(self) -> List[MarketData]:
         """Scan all markets from both platforms"""
@@ -357,7 +369,11 @@ class MarketScanner:
                     'closed': 'false'
                 }
                 
-                async with session.get(url, params=params) as response:
+                headers = {}
+                if self.polymarket_key:
+                    headers['Authorization'] = f"Bearer {self.polymarket_key}"
+                
+                async with session.get(url, params=params, headers=headers) as response:
                     data = await response.json()
                     
                     if not data:
@@ -413,7 +429,11 @@ class MarketScanner:
                 if cursor:
                     params['cursor'] = cursor
                 
-                async with session.get(url, params=params) as response:
+                headers = {}
+                if self.kalshi_key:
+                    headers['Authorization'] = f"Bearer {self.kalshi_key}"
+                
+                async with session.get(url, params=params, headers=headers) as response:
                     data = await response.json()
                     
                     market_list = data.get('markets', [])
@@ -462,7 +482,11 @@ class MarketScanner:
         
         try:
             url = f"{self.kalshi_url}/markets/{ticker}/orderbook"
-            async with session.get(url) as response:
+            headers = {}
+            if self.kalshi_key:
+                headers['Authorization'] = f"Bearer {self.kalshi_key}"
+            
+            async with session.get(url, headers=headers) as response:
                 data = await response.json()
                 
                 orderbook = data.get('orderbook', {})
