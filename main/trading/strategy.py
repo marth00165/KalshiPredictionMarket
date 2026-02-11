@@ -3,8 +3,8 @@
 import logging
 from typing import List, Tuple
 
-from ..models import MarketData, FairValueEstimate, TradeSignal
-from ..utils import (
+from models import MarketData, FairValueEstimate, TradeSignal
+from utils import (
     ConfigManager,
     InsufficientCapitalError,
     NoOpportunitiesError,

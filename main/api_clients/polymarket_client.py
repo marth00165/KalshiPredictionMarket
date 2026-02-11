@@ -112,15 +112,16 @@ class PolymarketClient(BaseAPIClient):
             return parsed_markets, next_offset
         
         headers = self._build_headers()
-        
-        markets = await self._get_paginated(
-            url=url,
-            params_builder=params_builder,
-            response_parser=response_parser,
-            max_items=self.config.max_markets,
-            pagination_type="offset",
-            headers=headers
-        )
+
+        async with self:
+            markets = await self._get_paginated(
+                url=url,
+                params_builder=params_builder,
+                response_parser=response_parser,
+                max_items=self.config.max_markets,
+                pagination_type="offset",
+                headers=headers
+            )
         
         logger.info(f"[polymarket] Successfully fetched {len(markets)} markets")
         return markets

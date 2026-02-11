@@ -241,7 +241,8 @@ class BaseAPIClient:
         self,
         api_key: Optional[str] = None,
         auth_type: str = "Bearer",
-        additional_headers: Optional[Dict[str, str]] = None
+        additional_headers: Optional[Dict[str, str]] = None,
+        auth_header_name: str = "Authorization",
     ) -> Dict[str, str]:
         """
         Build HTTP headers with optional authentication
@@ -261,7 +262,14 @@ class BaseAPIClient:
         # Add authentication if provided
         key_to_use = api_key or self.api_key
         if key_to_use:
-            headers["Authorization"] = f"{auth_type} {key_to_use}"
+            if auth_header_name == "Authorization":
+                headers[auth_header_name] = f"{auth_type} {key_to_use}".strip()
+            else:
+                # For APIs that use non-Authorization headers (e.g., 'x-api-key')
+                if auth_type:
+                    headers[auth_header_name] = f"{auth_type} {key_to_use}".strip()
+                else:
+                    headers[auth_header_name] = str(key_to_use)
         
         # Merge additional headers
         if additional_headers:
@@ -418,6 +426,7 @@ class BaseAPIClient:
             
             # Make request with retry
             async def fetch_page():
+                nonlocal request_count
                 request_headers = headers or self._build_headers()
                 async with self.session.get(url, params=params, headers=request_headers, **kwargs) as response:
                     # Check for errors

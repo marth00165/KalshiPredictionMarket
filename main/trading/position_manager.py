@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any
 from datetime import datetime
 
-from ..models import TradeSignal
-from ..utils import (
+from models import TradeSignal
+from utils import (
     PositionNotFoundError,
     PositionAlreadyClosedError,
     InsufficientBankrollError,

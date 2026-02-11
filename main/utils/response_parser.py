@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Dict, Any, Optional
 
-from ..models import MarketData, FairValueEstimate
+from models import MarketData, FairValueEstimate
 
 logger = logging.getLogger(__name__)
 

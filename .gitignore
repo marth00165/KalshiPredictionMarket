@@ -216,3 +216,8 @@ config_with_keys.json
 *.log
 trades_*.json
 performance_*.json
+
+# kalshi_private_key.txt
+kalshi_private_key.txt
+tradingAnalyzer_private_key.txt
+tradingAnalyzer.txt

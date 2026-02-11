@@ -3,8 +3,8 @@
 import logging
 from typing import List
 
-from ..models import TradeSignal
-from ..utils import (
+from models import TradeSignal
+from utils import (
     ConfigManager,
     ExecutionFailedError,
     OrderPlacementError,
@@ -95,7 +95,13 @@ class TradeExecutor:
         self._log_signal(signal)
         
         if self.dry_run:
-            raise DryRunError(f"Not executing real trade for {signal.market.market_id}")
+            # Simulate success without placing a real order.
+            self.executed_trades.append(signal)
+            logger.info(
+                f"DRY RUN: would execute {signal.action} on {signal.market.platform} "
+                f"for {signal.market.market_id} (${signal.position_size:,.2f})"
+            )
+            return True
         
         try:
             success = await self._execute_on_platform(signal)

@@ -17,16 +17,13 @@ logger = logging.getLogger(__name__)
 class APIConfig:
     """Configuration for API services (Claude, etc.)"""
     
-    claude_api_key: str
+    claude_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
     batch_size: int = 50
     api_cost_limit_per_cycle: float = 5.0
     
     def validate(self) -> None:
         """Validate API configuration"""
-        if not self.claude_api_key or self.claude_api_key.startswith("sk-ant-YOUR_"):
-            raise ValueError(
-                "Invalid claude_api_key: Please set your actual Claude API key in config"
-            )
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
         if self.api_cost_limit_per_cycle < 0:
@@ -34,12 +31,51 @@ class APIConfig:
 
 
 @dataclass
+class AnalysisConfig:
+    """Configuration for selecting which LLM provider performs analysis"""
+
+    provider: str = "claude"  # "claude" or "openai"
+    allow_runtime_override: bool = True
+
+    def validate(self) -> None:
+        provider_normalized = (self.provider or "").strip().lower()
+        if provider_normalized not in {"claude", "openai"}:
+            raise ValueError(f"provider must be 'claude' or 'openai', got {self.provider!r}")
+        self.provider = provider_normalized
+
+
+@dataclass
+class OpenAIConfig:
+    """Configuration for OpenAI models"""
+
+    model: str = "gpt-4o-mini"
+    temperature: float = 0.3
+    max_tokens: int = 1000
+    base_url: str = "https://api.openai.com/v1"
+    input_cost_per_mtok: float = 0.0
+    output_cost_per_mtok: float = 0.0
+
+    def validate(self) -> None:
+        if not self.model:
+            raise ValueError("model name cannot be empty")
+        if not (0 <= self.temperature <= 2):
+            raise ValueError(f"temperature must be between 0 and 2, got {self.temperature}")
+        if self.max_tokens < 1:
+            raise ValueError(f"max_tokens must be >= 1, got {self.max_tokens}")
+        if not self.base_url:
+            raise ValueError("base_url cannot be empty")
+        if self.input_cost_per_mtok < 0 or self.output_cost_per_mtok < 0:
+            raise ValueError("Pricing costs cannot be negative")
+
+
+@dataclass
 class PlatformConfig:
     """Configuration for a single prediction market platform"""
     
     api_key: Optional[str] = None
+    private_key_file: Optional[str] = None
     enabled: bool = True
-    max_markets: int = 500
+    max_markets: int = 25
     
     def validate(self) -> None:
         """Validate platform configuration"""
@@ -181,18 +217,42 @@ class ConfigManager:
     
     def _parse_config(self, raw_config: Dict[str, Any]) -> None:
         """Parse raw JSON config into typed dataclasses"""
+
+        # Analysis provider selection
+        analysis_raw = raw_config.get('analysis', {})
+        self.analysis = AnalysisConfig(
+            provider=analysis_raw.get('provider', 'claude'),
+            allow_runtime_override=analysis_raw.get('allow_runtime_override', True),
+        )
+        try:
+            self.analysis.validate()
+        except ValueError as e:
+            raise ValueError(f"Invalid analysis config: {e}")
         
         # API configuration (required)
         api_raw = raw_config.get('api', {})
         try:
             self.api = APIConfig(
-                claude_api_key=api_raw.get('claude_api_key', ''),
+                claude_api_key=api_raw.get('claude_api_key'),
+                openai_api_key=api_raw.get('openai_api_key'),
                 batch_size=api_raw.get('batch_size', 50),
                 api_cost_limit_per_cycle=api_raw.get('api_cost_limit_per_cycle', 5.0),
             )
             self.api.validate()
         except ValueError as e:
             raise ValueError(f"Invalid API config: {e}")
+
+        # Provider-specific key validation
+        if self.analysis.provider == 'claude':
+            if not self.api.claude_api_key or str(self.api.claude_api_key).startswith('sk-ant-YOUR_'):
+                raise ValueError(
+                    "Invalid claude_api_key: Please set your actual Claude API key in config"
+                )
+        elif self.analysis.provider == 'openai':
+            if not self.api.openai_api_key or str(self.api.openai_api_key).startswith('sk-proj-YOUR_'):
+                raise ValueError(
+                    "Invalid openai_api_key: Please set your actual OpenAI API key in config"
+                )
         
         # Claude configuration
         claude_raw = raw_config.get('claude', {})
@@ -207,6 +267,21 @@ class ConfigManager:
             self.claude.validate()
         except ValueError as e:
             raise ValueError(f"Invalid Claude config: {e}")
+
+        # OpenAI configuration
+        openai_raw = raw_config.get('openai', {})
+        self.openai = OpenAIConfig(
+            model=openai_raw.get('model', 'gpt-4o-mini'),
+            temperature=openai_raw.get('temperature', 0.3),
+            max_tokens=openai_raw.get('max_tokens', 1000),
+            base_url=openai_raw.get('base_url', 'https://api.openai.com/v1'),
+            input_cost_per_mtok=openai_raw.get('input_cost_per_mtok', 0.0),
+            output_cost_per_mtok=openai_raw.get('output_cost_per_mtok', 0.0),
+        )
+        try:
+            self.openai.validate()
+        except ValueError as e:
+            raise ValueError(f"Invalid OpenAI config: {e}")
         
         # Platforms configuration
         platforms_raw = raw_config.get('platforms', {})
@@ -216,11 +291,13 @@ class ConfigManager:
         self.platforms = PlatformsConfig(
             polymarket=PlatformConfig(
                 api_key=polymarket_raw.get('api_key'),
+                private_key_file=polymarket_raw.get('private_key_file'),
                 enabled=polymarket_raw.get('enabled', True),
                 max_markets=polymarket_raw.get('max_markets', 500),
             ),
             kalshi=PlatformConfig(
                 api_key=kalshi_raw.get('api_key'),
+                private_key_file=kalshi_raw.get('private_key_file'),
                 enabled=kalshi_raw.get('enabled', True),
                 max_markets=kalshi_raw.get('max_markets', 500),
             ),
@@ -284,7 +361,26 @@ class ConfigManager:
     @property
     def claude_api_key(self) -> str:
         """Get Claude API key"""
-        return self.api.claude_api_key
+        if not self.api.claude_api_key:
+            raise ValueError("Claude API key not configured")
+        return str(self.api.claude_api_key)
+
+    @property
+    def openai_api_key(self) -> str:
+        """Get OpenAI API key"""
+        if not self.api.openai_api_key:
+            raise ValueError("OpenAI API key not configured")
+        return str(self.api.openai_api_key)
+
+    @property
+    def analysis_provider(self) -> str:
+        """Get analysis provider ('claude' or 'openai')"""
+        return self.analysis.provider
+
+    @property
+    def allow_runtime_override(self) -> bool:
+        """Whether runtime analyzer override is allowed"""
+        return self.analysis.allow_runtime_override
     
     @property
     def polymarket_enabled(self) -> bool:

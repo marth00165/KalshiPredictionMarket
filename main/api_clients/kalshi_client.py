@@ -109,28 +109,29 @@ class KalshiClient(BaseAPIClient):
             return parsed_markets, next_cursor
         
         headers = self._build_headers()
-        
-        markets = await self._get_paginated(
-            url=url,
-            params_builder=params_builder,
-            response_parser=response_parser,
-            max_items=self.config.max_markets,
-            pagination_type="cursor",
-            headers=headers
-        )
-        
-        # Fetch prices for each market (TODO: optimize with batch price fetching)
-        for market in markets:
-            try:
-                ticker = market['market_id']
-                yes_price = await self._get_market_price(ticker)
-                market['yes_price'] = yes_price
-                market['no_price'] = 1 - yes_price
-            except Exception as e:
-                logger.warning(f"[kalshi] Failed to fetch price for {market.get('market_id')}: {e}")
-                # Use default prices
-                market['yes_price'] = 0.5
-                market['no_price'] = 0.5
+
+        async with self:
+            markets = await self._get_paginated(
+                url=url,
+                params_builder=params_builder,
+                response_parser=response_parser,
+                max_items=self.config.max_markets,
+                pagination_type="cursor",
+                headers=headers
+            )
+
+            # Fetch prices for each market (TODO: optimize with batch price fetching)
+            for market in markets:
+                try:
+                    ticker = market['market_id']
+                    yes_price = await self._get_market_price(ticker)
+                    market['yes_price'] = yes_price
+                    market['no_price'] = 1 - yes_price
+                except Exception as e:
+                    logger.warning(f"[kalshi] Failed to fetch price for {market.get('market_id')}: {e}")
+                    # Use default prices
+                    market['yes_price'] = 0.5
+                    market['no_price'] = 0.5
         
         logger.info(f"[kalshi] Successfully fetched {len(markets)} markets with prices")
         return markets

@@ -53,6 +53,9 @@ from utils import (
     ExecutionError,
 )
 
+# Import analysis providers
+from analysis import OpenAIAnalyzer
+
 # Import trading modules
 from trading import PositionManager, Strategy, TradeExecutor
 
@@ -107,11 +110,12 @@ class ClaudeAnalyzer:
         Returns:
             List of FairValueEstimate objects
         """
-        tasks = [
-            self.analyze_single_market(market)
-            for market in markets
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        async with self.client:
+            tasks = [
+                self.analyze_single_market(market)
+                for market in markets
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
         
         # Filter out errors and None results
         valid_results = [
@@ -232,7 +236,8 @@ Think step-by-step and be thorough."""
         # Build URL and headers
         url = f"{self.client.base_url}/messages"
         headers = self.client._build_headers(
-            auth_type="x-api-key",
+            auth_type="",
+            auth_header_name="x-api-key",
             additional_headers={
                 "anthropic-version": "2023-06-01"
             }
@@ -465,7 +470,7 @@ class AdvancedTradingBot:
         
         # Initialize components
         self.scanner = MarketScanner(self.config)
-        self.analyzer = ClaudeAnalyzer(self.config)
+        self.analyzer = self._create_analyzer(self.config.analysis_provider)
         self.strategy = Strategy(self.config)
         self.position_manager = PositionManager(
             self.config.trading.initial_bankroll
@@ -477,6 +482,27 @@ class AdvancedTradingBot:
         
         # Cycle counter
         self.cycle_count = 0
+
+    def _create_analyzer(self, provider: str):
+        provider_norm = (provider or "").strip().lower()
+        if provider_norm == "openai":
+            return OpenAIAnalyzer(self.config)
+        return ClaudeAnalyzer(self.config)
+
+    def set_analysis_provider(self, provider: str) -> None:
+        """Switch analysis provider before a scan begins."""
+        provider_norm = (provider or "").strip().lower()
+        if provider_norm not in {"claude", "openai"}:
+            raise ValueError(f"Unknown analysis provider: {provider}")
+
+        # Validate key availability for chosen provider
+        if provider_norm == "openai":
+            _ = self.config.openai_api_key
+        else:
+            _ = self.config.claude_api_key
+
+        self.config.analysis.provider = provider_norm
+        self.analyzer = self._create_analyzer(provider_norm)
     
     async def run_trading_cycle(self):
         """
@@ -517,9 +543,44 @@ class AdvancedTradingBot:
             filtered = self.strategy.filter_markets(markets)
             logger.info(f"   {len(filtered)} markets passed filters")
             
-            # Step 3: Analyze with Claude (in batches)
-            logger.info("\n🧠 Step 3: Analyzing with Claude AI...")
-            estimates = await self.analyzer.analyze_market_batch(filtered)
+            # Step 3: Analyze with LLM (in batches)
+            provider = (self.config.analysis_provider or "claude").strip().lower()
+            logger.info(f"\n🧠 Step 3: Analyzing with {provider}...")
+
+            batch_size = max(1, int(self.config.api.batch_size))
+            cost_limit = float(self.config.api.api_cost_limit_per_cycle)
+
+            analyzed_markets: List[MarketData] = []
+            estimates: List[FairValueEstimate] = []
+
+            total_batches = (len(filtered) + batch_size - 1) // batch_size
+            for batch_index in range(total_batches):
+                start = batch_index * batch_size
+                batch = filtered[start:start + batch_size]
+                if not batch:
+                    break
+
+                logger.info(
+                    f"   Batch {batch_index + 1}/{total_batches}: analyzing {len(batch)} markets"
+                )
+
+                batch_estimates = await self.analyzer.analyze_market_batch(batch)
+                estimates.extend(batch_estimates)
+                analyzed_markets.extend(batch)
+
+                # Stop early if we hit the configured API spend limit.
+                try:
+                    stats = self.analyzer.get_api_stats()
+                    total_cost = float(stats.get('total_cost', 0.0))
+                except Exception:
+                    total_cost = 0.0
+
+                if cost_limit > 0 and total_cost >= cost_limit:
+                    logger.warning(
+                        f"API cost limit reached: ${total_cost:.2f} >= ${cost_limit:.2f}. "
+                        "Stopping analysis early."
+                    )
+                    break
             
             if not estimates:
                 logger.warning("No estimates generated")
@@ -527,7 +588,7 @@ class AdvancedTradingBot:
             
             # Step 4: Find mispricings
             logger.info("\n💰 Step 4: Finding mispricings...")
-            opportunities = self.strategy.find_opportunities(estimates, filtered)
+            opportunities = self.strategy.find_opportunities(estimates, analyzed_markets)
             logger.info(
                 f"   Found {len(opportunities)} opportunities with "
                 f">{self.config.min_edge_percentage:.0f}% edge"
@@ -634,6 +695,21 @@ async def main():
     
     try:
         bot = AdvancedTradingBot('advanced_config.json')
+
+        # Optional: choose analysis provider before any scan
+        if bot.config.allow_runtime_override:
+            default_provider = bot.config.analysis_provider
+            choice = input(
+                "\nAnalysis provider:\n"
+                f"1. Claude (default: {default_provider})\n"
+                "2. OpenAI\n\n"
+                "Choice (Enter to keep default): "
+            ).strip()
+
+            if choice == '1':
+                bot.set_analysis_provider('claude')
+            elif choice == '2':
+                bot.set_analysis_provider('openai')
         
         # Run once or continuously
         mode = input(
