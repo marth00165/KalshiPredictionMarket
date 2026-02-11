@@ -6,6 +6,11 @@ from typing import List, Dict, Any
 from datetime import datetime
 
 from ..models import TradeSignal
+from ..utils import (
+    PositionNotFoundError,
+    PositionAlreadyClosedError,
+    InsufficientBankrollError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +81,18 @@ class PositionManager:
         
         Returns:
             Trade object representing the opened position
+        
+        Raises:
+            InsufficientBankrollError: If position size exceeds available bankroll
         """
+        
+        # Validate sufficient bankroll
+        if signal.position_size > self.current_bankroll:
+            raise InsufficientBankrollError(
+                position_size=signal.position_size,
+                bankroll=self.current_bankroll
+            )
+        
         # Determine entry price based on action
         if signal.action in ('buy_yes', 'sell_no'):
             entry_price = signal.market.yes_price
@@ -109,17 +125,20 @@ class PositionManager:
             Closed Trade object with result recorded
         
         Raises:
-            ValueError: If no open position found for market_id
+            PositionNotFoundError: If no open position found for market_id
+            PositionAlreadyClosedError: If position is already closed
         """
         # Find position
         position = None
         for p in self.open_positions:
-            if p.market_id == market_id and not p.closed:
+            if p.market_id == market_id:
+                if p.closed:
+                    raise PositionAlreadyClosedError(market_id)
                 position = p
                 break
         
         if not position:
-            raise ValueError(f"No open position found for {market_id}")
+            raise PositionNotFoundError(market_id)
         
         # Calculate profit/loss
         if position.action in ('buy_yes', 'sell_no'):

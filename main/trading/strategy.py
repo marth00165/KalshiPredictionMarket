@@ -4,7 +4,12 @@ import logging
 from typing import List, Tuple
 
 from ..models import MarketData, FairValueEstimate, TradeSignal
-from ..utils import ConfigManager
+from ..utils import (
+    ConfigManager,
+    InsufficientCapitalError,
+    NoOpportunitiesError,
+    PositionLimitError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +186,21 @@ class Strategy:
         
         Returns:
             List of ready-to-execute TradeSignal objects
+        
+        Raises:
+            InsufficientCapitalError: If no capital available for trading
+            PositionLimitError: If max positions reached before any signals generated
+            NoOpportunitiesError: If opportunities list is empty
         """
+        
+        if not opportunities:
+            raise NoOpportunitiesError("No opportunities provided for signal generation")
+        
+        if current_bankroll <= 0:
+            raise InsufficientCapitalError(
+                required=1.0,
+                available=current_bankroll
+            )
         
         signals = []
         max_positions = self.config.risk.max_positions
@@ -189,7 +208,10 @@ class Strategy:
         for market, estimate in opportunities[:max_positions]:
             # Don't add more positions if we already have the max
             if len(signals) >= max_positions:
-                break
+                raise PositionLimitError(
+                    current_positions=len(signals),
+                    max_allowed=max_positions
+                )
             
             # Determine action based on edge direction
             if estimate.is_buy_yes_signal():
@@ -219,8 +241,10 @@ class Strategy:
             
             # Skip if position would exceed available capital
             if position_size > current_bankroll:
-                logger.debug(f"Skipping {market.market_id}: position size ${position_size:.2f} "
-                           f"exceeds bankroll ${current_bankroll:.2f}")
+                logger.warning(
+                    f"Skipping {market.market_id}: position size ${position_size:.2f} "
+                    f"exceeds bankroll ${current_bankroll:.2f}"
+                )
                 continue
             
             # Calculate expected value
@@ -234,20 +258,29 @@ class Strategy:
                       estimate.estimated_probability * market_price) * position_size
             
             # Create signal
-            signal = TradeSignal(
-                market=market,
-                action=action,
-                fair_value=estimate.estimated_probability,
-                market_price=market_price,
-                edge=estimate.edge,
-                kelly_fraction=kelly_frac,
-                position_size=position_size,
-                expected_value=ev,
-                reasoning=estimate.reasoning[:200] if estimate.reasoning else ""
-            )
+            try:
+                signal = TradeSignal(
+                    market=market,
+                    action=action,
+                    fair_value=estimate.estimated_probability,
+                    market_price=market_price,
+                    edge=estimate.edge,
+                    kelly_fraction=kelly_frac,
+                    position_size=position_size,
+                    expected_value=ev,
+                    reasoning=estimate.reasoning[:200] if estimate.reasoning else ""
+                )
+                signals.append(signal)
+                logger.debug(f"Generated signal: {signal}")
             
-            signals.append(signal)
-            logger.debug(f"Generated signal: {signal}")
+            except ValueError as e:
+                logger.error(f"Error creating signal for {market.market_id}: {e}")
+                continue
+        
+        if not signals:
+            raise NoOpportunitiesError(
+                "No valid signals generated (all opportunities filtered or failed validation)"
+            )
         
         logger.info(f"Generated {len(signals)} trade signals")
         return signals

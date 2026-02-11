@@ -4,7 +4,13 @@ import logging
 from typing import List
 
 from ..models import TradeSignal
-from ..utils import ConfigManager
+from ..utils import (
+    ConfigManager,
+    ExecutionFailedError,
+    OrderPlacementError,
+    DryRunError,
+    ErrorContext,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +49,30 @@ class TradeExecutor:
         
         Returns:
             List of booleans indicating success/failure for each signal
+        
+        Raises:
+            ExecutionFailedError: If critical errors prevent execution (non-dry-run)
         """
         
+        if not signals:
+            logger.warning("No signals to execute")
+            return []
+        
         results = []
+        error_context = ErrorContext("Batch execution", critical=False)
         
         for signal in signals:
             try:
                 success = await self.execute_signal(signal)
                 results.append(success)
             except Exception as e:
-                logger.error(f"Error executing signal for {signal.market.market_id}: {e}")
+                error_context.add_error(e)
+                logger.error(f"Error executing signal: {e}")
                 results.append(False)
         
         successful = sum(results)
         logger.info(f"Executed {successful}/{len(signals)} signals successfully")
+        logger.info(error_context.get_summary())
         
         return results
     
@@ -69,20 +85,17 @@ class TradeExecutor:
         
         Returns:
             True if execution successful, False otherwise
+        
+        Raises:
+            DryRunError: In dry-run mode (non-critical)
+            ExecutionFailedError: If execution fails (non-dry-run)
         """
         
         # Log the signal
         self._log_signal(signal)
         
         if self.dry_run:
-            logger.warning(f"🏁 DRY RUN MODE - Not executing real trade for {signal.market.market_id}")
-            return True
-        
-        # TODO: Implement actual execution
-        # 1. Route to correct platform (Polymarket or Kalshi)
-        # 2. Call API with trade details
-        # 3. Validate order confirmation
-        # 4. Handle errors and retries
+            raise DryRunError(f"Not executing real trade for {signal.market.market_id}")
         
         try:
             success = await self._execute_on_platform(signal)
@@ -90,12 +103,22 @@ class TradeExecutor:
                 self.executed_trades.append(signal)
                 logger.info(f"✅ Trade executed: {signal}")
             else:
-                logger.error(f"❌ Trade execution failed: {signal}")
+                raise ExecutionFailedError(
+                    market_id=signal.market.market_id,
+                    action=signal.action,
+                    reason="Platform returned failure"
+                )
             return success
         
+        except (ExecutionFailedError, OrderPlacementError):
+            raise
         except Exception as e:
-            logger.error(f"Exception executing trade: {e}")
-            return False
+            raise ExecutionFailedError(
+                market_id=signal.market.market_id,
+                action=signal.action,
+                reason=str(e),
+                details={'error_type': type(e).__name__}
+            )
     
     async def _execute_on_platform(self, signal: TradeSignal) -> bool:
         """
@@ -106,6 +129,9 @@ class TradeExecutor:
         
         Returns:
             True if successful
+        
+        Raises:
+            OrderPlacementError: If platform API call fails
         """
         
         if signal.market.platform == 'polymarket':
@@ -113,8 +139,10 @@ class TradeExecutor:
         elif signal.market.platform == 'kalshi':
             return await self._execute_kalshi(signal)
         else:
-            logger.error(f"Unknown platform: {signal.market.platform}")
-            return False
+            raise OrderPlacementError(
+                platform=signal.market.platform,
+                message=f"Unknown platform: {signal.market.platform}"
+            )
     
     async def _execute_polymarket(self, signal: TradeSignal) -> bool:
         """Execute trade on Polymarket (stub)"""
