@@ -19,7 +19,7 @@ Create `advanced_config.json` in the repo root:
   "api": {
     "claude_api_key": "sk-ant-xxxxxxxxxxxxxxxxxxxxx",
     "batch_size": 50,
-    "api_cost_limit_per_cycle": 5.00
+    "api_cost_limit_per_cycle": 5.0
   },
   "platforms": {
     "polymarket": {
@@ -39,7 +39,7 @@ Create `advanced_config.json` in the repo root:
   },
   "strategy": {
     "min_edge": 0.08,
-    "min_confidence": 0.60
+    "min_confidence": 0.6
   },
   "risk": {
     "max_kelly_fraction": 0.25,
@@ -56,6 +56,7 @@ Create `advanced_config.json` in the repo root:
 ### 3. Protect Your Keys
 
 Add to `.gitignore` to never commit your keys:
+
 ```
 advanced_config.json
 *.env
@@ -98,15 +99,17 @@ This bot automates the entire process:
 The bot securely handles API keys from the configuration file:
 
 ### ClaudeAnalyzer
+
 ```python
 def __init__(self, config: Dict):
     self.api_key = config.get('api', {}).get('claude_api_key')
-    
+
     if not self.api_key:
         raise ValueError("Claude API key not found in config")
 ```
 
 Every Claude API call includes the API key:
+
 ```python
 async with session.post(
     self.api_url,
@@ -119,6 +122,7 @@ async with session.post(
 ```
 
 ### MarketScanner
+
 Both Polymarket and Kalshi APIs are called with authentication:
 
 ```python
@@ -136,6 +140,7 @@ async with session.get(url, params=params, headers=headers) as response:
 ```
 
 **Security Notes:**
+
 - Keys are loaded from `advanced_config.json` (never hardcoded)
 - Keys are never logged or printed
 - Config file should be in `.gitignore`
