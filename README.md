@@ -27,17 +27,40 @@ Edit `my_config.json` and add:
 
 ### 3. Run the Bot
 
-**Test run (no real trades):**
+**Test run (dry-run mode, no real trades):**
 
 ```bash
-python main/ai_trading_bot_refactored.py --dry-run
+python main/ai_trading_bot_refactored.py
+# Default: uses advanced_config.json with dry_run: true
 ```
 
-**Live trading:**
+In **dry-run mode**:
+- ✅ Scans all markets from Polymarket and Kalshi
+- ✅ Analyzes with Claude AI (costs money for API calls)
+- ✅ Generates trade signals with position sizing
+- ✅ **Blocks execution** - logs signals instead of placing bets
+- ✅ **Zero trading losses**
+
+**Live trading (real money):**
+
+First, edit `advanced_config.json` and change the dry_run flag:
+
+```json
+{
+  "trading": {
+    "dry_run": false,    ← Change from true to false
+    "initial_bankroll": 1000
+  }
+}
+```
+
+Then run:
 
 ```bash
-python main/ai_trading_bot_refactored.py --config my_config.json
+python main/ai_trading_bot_refactored.py
 ```
+
+⚠️ **WARNING**: `dry_run: false` places **REAL bets** with **REAL money**!
 
 ## How It Works
 
@@ -64,6 +87,7 @@ Key settings in `advanced_config.json`:
 ```json
 {
   "trading": {
+    "dry_run": true,              ← Set to false for live trading
     "initial_bankroll": 1000,
     "min_edge_percentage": 8.0
   },
@@ -79,6 +103,18 @@ Key settings in `advanced_config.json`:
   }
 }
 ```
+
+### Dry-Run vs Live Mode
+
+| Phase | Dry-Run | Live |
+|-------|---------|------|
+| Market Scanning | ✅ Real data | ✅ Real data |
+| Claude Analysis | ✅ Real calls | ✅ Real calls |
+| Signal Generation | ✅ Normal | ✅ Normal |
+| **Trade Execution** | **❌ Blocked** | **✅ Places bets** |
+| Money Risk | None | **Real money!** |
+
+**Safe Workflow**: Always test with `dry_run: true` first, then change one flag to go live.
 
 ## File Structure
 
