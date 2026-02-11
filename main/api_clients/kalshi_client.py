@@ -5,9 +5,19 @@ from typing import List, Dict, Optional, Any, Tuple
 
 from dataclasses import dataclass
 
-from .base_client import BaseAPIClient
+import asyncio
+
+from .base_client import BaseAPIClient, RateLimitError
 
 logger = logging.getLogger(__name__)
+
+
+# Many Kalshi markets are auto-generated "bundle" style entries with extremely long
+# titles (e.g., multi-game extended sports slips). These are typically not useful
+# for this bot's market-level analysis and are hard to locate on the website.
+EXCLUDED_TICKER_PREFIXES = (
+    "KXMVESPORTSMULTIGAMEEXTENDED",
+)
 
 
 @dataclass
@@ -87,6 +97,7 @@ class KalshiClient(BaseAPIClient):
                 Tuple of (parsed_markets, next_cursor_or_none)
             """
             parsed_markets = []
+            excluded = 0
             
             market_list = data.get('markets', [])
             if not market_list:
@@ -96,12 +107,19 @@ class KalshiClient(BaseAPIClient):
                 try:
                     # Kalshi requires fetching price from orderbook separately
                     # This will be done in _parse_market_with_price
+                    ticker = market.get('ticker', '') or ''
+                    if any(ticker.startswith(pfx) for pfx in EXCLUDED_TICKER_PREFIXES):
+                        excluded += 1
+                        continue
                     parsed = self._parse_market_metadata(market)
                     if parsed:
                         parsed_markets.append(parsed)
                 except Exception as e:
                     logger.debug(f"[kalshi] Error parsing market {market.get('ticker', 'unknown')}: {e}")
                     continue
+
+            if excluded:
+                logger.debug(f"[kalshi] Excluded {excluded} bundle markets by ticker prefix")
             
             # Get cursor for next page
             next_cursor = data.get('cursor')
@@ -127,6 +145,12 @@ class KalshiClient(BaseAPIClient):
                     yes_price = await self._get_market_price(ticker)
                     market['yes_price'] = yes_price
                     market['no_price'] = 1 - yes_price
+                    # Throttle to reduce likelihood of 429s during scans.
+                    await asyncio.sleep(0.15)
+                except RateLimitError as e:
+                    logger.warning(f"[kalshi] Rate limited fetching prices; using default 0.5 for remaining markets ({e})")
+                    market['yes_price'] = 0.5
+                    market['no_price'] = 0.5
                 except Exception as e:
                     logger.warning(f"[kalshi] Failed to fetch price for {market.get('market_id')}: {e}")
                     # Use default prices
@@ -193,7 +217,8 @@ class KalshiClient(BaseAPIClient):
         try:
             data = await self._call_with_retry(
                 fetch_orderbook,
-                f"Fetch orderbook for {ticker}"
+                f"Fetch orderbook for {ticker}",
+                max_retries=0
             )
             
             orderbook = data.get('orderbook', {})
@@ -208,6 +233,9 @@ class KalshiClient(BaseAPIClient):
             logger.debug(f"[kalshi] No YES bids for {ticker}, using default 0.5")
             return 0.5
         
+        except RateLimitError:
+            # Bubble up so caller can decide how to handle (default to 0.5 and continue).
+            raise
         except Exception as e:
             logger.warning(f"[kalshi] Error fetching price for {ticker}: {e}")
             return 0.5

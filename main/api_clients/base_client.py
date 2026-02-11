@@ -43,12 +43,20 @@ class APIError(Exception):
 class RateLimitError(APIError):
     """Raised when API rate limit is exceeded (HTTP 429)"""
     
-    def __init__(self, platform: str, retry_after: Optional[int] = None):
+    def __init__(
+        self,
+        platform: str,
+        retry_after: Optional[int] = None,
+        rate_limit_headers: Optional[Dict[str, str]] = None,
+    ):
         super().__init__(
             platform=platform,
             operation="Rate limit exceeded",
             status_code=429,
-            details={'retry_after': retry_after}
+            details={
+                'retry_after': retry_after,
+                'rate_limit_headers': rate_limit_headers or {},
+            },
         )
         self.retry_after = retry_after or 60
 
@@ -301,7 +309,8 @@ class BaseAPIClient:
         Raises:
             Original exception after max retries exhausted
         """
-        max_attempts = (max_retries or self.max_retries) + 1  # +1 for initial attempt
+        effective_retries = self.max_retries if max_retries is None else max_retries
+        max_attempts = effective_retries + 1  # +1 for initial attempt
         last_exception = None
         
         for attempt in range(max_attempts):
@@ -313,9 +322,11 @@ class BaseAPIClient:
                 last_exception = e
                 if attempt < max_attempts - 1:
                     wait_time = e.retry_after
+                    headers = (e.details or {}).get('rate_limit_headers') or {}
+                    header_hint = f" rate_limit={headers}" if headers else ""
                     logger.warning(
                         f"[{self.platform_name}] Rate limited. "
-                        f"Waiting {wait_time}s before retry..."
+                        f"Waiting {wait_time}s before retry...{header_hint}"
                     )
                     await asyncio.sleep(wait_time)
                 else:
@@ -448,12 +459,23 @@ class BaseAPIClient:
                 logger.debug(f"[{self.platform_name}] Fetched {len(batch_items)} items (total: {len(all_items)})")
                 
                 # Check if pagination is complete
-                if not batch_items or next_cursor is None:
-                    logger.info(
-                        f"[{self.platform_name}] Pagination complete. "
-                        f"Fetched {len(all_items)} items in {request_count} requests."
-                    )
-                    break
+                if pagination_type == "cursor":
+                    # For cursor pagination, an empty parsed batch can happen if we filtered
+                    # out items client-side; keep going as long as the API gives a cursor.
+                    if next_cursor is None:
+                        logger.info(
+                            f"[{self.platform_name}] Pagination complete. "
+                            f"Fetched {len(all_items)} items in {request_count} requests."
+                        )
+                        break
+                else:
+                    # For offset pagination, an empty batch usually means there are no more items.
+                    if not batch_items or next_cursor is None:
+                        logger.info(
+                            f"[{self.platform_name}] Pagination complete. "
+                            f"Fetched {len(all_items)} items in {request_count} requests."
+                        )
+                        break
                 
                 # Update pagination state
                 if pagination_type == "offset":
@@ -493,7 +515,31 @@ class BaseAPIClient:
         """
         if response.status == 429:
             retry_after = int(response.headers.get('Retry-After', 60))
-            raise RateLimitError(self.platform_name, retry_after=retry_after)
+
+            # Capture any standard-ish rate limit headers if present.
+            # Different gateways use different names/casing.
+            interesting_keys = {
+                'retry-after',
+                'x-ratelimit-limit',
+                'x-ratelimit-remaining',
+                'x-ratelimit-reset',
+                'ratelimit-limit',
+                'ratelimit-remaining',
+                'ratelimit-reset',
+                'ratelimit-policy',
+                'ratelimit',
+            }
+            rate_limit_headers: Dict[str, str] = {}
+            for key, value in response.headers.items():
+                key_lower = key.lower()
+                if key_lower in interesting_keys or 'ratelimit' in key_lower:
+                    rate_limit_headers[key] = str(value)
+
+            raise RateLimitError(
+                self.platform_name,
+                retry_after=retry_after,
+                rate_limit_headers=rate_limit_headers,
+            )
         
         elif response.status == 401:
             raise AuthenticationError(self.platform_name)
