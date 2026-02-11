@@ -217,6 +217,9 @@ config_with_keys.json
 trades_*.json
 performance_*.json
 
+# Generated cycle reports
+reports/
+
 # kalshi_private_key.txt
 kalshi_private_key.txt
 tradingAnalyzer_private_key.txt
