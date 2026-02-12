@@ -2,12 +2,24 @@
 
 An AI-powered trading bot that automatically analyzes prediction markets on Polymarket and Kalshi, calculates fair value estimates using Claude AI, and executes trades with intelligent position sizing.
 
+## Quickstart (uv)
+
+```bash
+uv pip install -e .
+cp advanced_config.template.json advanced_config.json
+uv run python main/series_scanner.py --series KXFED --no-save
+```
+
 ## Quick Start (Beginners)
 
 ### 1. Install Dependencies
 
 ```bash
-pip install -r requirements.txt
+# Install runtime deps
+uv pip install -e .
+
+# (Optional) install dev tooling
+uv pip install -e ".[dev]"
 ```
 
 ### 2. Set Up Configuration
@@ -15,7 +27,7 @@ pip install -r requirements.txt
 Copy and edit the configuration file with your API keys:
 
 ```bash
-cp advanced_config.json my_config.json
+cp advanced_config.template.json my_config.json
 ```
 
 Edit `my_config.json` and add:
@@ -82,6 +94,22 @@ python main/ai_trading_bot_refactored.py
 | `python main/series_scanner.py --discover`                         | Discover available Kalshi series |
 | `python main/series_scanner.py --series KXFED`                     | Scan specific series (no rate limits) |
 | `python main/ai_trading_bot.py`                                    | Run original monolithic version |
+
+## Dev Workflow (pyproject.toml)
+
+This repo uses a `pyproject.toml`-based layout. Use editable installs to avoid
+`PYTHONPATH` hacks and to keep imports consistent.
+
+```bash
+# Run a quick import check
+uv run python -c "import ai_trading_bot_refactored"
+
+# Run series scan (dry run, no report saved)
+uv run python main/series_scanner.py --series KXFED --no-save
+
+# Run tests (if/when tests are added)
+uv run pytest
+```
 
 ## Series Scanner (Recommended for Dry Runs)
 

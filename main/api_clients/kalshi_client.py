@@ -139,7 +139,7 @@ class KalshiClient(BaseAPIClient):
             )
 
             # Fetch prices for each market (TODO: optimize with batch price fetching)
-            for market in markets:
+            for index, market in enumerate(markets):
                 try:
                     ticker = market['market_id']
                     yes_price = await self._get_market_price(ticker)
@@ -148,9 +148,17 @@ class KalshiClient(BaseAPIClient):
                     # Throttle to reduce likelihood of 429s during scans.
                     await asyncio.sleep(0.15)
                 except RateLimitError as e:
-                    logger.warning(f"[kalshi] Rate limited fetching prices; using default 0.5 for remaining markets ({e})")
+                    logger.warning(
+                        "[kalshi] Rate limited fetching prices; using default 0.5 for remaining markets"
+                    )
+                    # Fill current and remaining markets with defaults and stop hammering.
                     market['yes_price'] = 0.5
                     market['no_price'] = 0.5
+                    remaining = markets[index + 1 :]
+                    for rest in remaining:
+                        rest['yes_price'] = 0.5
+                        rest['no_price'] = 0.5
+                    break
                 except Exception as e:
                     logger.warning(f"[kalshi] Failed to fetch price for {market.get('market_id')}: {e}")
                     # Use default prices

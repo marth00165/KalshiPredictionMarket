@@ -1,0 +1,44 @@
+[project]
+name = "kalshi-prediction-market"
+version = "0.1.0"
+description = "AI-powered prediction market trading bot for Kalshi and Polymarket"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+]
+
+[tool.setuptools.package-dir]
+"" = "main"
+
+[tool.setuptools]
+packages = ["api_clients", "analysis", "models", "trading", "utils"]
+py-modules = ["ai_trading_bot", "ai_trading_bot_refactored", "series_scanner"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.10.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+warn_unused_configs = true

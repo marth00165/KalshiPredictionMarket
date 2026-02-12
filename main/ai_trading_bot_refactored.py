@@ -143,6 +143,11 @@ class ClaudeAnalyzer:
         Returns:
             FairValueEstimate or None if analysis fails
         """
+        # Ensure API key is configured before making calls
+        if not self.config.api.claude_api_key:
+            logger.error("Claude API key not configured")
+            return None
+
         prompt = self._build_analysis_prompt(market)
         
         try:
@@ -637,15 +642,15 @@ class AdvancedTradingBot:
             
             for market in to_analyze:
                 try:
-                    estimate = await self.analyzer.analyze_market(market)
+                    estimate = await self.analyzer.analyze_single_market(market)
                     if estimate:
                         report["analyses"].append({
                             "market_id": market.market_id,
                             "title": market.title,
                             "market_price": market.yes_price,
-                            "estimated_probability": estimate.probability,
-                            "confidence": estimate.confidence,
-                            "edge": estimate.probability - market.yes_price,
+                            "estimated_probability": estimate.estimated_probability,
+                            "confidence": estimate.confidence_level,
+                            "edge": estimate.edge,
                             "reasoning": estimate.reasoning,
                         })
                         report["counts"]["analyzed"] += 1

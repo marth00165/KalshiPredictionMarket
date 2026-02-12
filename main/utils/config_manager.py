@@ -242,16 +242,17 @@ class ConfigManager:
         except ValueError as e:
             raise ValueError(f"Invalid API config: {e}")
 
-        # Provider-specific key validation
+        # Provider-specific key validation (warn only; runtime analysis will still fail
+        # if a key is missing, but this allows scan-only/dry-run usage without keys).
         if self.analysis.provider == 'claude':
             if not self.api.claude_api_key or str(self.api.claude_api_key).startswith('sk-ant-YOUR_'):
-                raise ValueError(
-                    "Invalid claude_api_key: Please set your actual Claude API key in config"
+                logger.warning(
+                    "Claude API key missing/placeholder. Analysis will fail until set."
                 )
         elif self.analysis.provider == 'openai':
             if not self.api.openai_api_key or str(self.api.openai_api_key).startswith('sk-proj-YOUR_'):
-                raise ValueError(
-                    "Invalid openai_api_key: Please set your actual OpenAI API key in config"
+                logger.warning(
+                    "OpenAI API key missing/placeholder. Analysis will fail until set."
                 )
         
         # Claude configuration

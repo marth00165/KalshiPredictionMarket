@@ -139,16 +139,12 @@ class TradeExecutor:
         Raises:
             OrderPlacementError: If platform API call fails
         """
-        
-        if signal.market.platform == 'polymarket':
-            return await self._execute_polymarket(signal)
-        elif signal.market.platform == 'kalshi':
-            return await self._execute_kalshi(signal)
-        else:
-            raise OrderPlacementError(
-                platform=signal.market.platform,
-                message=f"Unknown platform: {signal.market.platform}"
-            )
+        # Guard: do not report success for live trading without implementations.
+        raise OrderPlacementError(
+            platform=signal.market.platform,
+            message="Live order placement not implemented. Use dry_run or implement platform execution.",
+        )
+
     
     async def _execute_polymarket(self, signal: TradeSignal) -> bool:
         """Execute trade on Polymarket (stub)"""
