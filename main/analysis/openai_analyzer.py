@@ -97,6 +97,7 @@ Respond in JSON format:
 Return ONLY valid JSON."""
 
     async def _call_openai_api(self, prompt: str) -> dict:
+        logger.debug("Calling OpenAI API with prompt:\n" + prompt)
         """Call OpenAI Chat Completions API."""
 
         if not self.client.session:

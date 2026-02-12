@@ -359,6 +359,8 @@ class MarketScanner:
                     api_key=config.platforms.kalshi.api_key,
                     base_url="https://api.elections.kalshi.com/trade-api/v2",
                     max_markets=config.platforms.kalshi.max_markets,
+                    use_orderbooks=not config.is_dry_run,  # Skip orderbooks in dry run to avoid rate limits
+                    series_tickers=config.platforms.kalshi.series_tickers,  # Fetch from specific series if configured
                 )
             )
             if config.platforms.kalshi.enabled
@@ -569,7 +571,7 @@ class AdvancedTradingBot:
         1. Fetches markets by series (no orderbook calls)
         2. Applies filters
         3. Optionally analyzes top N markets with AI
-        4. Returns a report dict
+        4. Returns a report dict (same format as run_trading_cycle)
         
         Args:
             series_tickers: List of series tickers to scan
@@ -579,80 +581,152 @@ class AdvancedTradingBot:
         Returns:
             Report dict with scan results
         """
+        self.cycle_count += 1
+        cycle_started_at = datetime.now().isoformat()
+        
         logger.info("=" * 60)
-        logger.info(f"🔍 SERIES SCAN: {series_tickers}")
+        logger.info(f"🔍 SERIES SCAN (Cycle {self.cycle_count}): {series_tickers}")
         logger.info("=" * 60)
         
-        report = {
-            "timestamp": datetime.now().isoformat(),
-            "series_tickers": series_tickers,
-            "analyze": analyze,
+        # Report structure matches run_trading_cycle for consistency
+        report: dict = {
+            "cycle": self.cycle_count,
+            "scan_type": "series",
+            "started_at": cycle_started_at,
+            "finished_at": None,
+            "config": {
+                "series_tickers": series_tickers,
+                "analyze": analyze,
+                "max_analyze": max_analyze,
+                "analysis_provider": self.config.analysis_provider if analyze else None,
+                "dry_run": self.config.is_dry_run,
+                "filters": {
+                    "min_volume": self.config.filters.min_volume,
+                    "min_liquidity": self.config.filters.min_liquidity,
+                    "price_bounds": {"min": 0.01, "max": 0.99},
+                },
+                "strategy": {
+                    "min_edge": self.config.strategy.min_edge,
+                    "min_confidence": self.config.strategy.min_confidence,
+                },
+            },
             "counts": {
                 "scanned": 0,
                 "passed_filters": 0,
                 "analyzed": 0,
+                "estimates": 0,
+                "opportunities": 0,
+                "signals": 0,
+                "executed": 0,
             },
+            "api_cost": None,
             "markets": [],
-            "filtered_markets": [],
-            "analyses": [],
+            "signals": [],
+            "errors": [],
         }
         
-        # Step 1: Fetch markets
-        markets = await self.scan_series_markets(series_tickers)
-        report["counts"]["scanned"] = len(markets)
-        
-        # Store all market info
-        for m in markets:
-            report["markets"].append({
-                "market_id": m.market_id,
-                "title": m.title,
-                "yes_price": m.yes_price,
-                "volume": m.volume,
-                "liquidity": m.liquidity,
-                "end_date": m.end_date,
-                "category": m.category,
-            })
-        
-        # Step 2: Apply filters
-        filtered = self.strategy.filter_markets(markets)
-        report["counts"]["passed_filters"] = len(filtered)
-        
-        for m in filtered:
-            filter_result = self.strategy.evaluate_market_filters(m)
-            report["filtered_markets"].append({
-                "market_id": m.market_id,
-                "title": m.title,
-                "yes_price": m.yes_price,
-                "volume": m.volume,
-                "liquidity": m.liquidity,
-                "filter_checks": filter_result,
-            })
-        
-        logger.info(f"📊 Scanned: {len(markets)}, Passed filters: {len(filtered)}")
-        
-        # Step 3: Optional AI analysis
-        if analyze and filtered:
-            to_analyze = filtered[:max_analyze]
-            logger.info(f"🤖 Analyzing top {len(to_analyze)} markets...")
+        try:
+            # Step 1: Fetch markets by series
+            logger.info("\n📊 Step 1: Fetching markets by series...")
+            markets = await self.scan_series_markets(series_tickers)
+            report["counts"]["scanned"] = len(markets)
             
-            for market in to_analyze:
-                try:
-                    estimate = await self.analyzer.analyze_market(market)
-                    if estimate:
-                        report["analyses"].append({
+            # Build market rows with full detail (same format as trading cycle)
+            market_rows_by_id = {}
+            for m in markets:
+                evaluation = self.strategy.evaluate_market_filters(m)
+                volume_tier = self.strategy.classify_volume_tier(m)
+                row = {
+                    "market_id": m.market_id,
+                    "platform": m.platform,
+                    "title": m.title,
+                    "description": m.description,
+                    "category": m.category,
+                    "end_date": str(m.end_date),
+                    "prices": {
+                        "yes": m.yes_price,
+                        "no": m.no_price,
+                    },
+                    "stats": {
+                        "volume": m.volume,
+                        "liquidity": m.liquidity,
+                    },
+                    "volume_tier": volume_tier,
+                    "filters": evaluation,
+                    "analysis": None,
+                    "opportunity": None,
+                    "signal": None,
+                    "execution": None,
+                }
+                market_rows_by_id[m.market_id] = row
+            
+            report["markets"] = list(market_rows_by_id.values())
+            logger.info(f"   Found {len(markets)} markets")
+            
+            if not markets:
+                logger.warning("No markets found")
+                report["finished_at"] = datetime.now().isoformat()
+                return report
+            
+            # Step 2: Apply filters
+            logger.info("\n🔬 Step 2: Filtering markets...")
+            filtered = self.strategy.filter_markets(markets)
+            report["counts"]["passed_filters"] = len(filtered)
+            logger.info(f"   {len(filtered)} markets passed filters")
+            
+            # Step 3: Optional AI analysis
+            if analyze and filtered:
+                to_analyze = filtered[:max_analyze]
+                provider = (self.config.analysis_provider or "claude").strip().lower()
+                logger.info(f"\n🧠 Step 3: Analyzing {len(to_analyze)} markets with {provider}...")
+                
+                for market in to_analyze:
+                    try:
+                        estimate = await self.analyzer.analyze_market(market)
+                        if estimate:
+                            report["counts"]["analyzed"] += 1
+                            report["counts"]["estimates"] += 1
+                            
+                            # Update market row with analysis
+                            if market.market_id in market_rows_by_id:
+                                edge = estimate.probability - market.yes_price
+                                market_rows_by_id[market.market_id]["analysis"] = {
+                                    "estimated_probability": estimate.probability,
+                                    "confidence": estimate.confidence,
+                                    "edge": edge,
+                                    "reasoning": estimate.reasoning,
+                                }
+                                
+                                # Check if it's an opportunity
+                                if edge >= self.config.strategy.min_edge and estimate.confidence >= self.config.strategy.min_confidence:
+                                    report["counts"]["opportunities"] += 1
+                                    market_rows_by_id[market.market_id]["opportunity"] = {
+                                        "edge": edge,
+                                        "confidence": estimate.confidence,
+                                        "meets_threshold": True,
+                                    }
+                                    
+                    except Exception as e:
+                        logger.warning(f"Error analyzing {market.market_id}: {e}")
+                        report["errors"].append({
                             "market_id": market.market_id,
-                            "title": market.title,
-                            "market_price": market.yes_price,
-                            "estimated_probability": estimate.probability,
-                            "confidence": estimate.confidence,
-                            "edge": estimate.probability - market.yes_price,
-                            "reasoning": estimate.reasoning,
+                            "error": str(e),
                         })
-                        report["counts"]["analyzed"] += 1
-                except Exception as e:
-                    logger.warning(f"Error analyzing {market.market_id}: {e}")
+                
+                # Update markets list with analysis results
+                report["markets"] = list(market_rows_by_id.values())
+                
+                # Get API cost if available
+                if hasattr(self.analyzer, 'get_api_stats'):
+                    report["api_cost"] = self.analyzer.get_api_stats()
+            
+            logger.info(f"\n✅ Series scan complete")
+            
+        except Exception as e:
+            logger.error(f"Series scan error: {e}")
+            report["errors"].append({"error": str(e)})
         
-        logger.info(f"✅ Series scan complete")
+        report["finished_at"] = datetime.now().isoformat()
         return report
     
     async def run_trading_cycle(self):
@@ -750,6 +824,7 @@ class AdvancedTradingBot:
             market_rows_by_id = {}
             for m in markets:
                 evaluation = self.strategy.evaluate_market_filters(m)
+                volume_tier = self.strategy.classify_volume_tier(m)
                 row = {
                     "market_id": m.market_id,
                     "platform": m.platform,
@@ -757,6 +832,9 @@ class AdvancedTradingBot:
                     "description": m.description,
                     "category": m.category,
                     "end_date": str(m.end_date),
+                    "event_ticker": m.event_ticker,
+                    "yes_option": m.yes_option,
+                    "no_option": m.no_option,
                     "prices": {
                         "yes": m.yes_price,
                         "no": m.no_price,
@@ -765,6 +843,7 @@ class AdvancedTradingBot:
                         "volume": m.volume,
                         "liquidity": m.liquidity,
                     },
+                    "volume_tier": volume_tier,
                     "filters": evaluation,
                     "analysis": None,
                     "opportunity": None,
@@ -773,7 +852,44 @@ class AdvancedTradingBot:
                 }
                 market_rows_by_id[m.market_id] = row
             report["markets"] = list(market_rows_by_id.values())
+            
+            # Create grouped view by event_ticker
+            events_grouped = {}
+            for m in markets:
+                event_key = m.event_ticker or m.market_id
+                if event_key not in events_grouped:
+                    # Extract base event title (remove option-specific part)
+                    base_title = m.title
+                    if m.yes_option and m.yes_option in base_title:
+                        # Try to get cleaner event title
+                        base_title = m.title.replace(f" [{m.yes_option}]", "")
+                    events_grouped[event_key] = {
+                        "event_ticker": event_key,
+                        "event_title": base_title,
+                        "platform": m.platform,
+                        "category": m.category,
+                        "end_date": str(m.end_date),
+                        "options": []
+                    }
+                events_grouped[event_key]["options"].append({
+                    "market_id": m.market_id,
+                    "option_name": m.yes_option or m.title[:50],
+                    "yes_price": m.yes_price,
+                    "volume": m.volume,
+                })
+            report["events"] = list(events_grouped.values())
+            
             report["counts"]["scanned"] = len(markets)
+            
+            # Add tier breakdown to report
+            tier_counts = self.strategy.categorize_markets_by_tier(markets)
+            report["tier_summary"] = {
+                "high": len(tier_counts['high']),
+                "medium": len(tier_counts['medium']),
+                "low": len(tier_counts['low']),
+                "skip": len(tier_counts['skip']),
+            }
+            logger.info(f"   Volume tiers: high={report['tier_summary']['high']}, medium={report['tier_summary']['medium']}, low={report['tier_summary']['low']}")
             
             if not markets:
                 logger.warning("No markets found, aborting cycle")

@@ -122,6 +122,17 @@ class APIUsage:
             (self.input_tokens / 1_000_000) * input_cost_per_mtok +
             (self.output_tokens / 1_000_000) * output_cost_per_mtok
         )
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to JSON-serializable dict"""
+        return {
+            'timestamp': self.timestamp.isoformat(),
+            'operation': self.operation,
+            'input_tokens': self.input_tokens,
+            'output_tokens': self.output_tokens,
+            'status_code': self.status_code,
+            'platform': self.platform,
+        }
 
 
 class CostTracker:
@@ -170,7 +181,7 @@ class CostTracker:
             'total_input_tokens': self.total_input_tokens(),
             'total_output_tokens': self.total_output_tokens(),
             'avg_cost_per_request': total_cost / max(1, total_requests),
-            'usage_history': self.usage_history,
+            'usage_history': [u.to_dict() for u in self.usage_history],
         }
 
 
@@ -483,8 +494,8 @@ class BaseAPIClient:
                 else:  # cursor-based
                     cursor = next_cursor
                 
-                # Small delay between requests to respect rate limits
-                await asyncio.sleep(0.1)
+                # Delay between requests to respect rate limits (Kalshi: 10 req/min)
+                await asyncio.sleep(1.0)
             
             except Exception as e:
                 logger.error(f"[{self.platform_name}] Error parsing paginated response: {e}")

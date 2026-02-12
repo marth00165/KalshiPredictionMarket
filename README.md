@@ -74,20 +74,21 @@ python main/ai_trading_bot_refactored.py
 
 ## Important Commands
 
-| Command                                                            | Purpose                         |
-| ------------------------------------------------------------------ | ------------------------------- |
-| `python main/ai_trading_bot_refactored.py`                         | Run bot with default config     |
-| `python main/ai_trading_bot_refactored.py --dry-run`               | Test trades without executing   |
-| `python main/ai_trading_bot_refactored.py --config my_config.json` | Run with custom config          |
-| `python main/series_scanner.py --discover`                         | Discover available Kalshi series |
+| Command                                                            | Purpose                               |
+| ------------------------------------------------------------------ | ------------------------------------- |
+| `python main/ai_trading_bot_refactored.py`                         | Run bot with default config           |
+| `python main/ai_trading_bot_refactored.py --dry-run`               | Test trades without executing         |
+| `python main/ai_trading_bot_refactored.py --config my_config.json` | Run with custom config                |
+| `python main/series_scanner.py --discover`                         | Discover available Kalshi series      |
 | `python main/series_scanner.py --series KXFED`                     | Scan specific series (no rate limits) |
-| `python main/ai_trading_bot.py`                                    | Run original monolithic version |
+| `python main/ai_trading_bot.py`                                    | Run original monolithic version       |
 
 ## Series Scanner (Recommended for Dry Runs)
 
 The series scanner is a **lightweight, rate-limit-friendly** way to fetch and analyze Kalshi markets.
 
 Instead of fetching all 500+ markets and making individual orderbook calls (which hits rate limits), it:
+
 - Fetches markets by `series_ticker` — targeted, minimal API calls
 - Uses prices from the market list response — no orderbook calls needed
 - Filters by category (Economics, Politics, etc.)
@@ -124,14 +125,14 @@ python main/series_scanner.py --series KXFED --analyze --max-analyze 5
 
 ### Series Scanner Options
 
-| Flag | Description |
-|------|-------------|
-| `--discover` | List all available series |
-| `--category <name>` | Filter series by category |
-| `--series <tickers>` | Series tickers to scan (space-separated) |
-| `--analyze` | Run AI analysis on filtered markets |
-| `--max-analyze <n>` | Limit number of markets to analyze (default: 10) |
-| `--no-save` | Don't save report to file |
+| Flag                 | Description                                      |
+| -------------------- | ------------------------------------------------ |
+| `--discover`         | List all available series                        |
+| `--category <name>`  | Filter series by category                        |
+| `--series <tickers>` | Series tickers to scan (space-separated)         |
+| `--analyze`          | Run AI analysis on filtered markets              |
+| `--max-analyze <n>`  | Limit number of markets to analyze (default: 10) |
+| `--no-save`          | Don't save report to file                        |
 
 Reports are saved to `reports/series_scan_<timestamp>.json`.
 
@@ -213,6 +214,45 @@ pip install --upgrade -r requirements.txt
 2. **Start Small** - Set low initial bankroll to test strategy
 3. **Monitor Logs** - Check `error_logs.json` for issues
 4. **Read Docs** - See `main/QUICK_REFERENCE.md` for advanced features
+
+## Viewing Reports (Market Cycle Analyzer)
+
+After running scans, JSON reports are saved to the `reports/` folder. To visualize and analyze these reports, use the **Market Cycle Analyzer** web tool:
+
+👉 **[https://elcurryapps.org/marketCycleAnalyzer/](https://elcurryapps.org/marketCycleAnalyzer/)**
+
+### How to Use
+
+1. Navigate to the link above
+2. Either:
+   - **Paste JSON** directly into the text area and click "Parse JSON"
+   - **Upload a JSON file** by clicking "📁 Upload JSON File"
+3. View the parsed data in the dashboard:
+   - **Cycle Info** - Cycle number, timestamps, provider, dry run status
+   - **Counts** - Scanned, passed filters, analyzed, opportunities, signals, executed
+   - **API Cost** - Total cost, requests, tokens used
+   - **Configuration** - Min volume, liquidity, edge, confidence, position size
+   - **Markets Table** - All markets with prices, stats, filter results, and failure reasons
+4. Use the checkbox to filter and show only markets that passed filters
+5. Click "📸 Download Screenshot" to save the report as a PNG image
+
+### Expected JSON Format
+
+The analyzer expects the JSON format produced by both `ai_trading_bot_refactored.py` and `series_scanner.py`:
+
+```json
+{
+  "cycle": 1,
+  "started_at": "2026-02-11T03:42:58.486507",
+  "finished_at": "2026-02-11T03:43:00.601340",
+  "config": { ... },
+  "counts": { "scanned": 25, "passed_filters": 0, ... },
+  "api_cost": { "total_cost": 0, ... },
+  "markets": [ ... ],
+  "signals": [],
+  "errors": []
+}
+```
 
 ## Need Help?
 

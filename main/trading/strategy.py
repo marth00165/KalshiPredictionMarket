@@ -150,6 +150,66 @@ class Strategy:
             },
             "reasons": reasons,
         }
+
+    def classify_volume_tier(self, market: MarketData) -> str:
+        """
+        Classify a market into a volume tier for polling frequency.
+        
+        Returns:
+            Tier name: 'high', 'medium', 'low', or 'skip'
+        """
+        volume_tiers = getattr(self.config.filters, 'volume_tiers', None)
+        
+        if not volume_tiers:
+            # Default tiers if not configured
+            volume_tiers = {
+                'high': {'min_volume': 100000},
+                'medium': {'min_volume': 10000},
+                'low': {'min_volume': 1000},
+            }
+        
+        vol = market.volume
+        
+        if vol >= volume_tiers.get('high', {}).get('min_volume', 100000):
+            return 'high'
+        elif vol >= volume_tiers.get('medium', {}).get('min_volume', 10000):
+            return 'medium'
+        elif vol >= volume_tiers.get('low', {}).get('min_volume', 1000):
+            return 'low'
+        else:
+            return 'skip'
+
+    def get_tier_poll_seconds(self, tier: str) -> int:
+        """Get the polling interval for a volume tier."""
+        volume_tiers = getattr(self.config.filters, 'volume_tiers', None)
+        
+        defaults = {
+            'high': 30,
+            'medium': 120,
+            'low': 600,
+            'skip': 0,
+        }
+        
+        if not volume_tiers:
+            return defaults.get(tier, 120)
+        
+        tier_config = volume_tiers.get(tier, {})
+        return tier_config.get('poll_seconds', defaults.get(tier, 120))
+
+    def categorize_markets_by_tier(self, markets: List[MarketData]) -> dict:
+        """
+        Group markets by volume tier.
+        
+        Returns:
+            Dict with tier names as keys and lists of markets as values
+        """
+        result = {'high': [], 'medium': [], 'low': [], 'skip': []}
+        
+        for market in markets:
+            tier = self.classify_volume_tier(market)
+            result[tier].append(market)
+        
+        return result
     
     # ========================================================================
     # OPPORTUNITY FINDING

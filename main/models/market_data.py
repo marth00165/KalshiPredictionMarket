@@ -22,6 +22,9 @@ class MarketData:
     liquidity: float  # Available liquidity (varies by platform)
     end_date: str  # Market expiration/resolution date (ISO format)
     category: str  # Market category (politics, sports, finance, etc.)
+    event_ticker: str = ""  # Parent event ticker (for grouping related markets)
+    yes_option: str = ""  # Specific option name (e.g., "Pam Bondi" for cabinet markets)
+    no_option: str = ""  # Specific no option name
     
     def __post_init__(self):
         """Validate market data after initialization"""

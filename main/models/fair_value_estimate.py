@@ -18,6 +18,7 @@ class FairValueEstimate:
     confidence_level: float  # Confidence in the estimate (0.0-1.0)
     reasoning: str  # Detailed explanation of the analysis
     data_sources: List[str] = field(default_factory=list)  # Sources used for analysis
+    key_factors: List[str] = field(default_factory=list)  # Key factors in the analysis
     edge: float = 0.0  # Estimated edge vs. market price (calculated field)
     
     def __post_init__(self):

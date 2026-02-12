@@ -1,6 +1,7 @@
 """Kalshi API client for fetching prediction market data"""
 
 import logging
+import time
 from typing import List, Dict, Optional, Any, Tuple
 
 from dataclasses import dataclass
@@ -10,6 +11,36 @@ import asyncio
 from .base_client import BaseAPIClient, RateLimitError
 
 logger = logging.getLogger(__name__)
+
+
+class RateLimiter:
+    """Simple rate limiter to stay under API limits"""
+    
+    def __init__(self, max_per_sec: float = 10):
+        """
+        Initialize rate limiter.
+        
+        Args:
+            max_per_sec: Maximum requests per second (Kalshi allows ~10/sec, use 8 for safety)
+        """
+        self.delay = 1.0 / max_per_sec
+        self.last = 0.0
+    
+    def wait(self):
+        """Wait if needed to stay under rate limit"""
+        now = time.time()
+        elapsed = now - self.last
+        if elapsed < self.delay:
+            time.sleep(self.delay - elapsed)
+        self.last = time.time()
+    
+    async def async_wait(self):
+        """Async version of wait"""
+        now = time.time()
+        elapsed = now - self.last
+        if elapsed < self.delay:
+            await asyncio.sleep(self.delay - elapsed)
+        self.last = time.time()
 
 
 # Many Kalshi markets are auto-generated "bundle" style entries with extremely long
@@ -26,7 +57,9 @@ class KalshiConfig:
     api_key: Optional[str] = None
     base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     max_markets: int = 500
-    pagination_limit: int = 100
+    pagination_limit: int = 200  # Kalshi allows up to 1000
+    use_orderbooks: bool = True  # Set False for faster scanning (no rate limits)
+    series_tickers: Optional[List[str]] = None  # Fetch only from these series (e.g., ['KXNEWPOPE', 'KXG7LEADEROUT'])
 
 
 class KalshiClient(BaseAPIClient):
@@ -53,10 +86,15 @@ class KalshiClient(BaseAPIClient):
             base_url=config.base_url,
         )
         self.config = config
+        self.rate_limiter = RateLimiter(max_per_sec=8)  # Stay safely under Kalshi's 10/sec limit
+        logger.info(f"[kalshi] KalshiClient initialized: use_orderbooks={config.use_orderbooks}, max_markets={config.max_markets}")
     
     async def fetch_markets(self) -> List[Dict[str, Any]]:
         """
         Fetch all open markets from Kalshi
+        
+        If series_tickers is configured, fetches only from those series.
+        Otherwise fetches all open markets.
         
         Returns:
             List of standardized market data dicts with structure:
@@ -76,6 +114,11 @@ class KalshiClient(BaseAPIClient):
         Raises:
             APIError: If API request fails
         """
+        
+        # If series_tickers configured, use fetch_markets_by_series for targeted fetch
+        if self.config.series_tickers:
+            logger.info(f"[kalshi] Fetching markets from series: {self.config.series_tickers}")
+            return await self.fetch_markets_by_series(self.config.series_tickers)
         
         url = f"{self.base_url}/markets"
         
@@ -138,48 +181,83 @@ class KalshiClient(BaseAPIClient):
                 headers=headers
             )
 
-            # Fetch prices for each market (TODO: optimize with batch price fetching)
-            for market in markets:
-                try:
-                    ticker = market['market_id']
-                    yes_price = await self._get_market_price(ticker)
-                    market['yes_price'] = yes_price
-                    market['no_price'] = 1 - yes_price
-                    # Throttle to reduce likelihood of 429s during scans.
-                    await asyncio.sleep(0.15)
-                except RateLimitError as e:
-                    logger.warning(f"[kalshi] Rate limited fetching prices; using default 0.5 for remaining markets ({e})")
-                    market['yes_price'] = 0.5
-                    market['no_price'] = 0.5
-                except Exception as e:
-                    logger.warning(f"[kalshi] Failed to fetch price for {market.get('market_id')}: {e}")
-                    # Use default prices
-                    market['yes_price'] = 0.5
-                    market['no_price'] = 0.5
+            # Fetch prices for each market if orderbooks enabled
+            if self.config.use_orderbooks:
+                logger.info(f"[kalshi] Fetching orderbooks for {len(markets)} markets...")
+                for market in markets:
+                    try:
+                        await self.rate_limiter.async_wait()  # Rate limit orderbook calls
+                        ticker = market['market_id']
+                        yes_price = await self._get_market_price(ticker)
+                        market['yes_price'] = yes_price
+                        market['no_price'] = 1 - yes_price
+                    except RateLimitError as e:
+                        logger.warning(f"[kalshi] Rate limited fetching prices; using list price for remaining markets ({e})")
+                        # Keep the price from market list (set in _parse_market_metadata)
+                        break
+                    except Exception as e:
+                        logger.warning(f"[kalshi] Failed to fetch price for {market.get('market_id')}: {e}")
+                        # Keep the price from market list
+            else:
+                logger.info(f"[kalshi] Skipping orderbooks (use_orderbooks=False), using list prices")
         
-        logger.info(f"[kalshi] Successfully fetched {len(markets)} markets with prices")
+        logger.info(f"[kalshi] Successfully fetched {len(markets)} markets")
         return markets
     
     def _parse_market_metadata(self, market_json: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Parse a single Kalshi market JSON metadata (without price)
+        Parse a single Kalshi market JSON metadata with list price.
         
-        Note: Price is fetched separately via orderbook API
+        Uses yes_price from market list response (last trade price).
+        If use_orderbooks=True, this will be overwritten by orderbook data later.
         
         Args:
             market_json: Raw market data from Kalshi API
         
         Returns:
-            Market dict with placeholder prices (0.5) to be updated later
+            Market dict with prices from list response
         """
         try:
+            # Get price from response - prefer mid of bid/ask, fallback to last_price
+            yes_bid = market_json.get('yes_bid') or 0
+            yes_ask = market_json.get('yes_ask') or 0
+            last_price = market_json.get('last_price') or 0
+            
+            # Calculate mid-price if both bid and ask exist
+            if yes_bid > 0 and yes_ask > 0:
+                yes_price_cents = (yes_bid + yes_ask) / 2
+            elif yes_ask > 0:
+                yes_price_cents = yes_ask
+            elif yes_bid > 0:
+                yes_price_cents = yes_bid
+            elif last_price > 0:
+                yes_price_cents = last_price
+            else:
+                yes_price_cents = 50  # No price data available
+            
+            yes_price = yes_price_cents / 100 if yes_price_cents > 1 else yes_price_cents
+            yes_price = max(0.01, min(0.99, yes_price))  # Clamp to valid range
+            
+            # Build a clear title that includes the specific option
+            base_title = market_json.get('title', '')
+            yes_option = market_json.get('yes_sub_title', '')
+            
+            # If yes_sub_title exists and isn't already in title, append it
+            if yes_option and yes_option.lower() not in base_title.lower():
+                display_title = f"{base_title} [{yes_option}]"
+            else:
+                display_title = base_title
+            
             return {
                 'platform': 'kalshi',
                 'market_id': market_json.get('ticker', ''),
-                'title': market_json.get('title', ''),
-                'description': market_json.get('subtitle', ''),
-                'yes_price': 0.5,  # Will be updated by fetch_markets()
-                'no_price': 0.5,
+                'title': display_title,
+                'description': market_json.get('subtitle', '') or yes_option,
+                'yes_option': yes_option,
+                'no_option': market_json.get('no_sub_title', ''),
+                'event_ticker': market_json.get('event_ticker', ''),
+                'yes_price': yes_price,
+                'no_price': 1 - yes_price,
                 'volume': float(market_json.get('volume', 0)),
                 'liquidity': float(market_json.get('open_interest', 0)),
                 'end_date': market_json.get('expiration_time', ''),
@@ -264,6 +342,7 @@ class KalshiClient(BaseAPIClient):
         
         async with self:
             for series_ticker in series_tickers:
+                await self.rate_limiter.async_wait()  # Rate limit between series fetches
                 cursor = None
                 series_markets = []
                 

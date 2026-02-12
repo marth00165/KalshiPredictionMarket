@@ -4,7 +4,7 @@ import json
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,7 @@ class PlatformConfig:
     private_key_file: Optional[str] = None
     enabled: bool = True
     max_markets: int = 25
+    series_tickers: Optional[List[str]] = None  # For Kalshi: fetch only from these series
     
     def validate(self) -> None:
         """Validate platform configuration"""
@@ -148,6 +149,8 @@ class FiltersConfig:
     
     min_volume: float = 1000  # Minimum market volume
     min_liquidity: float = 500  # Minimum liquidity
+    volume_tiers: Optional[Dict[str, Dict[str, Any]]] = None  # Volume-based polling tiers
+    focus_categories: Optional[List[str]] = None  # Categories to prioritize
     
     def validate(self) -> None:
         """Validate filters configuration"""
@@ -155,6 +158,11 @@ class FiltersConfig:
             raise ValueError(f"min_volume must be >= 0, got {self.min_volume}")
         if self.min_liquidity < 0:
             raise ValueError(f"min_liquidity must be >= 0, got {self.min_liquidity}")
+        # Validate volume_tiers structure if provided
+        if self.volume_tiers:
+            for tier_name, tier_config in self.volume_tiers.items():
+                if not isinstance(tier_config, dict):
+                    raise ValueError(f"volume_tiers.{tier_name} must be a dict")
 
 
 @dataclass
@@ -300,6 +308,7 @@ class ConfigManager:
                 private_key_file=kalshi_raw.get('private_key_file'),
                 enabled=kalshi_raw.get('enabled', True),
                 max_markets=kalshi_raw.get('max_markets', 500),
+                series_tickers=kalshi_raw.get('series_tickers'),  # Optional list of series to fetch
             ),
         )
         try:
@@ -346,6 +355,8 @@ class ConfigManager:
         self.filters = FiltersConfig(
             min_volume=filters_raw.get('min_volume', 1000),
             min_liquidity=filters_raw.get('min_liquidity', 500),
+            volume_tiers=filters_raw.get('volume_tiers'),
+            focus_categories=filters_raw.get('focus_categories'),
         )
         try:
             self.filters.validate()

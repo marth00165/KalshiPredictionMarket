@@ -115,6 +115,7 @@ class ClaudeResponseParser:
                 confidence_level=confidence,
                 reasoning=data.get('reasoning', ''),
                 data_sources=data.get('data_sources', []),
+                key_factors=data.get('key_factors', []),
                 edge=edge
             )
             
@@ -159,6 +160,9 @@ class MarketDataParser:
                 liquidity=float(data.get('liquidity', 0)),
                 end_date=data.get('end_date', ''),
                 category=data.get('category', 'other'),
+                event_ticker=data.get('event_ticker', ''),
+                yes_option=data.get('yes_option', ''),
+                no_option=data.get('no_option', ''),
             )
             return market
         except (KeyError, ValueError, TypeError) as e:
