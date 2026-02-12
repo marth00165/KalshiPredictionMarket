@@ -42,6 +42,10 @@ class OpenAIAnalyzer:
         return valid_results
 
     async def analyze_single_market(self, market: MarketData) -> Optional[FairValueEstimate]:
+        if not self.config.api.openai_api_key:
+            logger.error("OpenAI API key not configured")
+            return None
+
         prompt = self._build_analysis_prompt(market)
 
         try:
