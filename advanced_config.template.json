@@ -1,0 +1,57 @@
+{
+  "analysis": {
+    "provider": "openai",
+    "allow_runtime_override": true
+  },
+  "api": {
+    "claude_api_key": "YOUR_CLAUDE_API_KEY_HERE",
+    "openai_api_key": "YOUR_OPENAI_API_KEY_HERE",
+    "batch_size": 5,
+    "api_cost_limit_per_cycle": 5.00
+  },
+  "openai": {
+    "model": "gpt-4o-mini",
+    "temperature": 0.3,
+    "max_tokens": 1000,
+    "base_url": "https://api.openai.com/v1",
+    "input_cost_per_mtok": 0.15,
+    "output_cost_per_mtok": 0.60
+  },
+  "claude": {
+    "model": "claude-3-5-sonnet-20241022",
+    "temperature": 0.3,
+    "max_tokens": 1000,
+    "input_cost_per_mtok": 3.00,
+    "output_cost_per_mtok": 15.00
+  },
+  "platforms": {
+    "polymarket": {
+      "api_key": "YOUR_POLYMARKET_API_KEY_HERE",
+      "enabled": false,
+      "max_markets": 25
+    },
+    "kalshi": {
+      "api_key": "YOUR_KALSHI_API_KEY_HERE",
+      "private_key_file": "kalshi_private_key.txt",
+      "enabled": true,
+      "max_markets": 25
+    }
+  },
+  "trading": {
+    "initial_bankroll": 10000,
+    "dry_run": true
+  },
+  "strategy": {
+    "min_edge": 0.08,
+    "min_confidence": 0.60
+  },
+  "risk": {
+    "max_kelly_fraction": 0.25,
+    "max_positions": 10,
+    "max_position_size": 1000
+  },
+  "filters": {
+    "min_volume": 1000,
+    "min_liquidity": 500
+  }
+}
