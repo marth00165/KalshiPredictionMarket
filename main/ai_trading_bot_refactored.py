@@ -504,6 +504,156 @@ class AdvancedTradingBot:
 
         self.config.analysis.provider = provider_norm
         self.analyzer = self._create_analyzer(provider_norm)
+
+    async def discover_kalshi_series(self, category: Optional[str] = None) -> List[dict]:
+        """
+        Discover available series on Kalshi.
+        
+        Useful for finding series_ticker values for targeted scanning.
+        
+        Args:
+            category: Optional category filter (e.g., 'Economics', 'Politics')
+        
+        Returns:
+            List of series info dicts
+        """
+        if not self.scanner.kalshi_client:
+            logger.error("Kalshi client not configured")
+            return []
+        
+        return await self.scanner.kalshi_client.discover_series(category)
+
+    async def scan_series_markets(
+        self,
+        series_tickers: List[str],
+        status: str = "open",
+    ) -> List[MarketData]:
+        """
+        Scan markets by series ticker — lightweight, no rate limit issues.
+        
+        This is the recommended method for dry runs and data collection.
+        Uses prices from market list response (no orderbook calls).
+        
+        Args:
+            series_tickers: List of series tickers (e.g., ['KXFED', 'KXCPI'])
+            status: Market status filter ('open', 'closed', 'settled')
+        
+        Returns:
+            List of MarketData objects
+        """
+        if not self.scanner.kalshi_client:
+            logger.error("Kalshi client not configured")
+            return []
+        
+        market_dicts = await self.scanner.kalshi_client.fetch_markets_by_series(
+            series_tickers=series_tickers,
+            status=status,
+        )
+        
+        # Convert to MarketData
+        markets = BatchParser.parse_markets_batch(market_dicts)
+        logger.info(f"✅ Scanned {len(markets)} markets from series: {series_tickers}")
+        
+        return markets
+
+    async def run_series_scan(
+        self,
+        series_tickers: List[str],
+        analyze: bool = False,
+        max_analyze: int = 10,
+    ) -> dict:
+        """
+        Run a lightweight scan on specific series — ideal for dry runs.
+        
+        This method:
+        1. Fetches markets by series (no orderbook calls)
+        2. Applies filters
+        3. Optionally analyzes top N markets with AI
+        4. Returns a report dict
+        
+        Args:
+            series_tickers: List of series tickers to scan
+            analyze: Whether to run AI analysis on filtered markets
+            max_analyze: Max markets to analyze (to limit API costs)
+        
+        Returns:
+            Report dict with scan results
+        """
+        logger.info("=" * 60)
+        logger.info(f"🔍 SERIES SCAN: {series_tickers}")
+        logger.info("=" * 60)
+        
+        report = {
+            "timestamp": datetime.now().isoformat(),
+            "series_tickers": series_tickers,
+            "analyze": analyze,
+            "counts": {
+                "scanned": 0,
+                "passed_filters": 0,
+                "analyzed": 0,
+            },
+            "markets": [],
+            "filtered_markets": [],
+            "analyses": [],
+        }
+        
+        # Step 1: Fetch markets
+        markets = await self.scan_series_markets(series_tickers)
+        report["counts"]["scanned"] = len(markets)
+        
+        # Store all market info
+        for m in markets:
+            report["markets"].append({
+                "market_id": m.market_id,
+                "title": m.title,
+                "yes_price": m.yes_price,
+                "volume": m.volume,
+                "liquidity": m.liquidity,
+                "end_date": m.end_date,
+                "category": m.category,
+            })
+        
+        # Step 2: Apply filters
+        filtered = self.strategy.filter_markets(markets)
+        report["counts"]["passed_filters"] = len(filtered)
+        
+        for m in filtered:
+            filter_result = self.strategy.evaluate_market_filters(m)
+            report["filtered_markets"].append({
+                "market_id": m.market_id,
+                "title": m.title,
+                "yes_price": m.yes_price,
+                "volume": m.volume,
+                "liquidity": m.liquidity,
+                "filter_checks": filter_result,
+            })
+        
+        logger.info(f"📊 Scanned: {len(markets)}, Passed filters: {len(filtered)}")
+        
+        # Step 3: Optional AI analysis
+        if analyze and filtered:
+            to_analyze = filtered[:max_analyze]
+            logger.info(f"🤖 Analyzing top {len(to_analyze)} markets...")
+            
+            for market in to_analyze:
+                try:
+                    estimate = await self.analyzer.analyze_market(market)
+                    if estimate:
+                        report["analyses"].append({
+                            "market_id": market.market_id,
+                            "title": market.title,
+                            "market_price": market.yes_price,
+                            "estimated_probability": estimate.probability,
+                            "confidence": estimate.confidence,
+                            "edge": estimate.probability - market.yes_price,
+                            "reasoning": estimate.reasoning,
+                        })
+                        report["counts"]["analyzed"] += 1
+                except Exception as e:
+                    logger.warning(f"Error analyzing {market.market_id}: {e}")
+        
+        logger.info(f"✅ Series scan complete")
+        return report
     
     async def run_trading_cycle(self):
         """

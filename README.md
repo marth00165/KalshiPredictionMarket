@@ -79,7 +79,61 @@ python main/ai_trading_bot_refactored.py
 | `python main/ai_trading_bot_refactored.py`                         | Run bot with default config     |
 | `python main/ai_trading_bot_refactored.py --dry-run`               | Test trades without executing   |
 | `python main/ai_trading_bot_refactored.py --config my_config.json` | Run with custom config          |
+| `python main/series_scanner.py --discover`                         | Discover available Kalshi series |
+| `python main/series_scanner.py --series KXFED`                     | Scan specific series (no rate limits) |
 | `python main/ai_trading_bot.py`                                    | Run original monolithic version |
+
+## Series Scanner (Recommended for Dry Runs)
+
+The series scanner is a **lightweight, rate-limit-friendly** way to fetch and analyze Kalshi markets.
+
+Instead of fetching all 500+ markets and making individual orderbook calls (which hits rate limits), it:
+- Fetches markets by `series_ticker` — targeted, minimal API calls
+- Uses prices from the market list response — no orderbook calls needed
+- Filters by category (Economics, Politics, etc.)
+
+### Discover Available Series
+
+See all series and their categories:
+
+```bash
+python main/series_scanner.py --discover
+```
+
+Filter by category:
+
+```bash
+python main/series_scanner.py --discover --category Economics
+python main/series_scanner.py --discover --category Politics
+```
+
+### Scan Specific Series
+
+Once you know the series tickers, scan them directly:
+
+```bash
+# Scan Fed rate decision markets
+python main/series_scanner.py --series KXFED
+
+# Scan multiple series
+python main/series_scanner.py --series KXFED KXCPI KXNFP
+
+# Scan and run AI analysis (costs money)
+python main/series_scanner.py --series KXFED --analyze --max-analyze 5
+```
+
+### Series Scanner Options
+
+| Flag | Description |
+|------|-------------|
+| `--discover` | List all available series |
+| `--category <name>` | Filter series by category |
+| `--series <tickers>` | Series tickers to scan (space-separated) |
+| `--analyze` | Run AI analysis on filtered markets |
+| `--max-analyze <n>` | Limit number of markets to analyze (default: 10) |
+| `--no-save` | Don't save report to file |
+
+Reports are saved to `reports/series_scan_<timestamp>.json`.
 
 ## Configuration Basics
 
