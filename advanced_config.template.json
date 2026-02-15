@@ -1,11 +1,9 @@
 {
   "analysis": {
-    "provider": "openai",
+    "provider": "claude",
     "allow_runtime_override": true
   },
   "api": {
-    "claude_api_key": "YOUR_CLAUDE_API_KEY_HERE",
-    "openai_api_key": "YOUR_OPENAI_API_KEY_HERE",
     "batch_size": 5,
     "api_cost_limit_per_cycle": 5.00
   },
@@ -26,15 +24,12 @@
   },
   "platforms": {
     "polymarket": {
-      "api_key": "YOUR_POLYMARKET_API_KEY_HERE",
       "enabled": false,
-      "max_markets": 25
+      "max_markets": 100
     },
     "kalshi": {
-      "api_key": "YOUR_KALSHI_API_KEY_HERE",
-      "private_key_file": "kalshi_private_key.txt",
       "enabled": true,
-      "max_markets": 25
+      "max_markets": 100
     }
   },
   "trading": {
