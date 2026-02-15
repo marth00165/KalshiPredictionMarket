@@ -1,5 +1,3 @@
-"""API client module for prediction market platforms"""
-
 from .base_client import (
     BaseAPIClient,
     APIError,
@@ -10,6 +8,7 @@ from .base_client import (
 )
 from .polymarket_client import PolymarketClient, PolymarketConfig
 from .kalshi_client import KalshiClient, KalshiConfig
+from .scanner import MarketScanner
 
 __all__ = [
     'BaseAPIClient',
@@ -22,4 +21,5 @@ __all__ = [
     'PolymarketConfig',
     'KalshiClient',
     'KalshiConfig',
+    'MarketScanner',
 ]

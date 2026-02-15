@@ -6,9 +6,9 @@ from typing import List, Optional
 
 import aiohttp
 
-from api_clients.base_client import BaseAPIClient, APIError
-from models import MarketData, FairValueEstimate
-from utils import ClaudeResponseParser, ConfigManager
+from app.api_clients.base_client import BaseAPIClient, APIError
+from app.models import MarketData, FairValueEstimate
+from app.utils import ClaudeResponseParser, ConfigManager
 
 logger = logging.getLogger(__name__)
 

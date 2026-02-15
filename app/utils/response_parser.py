@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Dict, Any, Optional
 
-from models import MarketData, FairValueEstimate
+from app.models import MarketData, FairValueEstimate
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ class MarketDataParser:
         This is used by platform-specific clients after they parse their API responses.
         
         Args:
-            data: Dictionary with market data (from api_clients)
+            data: Dictionary with market data (from app.api_clients)
         
         Returns:
             MarketData object or None if validation fails

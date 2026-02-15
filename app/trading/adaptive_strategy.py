@@ -13,8 +13,8 @@ from typing import List, Optional, Dict
 from datetime import datetime, timedelta
 from enum import Enum
 
-from models import FairValueEstimate, TradeSignal
-from utils import ConfigManager
+from app.models import FairValueEstimate, TradeSignal
+from app.utils import ConfigManager
 
 logger = logging.getLogger(__name__)
 
