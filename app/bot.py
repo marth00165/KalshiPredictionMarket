@@ -7,6 +7,7 @@ from typing import List, Optional
 from pathlib import Path
 
 from app.config import ConfigManager
+from app.storage.db import DatabaseManager
 from app.models import MarketData, FairValueEstimate, TradeSignal
 from app.api_clients.scanner import MarketScanner
 from app.analysis.claude_analyzer import ClaudeAnalyzer
@@ -61,6 +62,9 @@ class AdvancedTradingBot:
         )
         self.executor = TradeExecutor(self.config)
         
+        # Database
+        self.db = DatabaseManager(self.config.db_path)
+
         # Error reporting
         self.error_reporter = get_error_reporter()
         
@@ -88,7 +92,11 @@ class AdvancedTradingBot:
 
         # Validate key availability for chosen provider
         if provider_norm == "openai":
+            if not self.config.api.openai_api_key:
+                raise ValueError("OpenAI API key not configured")
         else:
+            if not self.config.api.claude_api_key:
+                raise ValueError("Claude API key not configured")
 
         self.config.analysis.provider = provider_norm
         self._analyzer = self._create_analyzer(provider_norm)

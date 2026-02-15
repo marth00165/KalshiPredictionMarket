@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 @dataclass
+class DatabaseConfig:
+    """Configuration for SQLite database"""
+    path: str = "kalshi.sqlite"
+
+    def validate(self) -> None:
+        if not self.path:
+            raise ValueError("database path cannot be empty")
+
+
+@dataclass
 class APIConfig:
     """Configuration for API services (Claude, OpenAI)"""
     
@@ -247,6 +257,16 @@ class ConfigManager:
     def _parse_config(self, raw_config: Dict[str, Any]) -> None:
         """Parse raw JSON config into typed dataclasses"""
 
+        # Database configuration
+        db_raw = raw_config.get('database', {})
+        self.db = DatabaseConfig(
+            path=db_raw.get('path', 'kalshi.sqlite')
+        )
+        try:
+            self.db.validate()
+        except ValueError as e:
+            raise ValueError(f"Invalid database config: {e}")
+
         # Analysis provider selection
         analysis_raw = raw_config.get('analysis', {})
         self.analysis = AnalysisConfig(
@@ -380,6 +400,11 @@ class ConfigManager:
     # CONVENIENCE PROPERTIES (reduce boilerplate)
     # ========================================================================
     
+    @property
+    def db_path(self) -> str:
+        """Get path to SQLite database"""
+        return self.db.path
+
     @property
     def claude_api_key(self) -> str:
         """Get Claude API key"""
