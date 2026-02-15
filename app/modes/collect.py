@@ -1,7 +1,9 @@
 import logging
 import asyncio
+import time
 from datetime import datetime
 from typing import List, Optional
+from dataclasses import asdict
 
 from app.bot import AdvancedTradingBot
 
@@ -12,21 +14,46 @@ async def run_collect(bot: AdvancedTradingBot, series_tickers: Optional[List[str
     Run collection mode: fetch markets and store snapshots.
     For Sprint 1, this focuses on gathering data without LLM or trading.
     """
-    logger.info("Starting collection mode...")
+    start_time = time.time()
+    logger.info("🚀 Starting collection mode...")
 
-    if series_tickers:
-        logger.info(f"Scanning specific series: {series_tickers}")
-        markets = await bot.scan_series_markets(series_tickers)
-    else:
-        logger.info("Scanning all markets...")
-        markets = await bot.scanner.scan_all_markets()
+    try:
+        # Initialize database
+        await bot.db.initialize()
 
-    logger.info(f"Collected {len(markets)} markets.")
+        if series_tickers:
+            logger.info(f"Scanning specific series: {series_tickers}")
+            markets = await bot.scan_series_markets(series_tickers)
+        else:
+            logger.info("Scanning all markets...")
+            markets = await bot.scanner.scan_all_markets()
 
-    # TODO: In future steps, implement SQLite storage here
-    # For now, we just fetch them to verify the flow
+        logger.info(f"Collected {len(markets)} markets.")
 
-    return markets
+        # Persist to SQLite
+        if markets:
+            market_dicts = [asdict(m) for m in markets]
+            await bot.db.save_market_snapshots(market_dicts)
+            logger.info(f"✅ Successfully stored {len(markets)} snapshots to database.")
+
+        duration = time.time() - start_time
+
+        # Update heartbeat status
+        await bot.db.update_status("last_success_at_utc", datetime.utcnow().isoformat())
+        await bot.db.update_status("last_mode", "collect")
+        await bot.db.update_status("last_collect_count", len(markets))
+        await bot.db.update_status("last_duration_s", f"{duration:.2f}")
+
+        # Structured summary log line
+        logger.info(f"cycle_summary mode=collect scanned={len(markets)} inserted={len(markets)} errors=0 duration_s={duration:.2f}")
+
+        return markets
+
+    except Exception as e:
+        logger.error(f"❌ Collection mode failed: {e}")
+        await bot.db.update_status("last_error_at_utc", datetime.utcnow().isoformat())
+        await bot.db.update_status("last_error_message", str(e))
+        raise
 
 async def discover_kalshi_series(bot: AdvancedTradingBot, category: Optional[str] = None):
     """Discover available series on Kalshi."""
