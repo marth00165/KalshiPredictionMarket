@@ -133,6 +133,72 @@ Optional: notify on failure (webhook/email) later.
 
 ---
 
+## Implementation Guidance for Copilot
+
+### Suggested Project Layout
+
+- `app/` [COMPLETED]
+  - `__main__.py` (CLI entry) [DONE]
+  - `config.py` (parse + validate) [DONE]
+  - `api_clients/kalshi_client.py` (aiohttp client + retries + rate limit) [DONE]
+  - `storage/` [CREATED]
+    - `db.py` (SQLite connection, WAL, migrations)
+    - `migrations/` [CREATED]
+  - `modes/` [CREATED]
+    - `collect.py` [STUB CREATED]
+    - `analyze.py`
+    - `trade.py`
+  - `utils/logging.py` (structured logging helper)
+  - `utils/lock.py` (file lock)
+- `reports/` (cycle JSON output) [DONE]
+- `backups/`
+- `requirements.txt` (pinned) or `pyproject.toml` (+ lock)
+
+### CLI Requirements [PARTIALLY COMPLETED]
+
+- `--config path` [DONE]
+- `--mode collect|analyze|trade` [DONE]
+- `--dry-run` [DONE]
+- `--once` [DONE]
+- `--log-level` [DONE]
+
+### Data Model (minimal)
+
+Tables:
+
+- `market_snapshots`:
+  - `market_id TEXT`
+  - `snapshot_hour_utc TEXT` (ISO hour)
+  - `payload_json TEXT` (raw market JSON blob)
+  - `created_at_utc TEXT`
+  - UNIQUE `(market_id, snapshot_hour_utc)`
+
+Optional tables for later:
+
+- `estimates` (LLM output)
+- `signals`
+- `executions`
+- `status`
+
+---
+
+## Deployment Assumptions (VPS)
+
+- Ubuntu VPS
+- Use `systemd` timer (or cron) to run hourly
+- DB stored at fixed path (e.g., `/var/lib/kalshi/kalshi.sqlite`)
+- App logs go to journald via stdout
+
+---
+
+## Safety Defaults
+
+- Trading is OFF by default.
+- If `trade` mode is enabled, require an explicit flag like `--enable-live-trading`.
+- Enforce spend limits (`api_cost_limit_per_cycle`) and stop early.
+
+---
+
 ## Definition of Done (Sprint 1)
 
 - Runs hourly without manual intervention
