@@ -54,7 +54,7 @@ class AdvancedTradingBot:
         
         # Initialize components
         self.scanner = MarketScanner(self.config)
-        self.analyzer = self._create_analyzer(self.config.analysis_provider)
+        self._analyzer = None # Created lazily
         self.strategy = Strategy(self.config)
         self.position_manager = PositionManager(
             self.config.trading.initial_bankroll
@@ -66,6 +66,13 @@ class AdvancedTradingBot:
         
         # Cycle counter
         self.cycle_count = 0
+
+    @property
+    def analyzer(self):
+        """Lazy initializer for analyzer"""
+        if self._analyzer is None:
+            self._analyzer = self._create_analyzer(self.config.analysis_provider)
+        return self._analyzer
 
     def _create_analyzer(self, provider: str):
         provider_norm = (provider or "").strip().lower()
@@ -81,12 +88,10 @@ class AdvancedTradingBot:
 
         # Validate key availability for chosen provider
         if provider_norm == "openai":
-            _ = self.config.openai_api_key
         else:
-            _ = self.config.claude_api_key
 
         self.config.analysis.provider = provider_norm
-        self.analyzer = self._create_analyzer(provider_norm)
+        self._analyzer = self._create_analyzer(provider_norm)
 
     async def discover_kalshi_series(self, category: Optional[str] = None) -> List[dict]:
         """

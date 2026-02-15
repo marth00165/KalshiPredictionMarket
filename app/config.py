@@ -2,9 +2,12 @@
 
 import json
 import logging
+import os
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
+
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class APIConfig:
-    """Configuration for API services (Claude, etc.)"""
+    """Configuration for API services (Claude, OpenAI)"""
     
     claude_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
@@ -73,6 +76,7 @@ class PlatformConfig:
     """Configuration for a single prediction market platform"""
     
     api_key: Optional[str] = None
+    private_key: Optional[str] = None
     private_key_file: Optional[str] = None
     enabled: bool = True
     max_markets: int = 25
@@ -211,18 +215,35 @@ class ConfigManager:
             json.JSONDecodeError: If config file is invalid JSON
             ValueError: If configuration validation fails
         """
+        # Load environment variables from .env file if it exists
+        load_dotenv()
+
         self.config_path = Path(config_file)
         
         if not self.config_path.exists():
-            raise FileNotFoundError(f"Config file not found: {config_file}")
-        
-        # Load JSON
-        with open(self.config_path) as f:
-            raw_config = json.load(f)
+            logger.warning(f"Config file not found: {config_file}. Using defaults and environment variables.")
+            raw_config = {}
+        else:
+            # Load JSON
+            with open(self.config_path) as f:
+                raw_config = json.load(f)
         
         # Parse into typed configs
         self._parse_config(raw_config)
     
+    def _get_secret(self, env_var: str, json_value: Optional[str] = None) -> Optional[str]:
+        """
+        Get secret from environment variable, falling back to JSON value.
+        Filters out placeholder values starting with 'YOUR_'.
+        """
+        val = os.getenv(env_var)
+        if not val:
+            val = json_value
+
+        if val and isinstance(val, str) and (val.startswith('YOUR_') or 'YOUR_' in val):
+            return None
+        return val
+
     def _parse_config(self, raw_config: Dict[str, Any]) -> None:
         """Parse raw JSON config into typed dataclasses"""
 
@@ -241,8 +262,8 @@ class ConfigManager:
         api_raw = raw_config.get('api', {})
         try:
             self.api = APIConfig(
-                claude_api_key=api_raw.get('claude_api_key'),
-                openai_api_key=api_raw.get('openai_api_key'),
+                claude_api_key=self._get_secret('ANTHROPIC_API_KEY', api_raw.get('claude_api_key')),
+                openai_api_key=self._get_secret('OPENAI_API_KEY', api_raw.get('openai_api_key')),
                 batch_size=api_raw.get('batch_size', 50),
                 api_cost_limit_per_cycle=api_raw.get('api_cost_limit_per_cycle', 5.0),
             )
@@ -250,18 +271,6 @@ class ConfigManager:
         except ValueError as e:
             raise ValueError(f"Invalid API config: {e}")
 
-        # Provider-specific key validation
-        if self.analysis.provider == 'claude':
-            if not self.api.claude_api_key or str(self.api.claude_api_key).startswith('sk-ant-YOUR_'):
-                raise ValueError(
-                    "Invalid claude_api_key: Please set your actual Claude API key in config"
-                )
-        elif self.analysis.provider == 'openai':
-            if not self.api.openai_api_key or str(self.api.openai_api_key).startswith('sk-proj-YOUR_'):
-                raise ValueError(
-                    "Invalid openai_api_key: Please set your actual OpenAI API key in config"
-                )
-        
         # Claude configuration
         claude_raw = raw_config.get('claude', {})
         self.claude = ClaudeConfig(
@@ -298,15 +307,17 @@ class ConfigManager:
         
         self.platforms = PlatformsConfig(
             polymarket=PlatformConfig(
-                api_key=polymarket_raw.get('api_key'),
+                api_key=self._get_secret('POLYMARKET_API_KEY', polymarket_raw.get('api_key')),
+                private_key=self._get_secret('POLYMARKET_PRIVATE_KEY'),
                 private_key_file=polymarket_raw.get('private_key_file'),
-                enabled=polymarket_raw.get('enabled', True),
+                enabled=polymarket_raw.get('enabled', True), # Default to True if not in JSON
                 max_markets=polymarket_raw.get('max_markets', 500),
             ),
             kalshi=PlatformConfig(
-                api_key=kalshi_raw.get('api_key'),
+                api_key=self._get_secret('KALSHI_API_KEY', kalshi_raw.get('api_key')),
+                private_key=self._get_secret('KALSHI_PRIVATE_KEY'),
                 private_key_file=kalshi_raw.get('private_key_file'),
-                enabled=kalshi_raw.get('enabled', True),
+                enabled=kalshi_raw.get('enabled', True), # Default to True if not in JSON
                 max_markets=kalshi_raw.get('max_markets', 500),
                 series_tickers=kalshi_raw.get('series_tickers'),  # Optional list of series to fetch
             ),
@@ -422,6 +433,47 @@ class ConfigManager:
     # HELPER METHODS
     # ========================================================================
     
+    def validate_for_mode(self, mode: str) -> None:
+        """
+        Perform strict validation of required keys for a specific execution mode.
+
+        Args:
+            mode: 'collect', 'analyze', or 'trade'
+
+        Raises:
+            ValueError: If required configuration for the mode is missing
+        """
+        logger.info(f"🔍 Validating configuration for mode: {mode}")
+
+        if mode == 'collect':
+            # Collect mode requires platform keys for enabled platforms
+            if self.kalshi_enabled and not self.platforms.kalshi.api_key:
+                raise ValueError("KALSHI_API_KEY is required for collect mode when Kalshi is enabled")
+            if self.polymarket_enabled and not self.platforms.polymarket.api_key:
+                raise ValueError("POLYMARKET_API_KEY is required for collect mode when Polymarket is enabled")
+
+        elif mode == 'analyze':
+            # Analyze mode requires LLM keys
+            provider = self.analysis_provider
+            if provider == 'claude' and not self.api.claude_api_key:
+                raise ValueError("ANTHROPIC_API_KEY is required for analyze mode with Claude provider")
+            if provider == 'openai' and not self.api.openai_api_key:
+                raise ValueError("OPENAI_API_KEY is required for analyze mode with OpenAI provider")
+
+        elif mode == 'trade':
+            # Trade mode requires everything
+            self.validate_for_mode('collect')
+            self.validate_for_mode('analyze')
+
+            # Plus private keys if not dry run
+            if not self.is_dry_run:
+                if self.kalshi_enabled:
+                    if not self.platforms.kalshi.private_key and not self.platforms.kalshi.private_key_file:
+                        raise ValueError("Kalshi private key (env or file) is required for live trading")
+                if self.polymarket_enabled:
+                    if not self.platforms.polymarket.private_key and not self.platforms.polymarket.private_key_file:
+                        raise ValueError("Polymarket private key (env or file) is required for live trading")
+
     def log_config_summary(self) -> None:
         """Log a summary of the loaded configuration"""
         logger.info("\n" + "=" * 80)

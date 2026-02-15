@@ -32,6 +32,9 @@ async def main():
     try:
         bot = AdvancedTradingBot(args.config)
 
+        # Validate config for the selected mode
+        bot.config.validate_for_mode(args.mode)
+
         # Override dry-run if specified
         if args.dry_run:
             bot.config.trading.dry_run = True
