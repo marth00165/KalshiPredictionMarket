@@ -22,7 +22,7 @@ Implement modes so the app can be deployed safely:
 
 ### Modes
 
-- **collect**: fetch markets + store raw snapshots to SQLite (NO LLM, NO trading)
+- **collect**: fetch markets + store raw snapshots to SQLite (NO LLM, NO trading) [IN PROGRESS]
 - **analyze**: read from SQLite, run LLM in batches, store estimates (optional for Sprint 1)
 - **trade**: generate/execute signals (keep disabled by default; require explicit opt-in)
 
@@ -32,14 +32,19 @@ Implement modes so the app can be deployed safely:
 
 ## Hard Requirements Before Deploying
 
-### 1) Single “run once” entrypoint + exit codes
+### 0) Project Restructuring [COMPLETED]
+- Moved to `app/` package structure.
+- Split business logic into modular components (`bot.py`, `scanner.py`, `claude_analyzer.py`).
+- Established CLI entry point in `__main__.py`.
+
+### 1) Single “run once” entrypoint + exit codes [PARTIALLY COMPLETED]
 
 Provide a command that runs one cycle and exits:
 
-- `python -m app run-once --mode collect --config config.json`
+- `python -m app --mode collect --config config.json --once` [DONE]
 - Return code:
   - `0` on success
-  - non-zero on failure
+  - non-zero on failure [DONE]
 
 Avoid infinite loops for scheduled execution.
 
@@ -128,72 +133,6 @@ Optional: notify on failure (webhook/email) later.
 
 ---
 
-## Implementation Guidance for Copilot
-
-### Suggested Project Layout
-
-- `app/`
-  - `main.py` (CLI entry)
-  - `config.py` (parse + validate)
-  - `kalshi_client.py` (aiohttp client + retries + rate limit)
-  - `storage/`
-    - `db.py` (SQLite connection, WAL, migrations)
-    - `schema.sql` / migrations
-  - `modes/`
-    - `collect.py`
-    - `analyze.py`
-    - `trade.py`
-  - `logging.py` (structured logging helper)
-  - `lock.py` (file lock)
-- `reports/` (cycle JSON output)
-- `backups/`
-- `requirements.txt` (pinned) or `pyproject.toml` (+ lock)
-
-### CLI Requirements
-
-- `--config path`
-- `--mode collect|analyze|trade`
-- `--dry-run` (for analyze/trade)
-- `--once` (run one cycle and exit)
-- `--log-level`
-
-### Data Model (minimal)
-
-Tables:
-
-- `market_snapshots`:
-  - `market_id TEXT`
-  - `snapshot_hour_utc TEXT` (ISO hour)
-  - `payload_json TEXT` (raw market JSON blob)
-  - `created_at_utc TEXT`
-  - UNIQUE `(market_id, snapshot_hour_utc)`
-
-Optional tables for later:
-
-- `estimates` (LLM output)
-- `signals`
-- `executions`
-- `status`
-
----
-
-## Deployment Assumptions (VPS)
-
-- Ubuntu VPS
-- Use `systemd` timer (or cron) to run hourly
-- DB stored at fixed path (e.g., `/var/lib/kalshi/kalshi.sqlite`)
-- App logs go to journald via stdout
-
----
-
-## Safety Defaults
-
-- Trading is OFF by default.
-- If `trade` mode is enabled, require an explicit flag like `--enable-live-trading`.
-- Enforce spend limits (`api_cost_limit_per_cycle`) and stop early.
-
----
-
 ## Definition of Done (Sprint 1)
 
 - Runs hourly without manual intervention
@@ -203,23 +142,3 @@ Optional tables for later:
 - Logs show success/failure and counts
 - Heartbeat indicates last successful run
 - Backups exist and restore tested
-
-The plan is updated with:
-
-1. **Market filtering config** for macro focus (Fed/CPI/NFP series)
-2. **Gap detection utility** with SQL query and CLI command
-3. **Health check options** (file-based and optional HTTP)
-4. Expanded **data model** with calibration fields (`probability_bucket`, `event_ticker`, `macro_event_type`)
-5. **Refined CLI** with subcommands (`run`, `gaps`, `status`, `migrate`)
-6. Your earlier schema suggestions integrated
-
-Ready for your next instruction!The plan is updated with:
-
-1. **Market filtering config** for macro focus (Fed/CPI/NFP series)
-2. **Gap detection utility** with SQL query and CLI command
-3. **Health check options** (file-based and optional HTTP)
-4. Expanded **data model** with calibration fields (`probability_bucket`, `event_ticker`, `macro_event_type`)
-5. **Refined CLI** with subcommands (`run`, `gaps`, `status`, `migrate`)
-6. Your earlier schema suggestions integrated
-
-Ready for your next instruction!

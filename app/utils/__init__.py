@@ -1,6 +1,4 @@
-"""Utilities for the trading bot"""
-
-from .config_manager import ConfigManager
+from app.config import ConfigManager
 from .response_parser import (
     ClaudeResponseParser,
     MarketDataParser,

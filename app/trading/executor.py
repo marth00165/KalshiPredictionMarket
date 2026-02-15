@@ -3,8 +3,8 @@
 import logging
 from typing import List
 
-from models import TradeSignal
-from utils import (
+from app.models import TradeSignal
+from app.utils import (
     ConfigManager,
     ExecutionFailedError,
     OrderPlacementError,
