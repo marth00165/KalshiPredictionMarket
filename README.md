@@ -10,28 +10,41 @@ An AI-powered trading bot that automatically analyzes prediction markets on Poly
 pip install -r requirements.txt
 ```
 
-### 2. Set Up Configuration
+### 2. Set Up Environment & Configuration
 
-Copy and edit the configuration file with your API keys:
+The bot uses environment variables for secrets and a JSON file for settings.
 
+**1. Set up secrets:**
 ```bash
-cp advanced_config.json my_config.json
+cp .env.example .env
+```
+Edit `.env` and add your API keys (KALSHI_API_KEY, ANTHROPIC_API_KEY, etc.).
+
+**2. Set up configuration:**
+```bash
+cp advanced_config.template.json advanced_config.json
+```
+Edit `advanced_config.json` to adjust thresholds like `min_volume` or `max_markets`.
+
+### 3. Database Setup
+
+The bot uses **SQLite** for persistence (storing market snapshots and heartbeat status).
+- **Initialization**: The database is automatically created and migrated the first time you run the bot.
+- **Default path**: `kalshi.sqlite` (can be changed in `advanced_config.json` under `database.path`).
+- **WAL Mode**: Enabled by default for better performance and concurrency.
+
+### 4. Run the Bot
+
+The bot is now structured as a Python package. Use `python -m app` to run it.
+
+**Data Collection (Safe, no AI costs):**
+```bash
+python -m app --mode collect --once
 ```
 
-Edit `my_config.json` and add:
-
-- `polymarket.api_key` - Your Polymarket API token
-- `kalshi.api_key` - Your Kalshi API key
-- `claude.api_key` - Your Claude API key from Anthropic
-- `trading.initial_bankroll` - Starting capital (e.g., 1000)
-
-### 3. Run the Bot
-
-**Test run (dry-run mode, no real trades):**
-
+**Test run (dry-run mode, runs full cycle with AI analysis):**
 ```bash
-python main/ai_trading_bot_refactored.py
-# Default: uses advanced_config.json with dry_run: true
+python -m app --mode trade --once --dry-run
 ```
 
 In **dry-run mode**:
@@ -74,18 +87,18 @@ python main/ai_trading_bot_refactored.py
 
 ## Important Commands
 
-| Command                                                            | Purpose                               |
-| ------------------------------------------------------------------ | ------------------------------------- |
-| `python main/ai_trading_bot_refactored.py`                         | Run bot with default config           |
-| `python main/ai_trading_bot_refactored.py --dry-run`               | Test trades without executing         |
-| `python main/ai_trading_bot_refactored.py --config my_config.json` | Run with custom config                |
-| `python main/series_scanner.py --discover`                         | Discover available Kalshi series      |
-| `python main/series_scanner.py --series KXFED`                     | Scan specific series (no rate limits) |
-| `python main/ai_trading_bot.py`                                    | Run original monolithic version       |
+| Command                                            | Purpose                                  |
+| -------------------------------------------------- | ---------------------------------------- |
+| `python -m app --mode collect --once`              | Collect market data once and exit        |
+| `python -m app --mode trade --once --dry-run`      | Run full cycle once in dry-run mode      |
+| `python -m app --mode trade --dry-run`             | Run continuously every hour (dry-run)    |
+| `python -m app --discover-series`                  | Discover available Kalshi series         |
+| `python -m app --mode collect --series KXFED`      | Collect specific Kalshi series           |
+| `python -m app --config my_config.json`            | Run with a custom configuration file     |
 
 ## Series Scanner (Recommended for Dry Runs)
 
-The series scanner is a **lightweight, rate-limit-friendly** way to fetch and analyze Kalshi markets.
+The series scanner is a **lightweight, rate-limit-friendly** way to fetch and analyze Kalshi markets. It is integrated into the `collect` mode.
 
 Instead of fetching all 500+ markets and making individual orderbook calls (which hits rate limits), it:
 
@@ -98,41 +111,27 @@ Instead of fetching all 500+ markets and making individual orderbook calls (whic
 See all series and their categories:
 
 ```bash
-python main/series_scanner.py --discover
+python -m app --discover-series
 ```
 
 Filter by category:
 
 ```bash
-python main/series_scanner.py --discover --category Economics
-python main/series_scanner.py --discover --category Politics
+python -m app --discover-series --category Economics
+python -m app --discover-series --category Politics
 ```
 
 ### Scan Specific Series
 
-Once you know the series tickers, scan them directly:
+Once you know the series tickers, scan them directly using `collect` mode:
 
 ```bash
 # Scan Fed rate decision markets
-python main/series_scanner.py --series KXFED
+python -m app --mode collect --once --series KXFED
 
 # Scan multiple series
-python main/series_scanner.py --series KXFED KXCPI KXNFP
-
-# Scan and run AI analysis (costs money)
-python main/series_scanner.py --series KXFED --analyze --max-analyze 5
+python -m app --mode collect --once --series KXFED KXCPI KXNFP
 ```
-
-### Series Scanner Options
-
-| Flag                 | Description                                      |
-| -------------------- | ------------------------------------------------ |
-| `--discover`         | List all available series                        |
-| `--category <name>`  | Filter series by category                        |
-| `--series <tickers>` | Series tickers to scan (space-separated)         |
-| `--analyze`          | Run AI analysis on filtered markets              |
-| `--max-analyze <n>`  | Limit number of markets to analyze (default: 10) |
-| `--no-save`          | Don't save report to file                        |
 
 Reports are saved to `reports/series_scan_<timestamp>.json`.
 
@@ -174,13 +173,15 @@ Key settings in `advanced_config.json`:
 
 ## File Structure
 
-- `main/` - Main bot code
-  - `ai_trading_bot_refactored.py` - **Start here** (new modular version)
-  - `ai_trading_bot.py` - Original version
+- `app/` - Main bot package
+  - `__main__.py` - CLI entry point
+  - `bot.py` - Main orchestrator
+  - `modes/` - Execution modes (collect, analyze, trade)
   - `api_clients/` - API integration (Polymarket, Kalshi)
   - `models/` - Data models
+  - `storage/` - Persistence (SQLite, migrations)
   - `trading/` - Strategy, position management, execution
-  - `utils/` - Configuration, error handling, parsing
+  - `utils/` - Utilities and error handling
 
 - `advanced_config.json` - Main configuration file
 - `REFACTORING_COMPLETE.md` - Technical refactoring details
