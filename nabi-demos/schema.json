@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nabi.dev/schemas/market-feed-event.json",
+  "title": "Market Feed Substrate Event",
+  "description": "Schema for real-time market data events ingested as substrate Synapses. Each trade tick becomes an atomic event with causal ordering via sequence numbers and exchange timestamps.",
+  "type": "object",
+  "required": ["seq", "symbol", "exchange", "event_type", "price", "timestamp"],
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "description": "Monotonically increasing sequence number within this adapter session"
+    },
+    "symbol": {
+      "type": "string",
+      "description": "Trading pair symbol (e.g., BTCUSDT, BTCUSD)",
+      "pattern": "^[A-Z]{3,10}$"
+    },
+    "exchange": {
+      "type": "string",
+      "description": "Source exchange identifier",
+      "enum": ["binance", "coinbase", "kraken", "coincap"]
+    },
+    "event_type": {
+      "type": "string",
+      "description": "Type of market event",
+      "enum": ["trade", "ticker", "aggTrade", "spread", "volume_spike", "connection", "heartbeat"]
+    },
+    "price": {
+      "type": "string",
+      "description": "Trade/ticker price as string to preserve decimal precision"
+    },
+    "quantity": {
+      "type": "string",
+      "description": "Trade quantity as string to preserve precision"
+    },
+    "side": {
+      "type": "string",
+      "description": "Trade side: buyer or seller initiated",
+      "enum": ["buy", "sell", "unknown"]
+    },
+    "trade_id": {
+      "type": "integer",
+      "description": "Exchange-assigned trade identifier"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp from exchange (event time, not receive time)"
+    },
+    "receive_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when adapter received the message (for latency measurement)"
+    },
+    "ticker": {
+      "type": "object",
+      "description": "24h ticker summary (only present for ticker events)",
+      "properties": {
+        "high": { "type": "string" },
+        "low": { "type": "string" },
+        "volume": { "type": "string" },
+        "change_pct": { "type": "string" },
+        "best_bid": { "type": "string" },
+        "best_ask": { "type": "string" }
+      }
+    },
+    "derived": {
+      "type": "object",
+      "description": "Adapter-computed derived metrics",
+      "properties": {
+        "spread_bps": {
+          "type": "number",
+          "description": "Bid-ask spread in basis points"
+        },
+        "price_delta_pct": {
+          "type": "number",
+          "description": "Price change from previous tick as percentage"
+        },
+        "volume_zscore": {
+          "type": "number",
+          "description": "Volume z-score relative to rolling window (for spike detection)"
+        },
+        "severity_reason": {
+          "type": "string",
+          "description": "Why this tick was escalated above info severity"
+        }
+      }
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Adapter session UUID (for reconnect tracking)"
+    }
+  },
+  "additionalProperties": false,
+
+  "$defs": {
+    "severity_mapping": {
+      "description": "How market events map to substrate severity levels",
+      "type": "object",
+      "properties": {
+        "info": { "const": "Normal trade tick — standard market activity" },
+        "warning": { "const": "Spread anomaly (>50bps) or price move (>0.5% in 10s)" },
+        "critical": { "const": "Volume spike (>3σ) or price move (>2% in 60s)" },
+        "error": { "const": "Connection loss, exchange error, or data gap" }
+      }
+    },
+    "substrate_mapping": {
+      "description": "How trading concepts map to substrate primitives",
+      "type": "object",
+      "properties": {
+        "trade_tick": { "const": "Synapse — atomic observable state change" },
+        "candle_window": { "const": "Causal chain — aggregated sequence over time" },
+        "price_spike": { "const": "Governance annotation — constrains valid transitions" },
+        "spread_shift": { "const": "State machine — deterministic transition rules" },
+        "volume_burst": { "const": "Emergent topology — observable in graph density" },
+        "exchange_session": { "const": "Epoch — bounded reasoning span" }
+      }
+    }
+  }
+}

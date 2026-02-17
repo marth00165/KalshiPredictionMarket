@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nabi.dev/schemas/judgment-loop.json",
+  "title": "Judgment Loop Event Schemas",
+  "description": "Three event types that form the judgment substrate: the system learns how you decide, not what to decide. These are the primitives for delegated judgment under constraints.",
+
+  "oneOf": [
+    { "$ref": "#/$defs/attention_captured" },
+    { "$ref": "#/$defs/judgment_reflection" },
+    { "$ref": "#/$defs/posture_shift" }
+  ],
+
+  "$defs": {
+    "attention_captured": {
+      "title": "attention.captured",
+      "description": "Something grabbed your attention. You sent it to the substrate. No explanation required — the act of sending IS the signal. Context snapshot is attached automatically.",
+      "type": "object",
+      "required": ["event_type", "content_type", "timestamp"],
+      "properties": {
+        "event_type": { "const": "attention.captured" },
+        "content_type": {
+          "type": "string",
+          "enum": ["url", "text", "quote", "image", "thread"],
+          "description": "What kind of content triggered attention"
+        },
+        "content": {
+          "type": "string",
+          "description": "The URL, text snippet, or quote that was captured"
+        },
+        "source_domain": {
+          "type": "string",
+          "description": "Where it came from (e.g., x.com, techcrunch.com, manual)"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "context_snapshot": {
+          "type": "object",
+          "description": "Automatic context at capture time — the substrate fills this, not the human",
+          "properties": {
+            "btc_price": { "type": "string", "description": "BTC-USD at capture time" },
+            "eth_price": { "type": "string", "description": "ETH-USD at capture time (optional)" },
+            "market_posture": {
+              "type": "string",
+              "enum": ["unknown", "risk_on", "risk_off", "neutral", "volatile"],
+              "description": "Current substrate-derived market posture"
+            },
+            "time_of_day": {
+              "type": "string",
+              "enum": ["pre_market", "market_open", "market_close", "after_hours", "weekend"],
+              "description": "Market session context"
+            },
+            "recent_severity_counts": {
+              "type": "object",
+              "description": "Last 1h severity distribution from market feed",
+              "properties": {
+                "info": { "type": "integer" },
+                "warning": { "type": "integer" },
+                "critical": { "type": "integer" }
+              }
+            }
+          }
+        },
+        "session_id": { "type": "string", "description": "Capture session UUID" },
+        "seq": { "type": "integer", "description": "Attention event sequence number" }
+      }
+    },
+
+    "judgment_reflection": {
+      "title": "judgment.reflection",
+      "description": "Retrospective assessment of a past attention event. Was the instinct right? Would you have wanted more or less exposure? This is where the system learns WHY, not WHAT.",
+      "type": "object",
+      "required": ["event_type", "references", "assessment", "timestamp"],
+      "properties": {
+        "event_type": { "const": "judgment.reflection" },
+        "references": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Event IDs of the attention.captured events being reflected on"
+        },
+        "assessment": {
+          "type": "string",
+          "enum": ["reinforced", "contradicted", "ambiguous", "irrelevant", "premature", "late"],
+          "description": "How the original attention signal played out"
+        },
+        "outcome_quality": {
+          "type": "string",
+          "enum": ["acceptable", "unacceptable", "neutral", "exceeded"],
+          "description": "Would you have accepted this outcome?"
+        },
+        "hindsight_action": {
+          "type": "string",
+          "enum": ["increase_exposure", "decrease_exposure", "hold", "exit", "no_action_correct"],
+          "description": "What the right action would have been"
+        },
+        "narrative": {
+          "type": "string",
+          "description": "Optional freeform reflection (the human's reasoning)"
+        },
+        "time_delta_hours": {
+          "type": "number",
+          "description": "Hours between attention capture and this reflection"
+        },
+        "price_at_reflection": {
+          "type": "string",
+          "description": "BTC-USD price at reflection time"
+        },
+        "price_delta_pct": {
+          "type": "number",
+          "description": "Price change since the referenced attention event"
+        },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "session_id": { "type": "string" }
+      }
+    },
+
+    "posture_shift": {
+      "title": "posture.shift",
+      "description": "The system's derived posture change. Still no trading — just confidence and authority adjustments. This is governance, not execution.",
+      "type": "object",
+      "required": ["event_type", "direction", "magnitude", "timestamp"],
+      "properties": {
+        "event_type": { "const": "posture.shift" },
+        "direction": {
+          "type": "string",
+          "enum": ["confidence_up", "confidence_down", "uncertainty_up", "uncertainty_down", "narrative_conflict", "regime_shift"],
+          "description": "The nature of the posture change"
+        },
+        "magnitude": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Strength of the shift (0 = negligible, 1 = maximum)"
+        },
+        "trigger_events": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Event IDs that caused this posture shift"
+        },
+        "previous_posture": {
+          "type": "string",
+          "enum": ["risk_on", "risk_off", "neutral", "volatile", "unknown"]
+        },
+        "new_posture": {
+          "type": "string",
+          "enum": ["risk_on", "risk_off", "neutral", "volatile", "unknown"]
+        },
+        "authority_recommendation": {
+          "type": "string",
+          "enum": ["increase_exposure_limit", "decrease_exposure_limit", "maintain", "halt_new_positions", "exit_all"],
+          "description": "What this posture shift means for execution authority"
+        },
+        "reasoning": {
+          "type": "string",
+          "description": "Why the posture changed (derived, not human-authored)"
+        },
+        "confidence_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "System's confidence in this posture assessment"
+        },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "session_id": { "type": "string" }
+      }
+    }
+  }
+}
