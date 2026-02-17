@@ -2,6 +2,7 @@ import sqlite3
 import aiosqlite
 import logging
 import json
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -150,3 +151,35 @@ class DatabaseManager:
             async with db.execute("SELECT key, value FROM status") as cursor:
                 rows = await cursor.fetchall()
                 return {row['key']: row['value'] for row in rows}
+
+    async def backup(self, backup_dir: str = "backups") -> str:
+        """
+        Create a backup of the database using SQLite's backup API.
+
+        Args:
+            backup_dir: Directory where the backup will be stored.
+
+        Returns:
+            The path to the created backup file.
+        """
+        db_path = Path(self.db_path)
+        if not db_path.exists():
+            raise FileNotFoundError(f"Database file not found: {self.db_path}")
+
+        backup_folder = Path(backup_dir)
+        backup_folder.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_name = f"{db_path.stem}_{timestamp}{db_path.suffix}"
+        backup_path = backup_folder / backup_name
+
+        def _do_sqlite_backup():
+            with sqlite3.connect(self.db_path) as src:
+                with sqlite3.connect(backup_path) as dst:
+                    src.backup(dst)
+
+        # Run the synchronous backup in a thread to avoid blocking the event loop
+        await asyncio.to_thread(_do_sqlite_backup)
+
+        logger.info(f"✅ Database backup created: {backup_path}")
+        return str(backup_path)
