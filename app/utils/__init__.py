@@ -32,6 +32,7 @@ from .error_reporter import (
     ErrorReporter,
     get_error_reporter,
 )
+from .lock import LockManager
 
 __all__ = [
     'ConfigManager',
@@ -68,4 +69,5 @@ __all__ = [
     'ErrorReport',
     'ErrorReporter',
     'get_error_reporter',
+    'LockManager',
 ]

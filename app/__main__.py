@@ -2,8 +2,10 @@ import argparse
 import asyncio
 import logging
 import sys
+from pathlib import Path
 from app.bot import AdvancedTradingBot
 from app.modes.collect import run_collect, discover_kalshi_series
+from app.utils import LockManager
 
 def setup_logging(log_level):
     logging.basicConfig(
@@ -18,8 +20,10 @@ async def main():
     parser.add_argument('--dry-run', action='store_true', help='Run in dry-run mode')
     parser.add_argument('--once', action='store_true', help='Run one cycle and exit')
     parser.add_argument('--log-level', type=str, default='INFO', help='Logging level')
+    parser.add_argument('--lock-file', type=str, help='Custom path to lock file')
 
     # Discovery/Utility arguments
+    parser.add_argument('--backup', action='store_true', help='Create a backup of the database')
     parser.add_argument('--discover-series', action='store_true', help='Discover Kalshi series')
     parser.add_argument('--category', type=str, help='Category for series discovery')
     parser.add_argument('--series', nargs='+', help='Specific series tickers to collect')
@@ -29,16 +33,33 @@ async def main():
     setup_logging(args.log_level)
     logger = logging.getLogger("app")
 
+    # Acquire lock before proceeding
+    lock_manager = LockManager(args.lock_file)
+    if not lock_manager.acquire():
+        logger.error("Failed to acquire lock. Another instance might be running. Exiting.")
+        sys.exit(1)
+
     try:
         bot = AdvancedTradingBot(args.config)
-
-        # Validate config for the selected mode
-        bot.config.validate_for_mode(args.mode)
 
         # Override dry-run if specified
         if args.dry_run:
             bot.config.trading.dry_run = True
             logger.info("Dry-run mode enabled via CLI")
+
+        if args.backup:
+            logger.info("Creating database backup...")
+            # Initialize DB if it doesn't exist yet
+            if not Path(bot.db.db_path).exists():
+                logger.info("Database does not exist. Initializing empty database first...")
+                await bot.db.initialize()
+
+            backup_path = await bot.db.backup()
+            print(f"Database backup created at: {backup_path}")
+            return
+
+        # Validate config for the selected mode (discovery/collect/analyze/trade)
+        bot.config.validate_for_mode(args.mode)
 
         if args.discover_series:
             await discover_kalshi_series(bot, args.category)
@@ -77,6 +98,8 @@ async def main():
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
+    finally:
+        lock_manager.release()
 
 if __name__ == "__main__":
     asyncio.run(main())
