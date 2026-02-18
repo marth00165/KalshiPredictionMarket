@@ -1,249 +1,96 @@
-# Kalshi Market Predictor
+# 🤖 Kalshi & Polymarket Trading Bot
 
-An AI-powered trading bot that automatically analyzes prediction markets on Polymarket and Kalshi, calculates fair value estimates using Claude AI, and executes trades with intelligent position sizing.
+An easy-to-use, AI-powered trading bot for prediction markets. It scans markets, uses AI to figure out the "true" odds, and places smart bets automatically.
 
-## Quickstart (uv)
+---
 
+## 🌟 What This Bot Does
+- **Scans Markets**: Automatically finds active bets on Kalshi and Polymarket.
+- **AI Analysis**: Uses Claude or OpenAI to analyze news and data to find the real probability of an event happening.
+- **Smart Sizing**: Uses the "Kelly Criterion" (a math formula) to decide exactly how much to bet based on the bot's confidence.
+- **Autonomous**: Once started, it handles everything—tracking your money, managing open bets, and syncing with your exchange.
+
+---
+
+## 🚀 Beginner's Quick Start Guide
+
+### 1. Install the Bot
+First, make sure you have Python installed. Then, open your terminal and run:
 ```bash
-uv pip install -e .
-cp advanced_config.template.json advanced_config.json
-uv run python main/series_scanner.py --series KXFED --no-save
+pip install -r requirements.txt
 ```
 
-## Quick Start (Beginners)
+### 2. Set Up Your API Keys
+You need to tell the bot how to access your accounts and the AI.
+1. Copy the example file: `cp .env.example .env`
+2. Open the new `.env` file in a text editor.
+3. Add your keys:
+   - `KALSHI_API_KEY`: From your Kalshi settings.
+   - `ANTHROPIC_API_KEY`: From Anthropic (for Claude AI).
+   - `KALSHI_PRIVATE_KEY`: Needed for placing real bets.
 
-### 1. Install Dependencies
+### 3. Configure Your Settings
+1. Copy the template: `cp advanced_config.template.json advanced_config.json`
+2. Open `advanced_config.json`.
+3. **Important for Beginners**: Make sure `"dry_run": true` is set. This lets the bot "pretend" to trade so you don't lose money while learning.
 
+---
+
+## 🛡️ Safety First: Testing Your Bot
+
+Before using real money, run these commands to make sure everything is working:
+
+### 📡 Test Data Collection (Free)
+This checks if the bot can see the markets.
 ```bash
-# Install runtime deps
-uv pip install -e .
-
-# (Optional) install dev tooling
-uv pip install -e ".[dev]"
+python -m app --mode collect --once
 ```
 
-### 2. Set Up Configuration
-
-Copy and edit the configuration file with your API keys:
-
+### 🧠 Test AI Analysis (Costs a few cents in AI tokens)
+This runs a full cycle, analyzes a few markets, but **will not** place any real bets.
 ```bash
-cp advanced_config.template.json my_config.json
+python -m app --mode trade --once --dry-run
 ```
 
-Edit `my_config.json` and add:
+---
 
-- `polymarket.api_key` - Your Polymarket API token
-- `kalshi.api_key` - Your Kalshi API key
-- `claude.api_key` - Your Claude API key from Anthropic
-- `trading.initial_bankroll` - Starting capital (e.g., 1000)
+## 💸 Going Live
 
-### 3. Run the Bot
+Once you are confident the bot is making good choices in Dry Run mode, you can go live:
 
-**Test run (dry-run mode, no real trades):**
-
+1. Edit `advanced_config.json`.
+2. Change `"dry_run": false`.
+3. Set your `"initial_bankroll": 100` (Start small!).
+4. Run the bot:
 ```bash
-python main/ai_trading_bot_refactored.py
-# Default: uses advanced_config.json with dry_run: true
+python -m app --mode trade
 ```
 
-In **dry-run mode**:
+---
 
-- ✅ Scans all markets from Polymarket and Kalshi
-- ✅ Analyzes with Claude AI (costs money for API calls)
-- ✅ Generates trade signals with position sizing
-- ✅ **Blocks execution** - logs signals instead of placing bets
-- ✅ **Zero trading losses**
+## 📖 Common Commands
 
-**Live trading (real money):**
+| Command | What it does |
+|---------|--------------|
+| `python -m app --mode collect` | Just watches markets and saves data. |
+| `python -m app --mode trade --dry-run` | Runs full AI analysis without betting real money. |
+| `python -m app --discover-series` | Lists all types of events (like Economics, Politics) you can track. |
+| `python -m app --backup` | Saves a backup of your trading data. |
 
-First, edit `advanced_config.json` and change the dry_run flag:
+---
 
-```json
-{
-  "trading": {
-    "dry_run": false,    ← Change from true to false
-    "initial_bankroll": 1000
-  }
-}
-```
+## ❓ Frequently Asked Questions
 
-Then run:
+**"Does this cost money?"**
+- Running the bot in `collect` mode is free.
+- Using the AI (Claude/OpenAI) costs a small amount per scan (usually a few cents).
+- Real trading, of course, uses your Kalshi/Polymarket balance.
 
-```bash
-python main/ai_trading_bot_refactored.py
-```
+**"The bot stopped trading. Why?"**
+- Check your bankroll. The bot will automatically stop if your balance hits $0 to protect you.
+- Check the logs. If your API keys expire, it will stop and tell you why.
 
-⚠️ **WARNING**: `dry_run: false` places **REAL bets** with **REAL money**!
+---
 
-## How It Works
-
-1. **Scans** - Bot checks Polymarket and Kalshi for active markets
-2. **Analyzes** - Claude AI estimates fair value for each market
-3. **Identifies** - Finds opportunities where market price differs from fair value
-4. **Sizes** - Kelly Criterion calculates optimal position size
-5. **Executes** - Places trades on profitable opportunities
-6. **Reports** - Tracks performance and error logs
-
-## Important Commands
-
-| Command                                                            | Purpose                         |
-| ------------------------------------------------------------------ | ------------------------------- |
-| `python main/ai_trading_bot_refactored.py`                         | Run bot with default config     |
-| `python main/ai_trading_bot_refactored.py --dry-run`               | Test trades without executing   |
-| `python main/ai_trading_bot_refactored.py --config my_config.json` | Run with custom config          |
-| `python main/series_scanner.py --discover`                         | Discover available Kalshi series |
-| `python main/series_scanner.py --series KXFED`                     | Scan specific series (no rate limits) |
-| `python main/ai_trading_bot.py`                                    | Run original monolithic version |
-
-## Dev Workflow (pyproject.toml)
-
-This repo uses a `pyproject.toml`-based layout. Use editable installs to avoid
-`PYTHONPATH` hacks and to keep imports consistent.
-
-```bash
-# Run a quick import check
-uv run python -c "import ai_trading_bot_refactored"
-
-# Run series scan (dry run, no report saved)
-uv run python main/series_scanner.py --series KXFED --no-save
-
-# Run tests (if/when tests are added)
-uv run pytest
-```
-
-## Series Scanner (Recommended for Dry Runs)
-
-The series scanner is a **lightweight, rate-limit-friendly** way to fetch and analyze Kalshi markets.
-
-Instead of fetching all 500+ markets and making individual orderbook calls (which hits rate limits), it:
-- Fetches markets by `series_ticker` — targeted, minimal API calls
-- Uses prices from the market list response — no orderbook calls needed
-- Filters by category (Economics, Politics, etc.)
-
-### Discover Available Series
-
-See all series and their categories:
-
-```bash
-python main/series_scanner.py --discover
-```
-
-Filter by category:
-
-```bash
-python main/series_scanner.py --discover --category Economics
-python main/series_scanner.py --discover --category Politics
-```
-
-### Scan Specific Series
-
-Once you know the series tickers, scan them directly:
-
-```bash
-# Scan Fed rate decision markets
-python main/series_scanner.py --series KXFED
-
-# Scan multiple series
-python main/series_scanner.py --series KXFED KXCPI KXNFP
-
-# Scan and run AI analysis (costs money)
-python main/series_scanner.py --series KXFED --analyze --max-analyze 5
-```
-
-### Series Scanner Options
-
-| Flag | Description |
-|------|-------------|
-| `--discover` | List all available series |
-| `--category <name>` | Filter series by category |
-| `--series <tickers>` | Series tickers to scan (space-separated) |
-| `--analyze` | Run AI analysis on filtered markets |
-| `--max-analyze <n>` | Limit number of markets to analyze (default: 10) |
-| `--no-save` | Don't save report to file |
-
-Reports are saved to `reports/series_scan_<timestamp>.json`.
-
-## Configuration Basics
-
-Key settings in `advanced_config.json`:
-
-```json
-{
-  "trading": {
-    "dry_run": true,              ← Set to false for live trading
-    "initial_bankroll": 1000,
-    "min_edge_percentage": 8.0
-  },
-  "strategy": {
-    "min_volume_usd": 500,
-    "min_liquidity_usd": 200
-  },
-  "polymarket": {
-    "api_base_url": "https://clob.polymarket.com"
-  },
-  "kalshi": {
-    "api_base_url": "https://api.kalshi.com/v2"
-  }
-}
-```
-
-### Dry-Run vs Live Mode
-
-| Phase               | Dry-Run        | Live               |
-| ------------------- | -------------- | ------------------ |
-| Market Scanning     | ✅ Real data   | ✅ Real data       |
-| Claude Analysis     | ✅ Real calls  | ✅ Real calls      |
-| Signal Generation   | ✅ Normal      | ✅ Normal          |
-| **Trade Execution** | **❌ Blocked** | **✅ Places bets** |
-| Money Risk          | None           | **Real money!**    |
-
-**Safe Workflow**: Always test with `dry_run: true` first, then change one flag to go live.
-
-## File Structure
-
-- `main/` - Main bot code
-  - `ai_trading_bot_refactored.py` - **Start here** (new modular version)
-  - `ai_trading_bot.py` - Original version
-  - `api_clients/` - API integration (Polymarket, Kalshi)
-  - `models/` - Data models
-  - `trading/` - Strategy, position management, execution
-  - `utils/` - Configuration, error handling, parsing
-
-- `advanced_config.json` - Main configuration file
-- `REFACTORING_COMPLETE.md` - Technical refactoring details
-
-## Troubleshooting
-
-**"Module not found" error:**
-
-```bash
-# Make sure you're in the right directory
-cd /Users/rohitpratti/repos/KalshiMarketPredictor
-
-# Re-install dependencies
-pip install --upgrade -r requirements.txt
-```
-
-**API authentication fails:**
-
-- Check API keys in config are correct
-- Ensure they have proper permissions on their respective platforms
-- Check `error_logs.json` for detailed error messages
-
-**"Insufficient bankroll" error:**
-
-- Your `initial_bankroll` is too low for current opportunities
-- Lower `min_volume_usd` and `min_liquidity_usd` thresholds, or increase bankroll
-
-## Next Steps
-
-1. **Test Mode First** - Always run with `--dry-run` before live trading
-2. **Start Small** - Set low initial bankroll to test strategy
-3. **Monitor Logs** - Check `error_logs.json` for issues
-4. **Read Docs** - See `main/QUICK_REFERENCE.md` for advanced features
-
-## Need Help?
-
-- Check [QUICK_REFERENCE.md](main/QUICK_REFERENCE.md) for API reference
-- Read [REFACTORING_COMPLETE.md](REFACTORING_COMPLETE.md) for architecture overview
-- Review [USAGE_EXAMPLES.md](main/USAGE_EXAMPLES.md) for code examples
+## 🛠️ Need Technical Details?
+Check out [TECHNICAL_DOCS.md](./TECHNICAL_DOCS.md) for a deep dive into how the bot works, the database structure, and the safety systems.
