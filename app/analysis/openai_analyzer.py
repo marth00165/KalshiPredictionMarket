@@ -27,6 +27,11 @@ class OpenAIAnalyzer:
         )
         self.config = config
         self._context_json_block = load_context_json_block(config)
+        self._runtime_context_block = ""
+
+    def set_runtime_context_block(self, context_text: str) -> None:
+        """Set optional runtime context block (e.g., prior analysis blurbs)."""
+        self._runtime_context_block = str(context_text or "").strip()
 
     async def analyze_market_batch(
         self,
@@ -72,14 +77,24 @@ class OpenAIAnalyzer:
             return None
 
     def _build_analysis_prompt(self, market: MarketData) -> str:
-        context_section = ""
+        context_blocks = []
         if self._context_json_block:
-            context_section = f"""
-
+            context_blocks.append(
+                f"""
 ADDITIONAL USER CONTEXT (local JSON file):
 {self._context_json_block}
 
 Use this context as supplemental evidence. If it conflicts with market data or is stale, explain that in reasoning."""
+            )
+        if self._runtime_context_block:
+            context_blocks.append(
+                f"""
+RECENT INTERNAL ANALYSIS CONTEXT (historical, from prior runs):
+{self._runtime_context_block}
+
+Treat this as historical signal memory. It can be stale; verify against current market state before relying on it."""
+            )
+        context_section = "".join(context_blocks)
 
         return f"""Analyze this prediction market and estimate the TRUE probability of the outcome.
 

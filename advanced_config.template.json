@@ -3,7 +3,11 @@
     "provider": "claude",
     "allow_runtime_override": true,
     "context_json_path": "context/llm_context.json",
-    "context_max_chars": 12000
+    "context_max_chars": 12000,
+    "persist_reasoning_to_db": true,
+    "use_recent_reasoning_context": true,
+    "recent_reasoning_entries": 12,
+    "recent_reasoning_max_chars": 4000
   },
   "api": {
     "batch_size": 5,

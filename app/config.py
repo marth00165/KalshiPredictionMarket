@@ -51,6 +51,10 @@ class AnalysisConfig:
     allow_runtime_override: bool = True
     context_json_path: Optional[str] = None
     context_max_chars: int = 12000
+    persist_reasoning_to_db: bool = True
+    use_recent_reasoning_context: bool = True
+    recent_reasoning_entries: int = 12
+    recent_reasoning_max_chars: int = 4000
 
     def validate(self) -> None:
         provider_normalized = (self.provider or "").strip().lower()
@@ -58,6 +62,10 @@ class AnalysisConfig:
             raise ValueError(f"provider must be 'claude' or 'openai', got {self.provider!r}")
         if self.context_max_chars < 1:
             raise ValueError("context_max_chars must be >= 1")
+        if self.recent_reasoning_entries < 1:
+            raise ValueError("recent_reasoning_entries must be >= 1")
+        if self.recent_reasoning_max_chars < 1:
+            raise ValueError("recent_reasoning_max_chars must be >= 1")
         self.provider = provider_normalized
 
 
@@ -455,6 +463,10 @@ class ConfigManager:
             allow_runtime_override=analysis_raw.get('allow_runtime_override', True),
             context_json_path=analysis_raw.get('context_json_path'),
             context_max_chars=analysis_raw.get('context_max_chars', 12000),
+            persist_reasoning_to_db=analysis_raw.get('persist_reasoning_to_db', True),
+            use_recent_reasoning_context=analysis_raw.get('use_recent_reasoning_context', True),
+            recent_reasoning_entries=analysis_raw.get('recent_reasoning_entries', 12),
+            recent_reasoning_max_chars=analysis_raw.get('recent_reasoning_max_chars', 4000),
         )
         try:
             self.analysis.validate()
@@ -772,6 +784,11 @@ class ConfigManager:
         logger.info(f"   Provider: {provider}")
         if self.analysis.context_json_path:
             logger.info(f"   Context JSON: {self.analysis.context_json_path}")
+        logger.info(
+            "   DB reasoning memory: "
+            f"{'✅ persist' if self.analysis.persist_reasoning_to_db else '❌ off'}, "
+            f"{'✅ prompt context' if self.analysis.use_recent_reasoning_context else '❌ prompt off'}"
+        )
         if provider == "openai":
             logger.info(f"   Model: {self.openai.model}")
             logger.info(f"   Temperature: {self.openai.temperature}")
@@ -919,5 +936,9 @@ class ConfigManager:
                 'provider': self.analysis.provider,
                 'context_json_path': self.analysis.context_json_path,
                 'context_max_chars': self.analysis.context_max_chars,
+                'persist_reasoning_to_db': self.analysis.persist_reasoning_to_db,
+                'use_recent_reasoning_context': self.analysis.use_recent_reasoning_context,
+                'recent_reasoning_entries': self.analysis.recent_reasoning_entries,
+                'recent_reasoning_max_chars': self.analysis.recent_reasoning_max_chars,
             },
         }

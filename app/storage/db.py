@@ -151,6 +151,34 @@ class DatabaseManager:
             """
             ALTER TABLE executions ADD COLUMN reconcile_attempts INTEGER DEFAULT 0;
             ALTER TABLE executions ADD COLUMN last_reconciled_at_utc TEXT;
+            """,
+            # Version 8: Persist LLM analysis blurbs for future prompt context
+            """
+            CREATE TABLE IF NOT EXISTS analysis_reasoning (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER,
+                market_id TEXT NOT NULL,
+                event_ticker TEXT,
+                series_ticker TEXT,
+                platform TEXT NOT NULL,
+                title TEXT,
+                selection TEXT,
+                yes_price REAL,
+                fair_probability REAL,
+                edge REAL,
+                confidence REAL,
+                action TEXT,
+                position_size REAL,
+                provider TEXT NOT NULL,
+                reasoning TEXT NOT NULL,
+                analyzed_at_utc TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL,
+                UNIQUE(cycle_id, market_id, platform, provider)
+            );
+            CREATE INDEX IF NOT EXISTS idx_analysis_reasoning_analyzed_at
+            ON analysis_reasoning(analyzed_at_utc DESC);
+            CREATE INDEX IF NOT EXISTS idx_analysis_reasoning_series
+            ON analysis_reasoning(platform, series_ticker, analyzed_at_utc DESC);
             """
         ]
 
@@ -226,6 +254,117 @@ class DatabaseManager:
             async with db.execute("SELECT key, value FROM status") as cursor:
                 rows = await cursor.fetchall()
                 return {row['key']: row['value'] for row in rows}
+
+    async def save_analysis_reasoning_entries(self, entries: List[Dict[str, Any]]) -> int:
+        """
+        Persist LLM analysis reasoning entries for later context reuse.
+
+        Returns:
+            Number of entries written (inserted or updated).
+        """
+        if not entries:
+            return 0
+
+        now = datetime.utcnow().isoformat() + "Z"
+        written = 0
+
+        async with aiosqlite.connect(self.db_path) as db:
+            for entry in entries:
+                try:
+                    await db.execute(
+                        """
+                        INSERT INTO analysis_reasoning (
+                            cycle_id, market_id, event_ticker, series_ticker, platform,
+                            title, selection, yes_price, fair_probability, edge, confidence,
+                            action, position_size, provider, reasoning, analyzed_at_utc, created_at_utc
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(cycle_id, market_id, platform, provider) DO UPDATE SET
+                            event_ticker=excluded.event_ticker,
+                            series_ticker=excluded.series_ticker,
+                            title=excluded.title,
+                            selection=excluded.selection,
+                            yes_price=excluded.yes_price,
+                            fair_probability=excluded.fair_probability,
+                            edge=excluded.edge,
+                            confidence=excluded.confidence,
+                            action=excluded.action,
+                            position_size=excluded.position_size,
+                            reasoning=excluded.reasoning,
+                            analyzed_at_utc=excluded.analyzed_at_utc
+                        """,
+                        (
+                            entry.get("cycle_id"),
+                            entry.get("market_id"),
+                            entry.get("event_ticker"),
+                            entry.get("series_ticker"),
+                            entry.get("platform"),
+                            entry.get("title"),
+                            entry.get("selection"),
+                            entry.get("yes_price"),
+                            entry.get("fair_probability"),
+                            entry.get("edge"),
+                            entry.get("confidence"),
+                            entry.get("action"),
+                            entry.get("position_size"),
+                            entry.get("provider") or "unknown",
+                            entry.get("reasoning") or "",
+                            entry.get("analyzed_at_utc") or now,
+                            now,
+                        ),
+                    )
+                    written += 1
+                except Exception as e:
+                    logger.warning(
+                        "Failed to persist analysis reasoning for %s: %s",
+                        entry.get("market_id"),
+                        e,
+                    )
+            await db.commit()
+
+        return written
+
+    async def get_recent_analysis_reasoning(
+        self,
+        limit: int = 20,
+        platform: Optional[str] = None,
+        series_tickers: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Load recent analysis blurbs for use as prompt context.
+        """
+        safe_limit = max(1, int(limit or 1))
+        where_clauses: List[str] = []
+        params: List[Any] = []
+
+        if platform:
+            where_clauses.append("platform = ?")
+            params.append(platform)
+
+        if series_tickers:
+            normalized_series = [s for s in series_tickers if s]
+            if normalized_series:
+                placeholders = ",".join(["?"] * len(normalized_series))
+                where_clauses.append(f"series_ticker IN ({placeholders})")
+                params.extend(normalized_series)
+
+        query = """
+            SELECT
+                cycle_id, market_id, event_ticker, series_ticker, platform,
+                title, selection, yes_price, fair_probability, edge, confidence,
+                action, position_size, provider, reasoning, analyzed_at_utc
+            FROM analysis_reasoning
+        """
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+        query += " ORDER BY analyzed_at_utc DESC LIMIT ?"
+        params.append(safe_limit)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
 
     async def backup(self, backup_dir: str = "backups") -> str:
         """

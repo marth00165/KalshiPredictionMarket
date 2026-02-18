@@ -332,6 +332,150 @@ class AdvancedTradingBot:
         except Exception as e:
             logger.warning(f"Failed to append trade journal entry: {e}")
 
+    async def _set_recent_reasoning_prompt_context(self, markets: List[MarketData]) -> None:
+        """
+        Load recent persisted LLM blurbs and pass them into analyzer runtime context.
+        """
+        analyzer = self.analyzer
+        setter = getattr(analyzer, "set_runtime_context_block", None)
+        if not callable(setter):
+            return
+
+        if not bool(getattr(self.config.analysis, "use_recent_reasoning_context", True)):
+            setter("")
+            return
+
+        try:
+            max_entries = max(1, int(getattr(self.config.analysis, "recent_reasoning_entries", 12) or 12))
+            max_chars = max(1, int(getattr(self.config.analysis, "recent_reasoning_max_chars", 4000) or 4000))
+        except Exception:
+            max_entries = 12
+            max_chars = 4000
+
+        if not markets:
+            setter("")
+            return
+
+        unique_platforms = {m.platform for m in markets if m.platform}
+        platform = next(iter(unique_platforms)) if len(unique_platforms) == 1 else None
+        series_tickers = sorted({m.series_ticker for m in markets if m.series_ticker})
+
+        rows_result = self.db.get_recent_analysis_reasoning(
+            limit=max_entries * 3,
+            platform=platform,
+            series_tickers=series_tickers or None,
+        )
+        if asyncio.iscoroutine(rows_result):
+            rows = await rows_result
+        else:
+            rows = rows_result
+        if not rows:
+            setter("")
+            return
+
+        lines = [
+            "Recent prior-run analysis blurbs (historical; verify against current market data):"
+        ]
+        added = 0
+        seen_keys = set()
+        for row in rows:
+            if added >= max_entries:
+                break
+            market_id = str(row.get("market_id") or "").strip()
+            reasoning = str(row.get("reasoning") or "").strip()
+            if not market_id or not reasoning:
+                continue
+            key = (market_id, reasoning)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            analyzed_at = str(row.get("analyzed_at_utc") or "")
+            edge = row.get("edge")
+            conf = row.get("confidence")
+            edge_txt = f"{float(edge):+.3f}" if isinstance(edge, (int, float)) else "-"
+            conf_txt = f"{float(conf):.3f}" if isinstance(conf, (int, float)) else "-"
+            lines.append(
+                f"- {analyzed_at} | {market_id} | edge={edge_txt} conf={conf_txt} | "
+                f"{self._truncate(reasoning, 240)}"
+            )
+            added += 1
+
+        if added == 0:
+            setter("")
+            return
+
+        block = "\n".join(lines)
+        if len(block) > max_chars:
+            block = self._truncate(block, max_chars)
+        setter(block)
+        logger.info("Loaded %d recent analysis blurbs into runtime prompt context", added)
+
+    async def _persist_analysis_reasoning_to_db(self, report: Dict[str, Any]) -> None:
+        """
+        Persist LLM reasoning blurbs from this cycle for future prompt context.
+        """
+        if not bool(getattr(self.config.analysis, "persist_reasoning_to_db", True)):
+            return
+
+        markets = report.get("markets")
+        if not isinstance(markets, list) or not markets:
+            return
+
+        config_block = report.get("config") if isinstance(report.get("config"), dict) else {}
+        provider = (
+            (config_block.get("analysis_provider") if isinstance(config_block, dict) else None)
+            or self.config.analysis_provider
+            or "unknown"
+        )
+        cycle_id = int(report.get("cycle") or self.cycle_count or 0)
+        analyzed_at = str(report.get("finished_at") or datetime.utcnow().isoformat() + "Z")
+
+        entries = []
+        for row in markets:
+            if not isinstance(row, dict):
+                continue
+            analysis = row.get("analysis")
+            if not isinstance(analysis, dict):
+                continue
+            reasoning = str(analysis.get("reasoning") or "").strip()
+            if not reasoning:
+                continue
+            signal = row.get("signal") if isinstance(row.get("signal"), dict) else {}
+            entries.append({
+                "cycle_id": cycle_id,
+                "market_id": row.get("market_id"),
+                "event_ticker": row.get("event_ticker"),
+                "series_ticker": row.get("series_ticker"),
+                "platform": row.get("platform"),
+                "title": row.get("title"),
+                "selection": row.get("yes_option"),
+                "yes_price": (row.get("prices") or {}).get("yes"),
+                "fair_probability": analysis.get(
+                    "effective_probability",
+                    analysis.get("estimated_probability"),
+                ),
+                "edge": analysis.get("effective_edge", analysis.get("edge")),
+                "confidence": analysis.get(
+                    "effective_confidence",
+                    analysis.get("confidence"),
+                ),
+                "action": signal.get("action"),
+                "position_size": signal.get("position_size"),
+                "provider": provider,
+                "reasoning": reasoning,
+                "analyzed_at_utc": analyzed_at,
+            })
+
+        if not entries:
+            return
+
+        write_result = self.db.save_analysis_reasoning_entries(entries)
+        if asyncio.iscoroutine(write_result):
+            written = await write_result
+        else:
+            written = int(write_result or 0)
+        logger.info("Persisted %d analysis blurbs to DB context memory", written)
+
     async def _compute_current_equity(self) -> float:
         """
         Compute current equity for risk guards.
@@ -650,6 +794,7 @@ class AdvancedTradingBot:
             conf = analysis.get("effective_confidence", analysis.get("confidence"))
             yes_price = (market.get("prices") or {}).get("yes")
             size = signal.get("position_size")
+            reasoning = signal.get("reasoning") or analysis.get("reasoning") or "-"
 
             analysis_rows.append({
                 "market_id": market.get("market_id", ""),
@@ -661,6 +806,7 @@ class AdvancedTradingBot:
                 "conf": conf,
                 "signal": signal.get("action", "-"),
                 "size": size,
+                "reasoning": reasoning,
             })
 
         if not analysis_rows:
@@ -671,7 +817,7 @@ class AdvancedTradingBot:
             reverse=True,
         )
 
-        headers = ["Market", "Question", "Selection", "YES", "Fair", "Edge", "Conf", "Signal", "Size"]
+        headers = ["Market", "Question", "Selection", "YES", "Fair", "Edge", "Conf", "Signal", "Size", "Why"]
         rows = []
         for row in analysis_rows:
             yes_val = row["yes_price"]
@@ -689,6 +835,7 @@ class AdvancedTradingBot:
                 f"{conf_val:.3f}" if isinstance(conf_val, (int, float)) else "-",
                 self._truncate(row["signal"], 10),
                 f"${size_val:,.2f}" if isinstance(size_val, (int, float)) else "-",
+                self._truncate(row["reasoning"], 84),
             ])
 
         print("\nDRY RUN ANALYSIS RESULTS")
@@ -834,6 +981,10 @@ class AdvancedTradingBot:
                     "description": m.description,
                     "category": m.category,
                     "end_date": str(m.end_date),
+                    "event_ticker": m.event_ticker,
+                    "series_ticker": m.series_ticker,
+                    "yes_option": m.yes_option,
+                    "no_option": m.no_option,
                     "prices": {
                         "yes": m.yes_price,
                         "no": m.no_price,
@@ -876,6 +1027,7 @@ class AdvancedTradingBot:
                 provider = (self.config.analysis_provider or "claude").strip().lower()
                 logger.info(f"\n🧠 Step 3: Analyzing {len(to_analyze)} markets with {provider}...")
                 analyzed_estimates: List[FairValueEstimate] = []
+                await self._set_recent_reasoning_prompt_context(to_analyze)
                 
                 try:
                     estimates = await self.analyzer.analyze_market_batch(to_analyze)
@@ -942,8 +1094,12 @@ class AdvancedTradingBot:
         except Exception as e:
             logger.error(f"Series scan error: {e}")
             report["errors"].append({"error": str(e)})
-        
+
         report["finished_at"] = datetime.now().isoformat()
+        try:
+            await self._persist_analysis_reasoning_to_db(report)
+        except Exception as e:
+            logger.warning(f"Failed persisting analysis blurbs from series scan: {e}")
         await self._update_heartbeat()
         return report
     
@@ -1166,6 +1322,7 @@ class AdvancedTradingBot:
             # Step 3: Analyze with LLM (in batches)
             provider = (self.config.analysis_provider or "claude").strip().lower()
             logger.info(f"\n🧠 Step 3: Analyzing with {provider}...")
+            await self._set_recent_reasoning_prompt_context(filtered)
 
             batch_size = max(1, int(self.config.api.batch_size))
             cost_limit = float(self.config.api.api_cost_limit_per_cycle)
@@ -1722,12 +1879,17 @@ class AdvancedTradingBot:
             })
         
         finally:
-            # Update heartbeat at end of cycle
-            await self._update_heartbeat()
-
             # Finish cycle report in memory only.
             # JSON artifacts are intentionally limited to collect mode.
             report["finished_at"] = datetime.now().isoformat() + "Z"
+
+            try:
+                await self._persist_analysis_reasoning_to_db(report)
+            except Exception as e:
+                logger.warning(f"Failed persisting analysis blurbs from trading cycle: {e}")
+
+            # Update heartbeat at end of cycle
+            await self._update_heartbeat()
 
             # Log any errors from this cycle
             cycle_report.log_summary()
