@@ -247,7 +247,7 @@ class Strategy:
         
         # Sort by edge * confidence (best opportunities first)
         opportunities.sort(
-            key=lambda x: abs(x[1].edge) * x[1].confidence_level,
+            key=lambda x: abs(x[1].effective_edge) * x[1].effective_confidence,
             reverse=True
         )
         
@@ -311,7 +311,7 @@ class Strategy:
             
             # Calculate Kelly fraction
             kelly_frac = self.kelly.calculate_kelly_fraction(
-                probability=estimate.estimated_probability,
+                probability=estimate.effective_probability,
                 market_price=market_price,
                 max_fraction=self.config.risk.max_kelly_fraction
             )
@@ -336,23 +336,24 @@ class Strategy:
                 continue
             
             # Calculate expected value
+            probability = estimate.effective_probability
             if estimate.is_buy_yes_signal():
                 # Buying YES at market_price
-                ev = (estimate.estimated_probability * (1 - market_price) - 
-                      (1 - estimate.estimated_probability) * market_price) * position_size
+                ev = (probability * (1 - market_price) - 
+                      (1 - probability) * market_price) * position_size
             else:
                 # Buying NO at market_price
-                ev = ((1 - estimate.estimated_probability) * (1 - market_price) - 
-                      estimate.estimated_probability * market_price) * position_size
+                ev = ((1 - probability) * (1 - market_price) - 
+                      probability * market_price) * position_size
             
             # Create signal
             try:
                 signal = TradeSignal(
                     market=market,
                     action=action,
-                    fair_value=estimate.estimated_probability,
+                    fair_value=probability,
                     market_price=market_price,
-                    edge=estimate.edge,
+                    edge=estimate.effective_edge,
                     kelly_fraction=kelly_frac,
                     position_size=position_size,
                     expected_value=ev,

@@ -1,7 +1,7 @@
 """Fair value estimate model from Claude AI analysis"""
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -20,6 +20,17 @@ class FairValueEstimate:
     data_sources: List[str] = field(default_factory=list)  # Sources used for analysis
     key_factors: List[str] = field(default_factory=list)  # Key factors in the analysis
     edge: float = 0.0  # Estimated edge vs. market price (calculated field)
+    fused_probability: Optional[float] = None  # probability after external feature fusion
+    fused_confidence: Optional[float] = None  # confidence after external feature fusion
+    fused_edge: Optional[float] = None  # edge after external feature fusion
+    feature_confidence: Optional[float] = None  # confidence from external source
+    feature_signal_score: Optional[float] = None
+    feature_anomaly: Optional[float] = None
+    feature_recommendation: Optional[str] = None
+    feature_regime: Optional[str] = None
+    feature_provider: Optional[str] = None
+    fusion_metadata: Dict[str, Any] = field(default_factory=dict)
+    fusion_tags: List[str] = field(default_factory=list)
     
     def __post_init__(self):
         """Validate estimate data after initialization"""
@@ -31,6 +42,53 @@ class FairValueEstimate:
             raise ValueError(
                 f"confidence_level must be between 0 and 1, got {self.confidence_level}"
             )
+        if self.fused_probability is not None and not 0 <= self.fused_probability <= 1:
+            raise ValueError(
+                f"fused_probability must be between 0 and 1, got {self.fused_probability}"
+            )
+        if self.fused_confidence is not None and not 0 <= self.fused_confidence <= 1:
+            raise ValueError(
+                f"fused_confidence must be between 0 and 1, got {self.fused_confidence}"
+            )
+        if self.feature_confidence is not None and not 0 <= self.feature_confidence <= 1:
+            raise ValueError(
+                f"feature_confidence must be between 0 and 1, got {self.feature_confidence}"
+            )
+        if self.feature_anomaly is not None and not 0 <= self.feature_anomaly <= 1:
+            raise ValueError(
+                f"feature_anomaly must be between 0 and 1, got {self.feature_anomaly}"
+            )
+
+    @property
+    def probability(self) -> float:
+        """Backward-compatible alias used in older bot code paths."""
+        return self.estimated_probability
+
+    @property
+    def confidence(self) -> float:
+        """Backward-compatible alias used in older bot code paths."""
+        return self.confidence_level
+
+    @property
+    def effective_probability(self) -> float:
+        """Effective probability after fusion."""
+        if self.fused_probability is not None:
+            return self.fused_probability
+        return self.estimated_probability
+
+    @property
+    def effective_confidence(self) -> float:
+        """Effective confidence after fusion."""
+        if self.fused_confidence is not None:
+            return self.fused_confidence
+        return self.confidence_level
+
+    @property
+    def effective_edge(self) -> float:
+        """Effective edge after fusion."""
+        if self.fused_edge is not None:
+            return self.fused_edge
+        return self.edge
     
     def __str__(self) -> str:
         """Human-readable representation"""
@@ -50,12 +108,12 @@ class FairValueEstimate:
         Returns:
             True if both edge and confidence exceed thresholds
         """
-        return abs(self.edge) >= min_edge and self.confidence_level >= min_confidence
+        return abs(self.effective_edge) >= min_edge and self.effective_confidence >= min_confidence
     
     def is_buy_yes_signal(self) -> bool:
         """Returns True if estimate suggests buying YES outcome"""
-        return self.edge > 0
-    
+        return self.effective_edge > 0
+
     def is_buy_no_signal(self) -> bool:
         """Returns True if estimate suggests buying NO outcome"""
-        return self.edge < 0
+        return self.effective_edge < 0

@@ -15,6 +15,7 @@ from app.analysis import OpenAIAnalyzer
 from app.trading import PositionManager, Strategy, TradeExecutor
 from app.trading.bankroll_manager import BankrollManager
 from app.trading.reconciliation import ReconciliationManager
+from app.signals import SignalFusionService
 from app.utils import (
     get_error_reporter,
     BatchParser,
@@ -62,6 +63,7 @@ class AdvancedTradingBot:
         self.scanner = MarketScanner(self.config)
         self._analyzer = None # Created lazily
         self.strategy = Strategy(self.config)
+        self.signal_fusion_service = SignalFusionService(self.config)
 
         # New persistent managers
         self.bankroll_manager = BankrollManager(
@@ -233,6 +235,7 @@ class AdvancedTradingBot:
                     "min_liquidity": self.config.filters.min_liquidity,
                     "price_bounds": {"min": 0.01, "max": 0.99},
                 },
+                "signal_fusion": self.signal_fusion_service.report_status(),
                 "strategy": {
                     "min_edge": self.config.strategy.min_edge,
                     "min_confidence": self.config.strategy.min_confidence,
@@ -307,6 +310,7 @@ class AdvancedTradingBot:
                 to_analyze = filtered[:max_analyze]
                 provider = (self.config.analysis_provider or "claude").strip().lower()
                 logger.info(f"\n🧠 Step 3: Analyzing {len(to_analyze)} markets with {provider}...")
+                analyzed_estimates: List[FairValueEstimate] = []
                 
                 for market in to_analyze:
                     try:
@@ -314,25 +318,19 @@ class AdvancedTradingBot:
                         if estimate:
                             report["counts"]["analyzed"] += 1
                             report["counts"]["estimates"] += 1
+                            analyzed_estimates.append(estimate)
                             
                             # Update market row with analysis
                             if market.market_id in market_rows_by_id:
-                                edge = estimate.probability - market.yes_price
                                 market_rows_by_id[market.market_id]["analysis"] = {
-                                    "estimated_probability": estimate.probability,
-                                    "confidence": estimate.confidence,
-                                    "edge": edge,
+                                    "estimated_probability": estimate.estimated_probability,
+                                    "confidence": estimate.confidence_level,
+                                    "edge": estimate.edge,
+                                    "effective_probability": estimate.effective_probability,
+                                    "effective_confidence": estimate.effective_confidence,
+                                    "effective_edge": estimate.effective_edge,
                                     "reasoning": estimate.reasoning,
                                 }
-                                
-                                # Check if it's an opportunity
-                                if edge >= self.config.strategy.min_edge and estimate.confidence >= self.config.strategy.min_confidence:
-                                    report["counts"]["opportunities"] += 1
-                                    market_rows_by_id[market.market_id]["opportunity"] = {
-                                        "edge": edge,
-                                        "confidence": estimate.confidence,
-                                        "meets_threshold": True,
-                                    }
                                     
                     except Exception as e:
                         logger.warning(f"Error analyzing {market.market_id}: {e}")
@@ -340,6 +338,49 @@ class AdvancedTradingBot:
                             "market_id": market.market_id,
                             "error": str(e),
                         })
+                
+                # Apply optional external feature fusion.
+                if analyzed_estimates and self.signal_fusion_service.enabled:
+                    analyzed_by_id = {m.market_id: m for m in to_analyze}
+                    analyzed_estimates, fused_features = self.signal_fusion_service.apply(
+                        analyzed_estimates,
+                        analyzed_by_id,
+                    )
+                    report.setdefault("signal_fusion", {})["applied"] = len(fused_features)
+
+                # Recompute opportunities from effective values (including any fusion-adjusted estimates).
+                report["counts"]["opportunities"] = 0
+                min_edge = self.config.strategy.min_edge
+                min_confidence = self.config.strategy.min_confidence
+                for est in analyzed_estimates:
+                    row = market_rows_by_id.get(est.market_id)
+                    if not row:
+                        continue
+                    row["analysis"] = {
+                        "estimated_probability": est.estimated_probability,
+                        "confidence": est.confidence_level,
+                        "edge": est.edge,
+                        "effective_probability": est.effective_probability,
+                        "effective_confidence": est.effective_confidence,
+                        "effective_edge": est.effective_edge,
+                        "reasoning": est.reasoning,
+                        "feature_confidence": est.feature_confidence,
+                        "feature_signal_score": est.feature_signal_score,
+                        "feature_anomaly": est.feature_anomaly,
+                        "feature_recommendation": est.feature_recommendation,
+                        "feature_regime": est.feature_regime,
+                        "feature_provider": est.feature_provider,
+                        "feature_reason": (est.fusion_metadata or {}).get("feature", {}).get("reason"),
+                        "feature_rules": (est.fusion_metadata or {}).get("applied_rules", []),
+                    }
+                    if est.has_significant_edge(min_edge, min_confidence):
+                        report["counts"]["opportunities"] += 1
+                        row["opportunity"] = {
+                            "edge": est.effective_edge,
+                            "confidence": est.effective_confidence,
+                            "estimated_probability": est.effective_probability,
+                            "meets_threshold": True,
+                        }
                 
                 # Update markets list with analysis results
                 report["markets"] = list(market_rows_by_id.values())
@@ -405,6 +446,7 @@ class AdvancedTradingBot:
                     "min_edge": self.config.strategy.min_edge,
                     "min_confidence": self.config.strategy.min_confidence,
                 },
+                "signal_fusion": self.signal_fusion_service.report_status(),
                 "risk": {
                     "max_kelly_fraction": self.config.risk.max_kelly_fraction,
                     "max_positions": self.config.risk.max_positions,
@@ -562,6 +604,9 @@ class AdvancedTradingBot:
                             "estimated_probability": est.estimated_probability,
                             "confidence": est.confidence_level,
                             "edge": est.edge,
+                            "effective_probability": est.effective_probability,
+                            "effective_confidence": est.effective_confidence,
+                            "effective_edge": est.effective_edge,
                             "reasoning": est.reasoning,
                             "key_factors": est.key_factors,
                             "data_sources": est.data_sources,
@@ -580,6 +625,31 @@ class AdvancedTradingBot:
                         "Stopping analysis early."
                     )
                     break
+
+            if self.signal_fusion_service.enabled:
+                estimates, fused_features = self.signal_fusion_service.apply(
+                    estimates,
+                    {m.market_id: m for m in analyzed_markets},
+                )
+                report.setdefault("signal_fusion", {})["applied"] = len(fused_features)
+                for est in estimates:
+                    row = market_rows_by_id.get(est.market_id)
+                    if row is not None:
+                        row["analysis"] = {
+                            "estimated_probability": est.estimated_probability,
+                            "confidence": est.confidence_level,
+                            "edge": est.edge,
+                            "effective_probability": est.effective_probability,
+                            "effective_confidence": est.effective_confidence,
+                            "effective_edge": est.effective_edge,
+                            "reasoning": est.reasoning,
+                            "key_factors": est.key_factors,
+                            "data_sources": est.data_sources,
+                            "feature_confidence": est.feature_confidence,
+                            "feature_recommendation": est.feature_recommendation,
+                            "feature_provider": est.feature_provider,
+                            "feature_reason": (est.fusion_metadata or {}).get("feature", {}).get("reason"),
+                        }
 
             # Snapshot cost stats if available
             try:
@@ -604,9 +674,9 @@ class AdvancedTradingBot:
                 row = market_rows_by_id.get(market.market_id)
                 if row is not None:
                     row["opportunity"] = {
-                        "edge": est.edge,
-                        "confidence": est.confidence_level,
-                        "estimated_probability": est.estimated_probability,
+                        "edge": est.effective_edge,
+                        "confidence": est.effective_confidence,
+                        "estimated_probability": est.effective_probability,
                     }
             
             # Step 5: Generate trade signals

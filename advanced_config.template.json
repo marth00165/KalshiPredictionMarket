@@ -48,5 +48,20 @@
   "filters": {
     "min_volume": 1000,
     "min_liquidity": 500
+  },
+  "signal_fusion": {
+    "enabled": false,
+    "mode": "none",
+    "curator_jsonl_path": "path/to/curator/signals.jsonl",
+    "market_feed_jsonl_path": "path/to/market-feed/signals.jsonl",
+    "ttl_seconds": 300,
+    "max_event_age_seconds": 7200,
+    "max_scan_lines": 4000,
+    "curator_boost": 0.08,
+    "market_feed_boost": 0.06,
+    "low_recommendation_penalty": 0.22,
+    "anomaly_penalty_factor": 0.70,
+    "max_anomaly_veto": 0.95,
+    "signal_score_weight": 0.20
   }
 }

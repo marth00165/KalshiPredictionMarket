@@ -58,6 +58,68 @@ class AnalysisConfig:
 
 
 @dataclass
+class SignalFusionConfig:
+    """Configuration for optional external signal ingestion + fusion."""
+
+    enabled: bool = False
+    mode: str = "none"  # none|curator|market_feed|both
+    curator_jsonl_path: Optional[str] = None
+    market_feed_jsonl_path: Optional[str] = None
+    ttl_seconds: int = 300
+    max_event_age_seconds: int = 7200
+    max_scan_lines: int = 4000
+    curator_boost: float = 0.08
+    market_feed_boost: float = 0.06
+    low_recommendation_penalty: float = 0.22
+    anomaly_penalty_factor: float = 0.70
+    max_anomaly_veto: float = 0.95
+    signal_score_weight: float = 0.20
+
+    def validate(self) -> None:
+        mode_normalized = (self.mode or "").strip().lower()
+        if not mode_normalized:
+            mode_normalized = "none"
+
+        if mode_normalized not in {"none", "curator", "market_feed", "both"}:
+            raise ValueError(
+                f"signal_fusion.mode must be one of "
+                f"['none', 'curator', 'market_feed', 'both'], got {self.mode!r}"
+            )
+        self.mode = mode_normalized
+
+        if self.ttl_seconds < 0:
+            raise ValueError(f"ttl_seconds must be >= 0, got {self.ttl_seconds}")
+        if self.max_event_age_seconds < 0:
+            raise ValueError(
+                f"max_event_age_seconds must be >= 0, got {self.max_event_age_seconds}"
+            )
+        if self.max_scan_lines <= 0:
+            raise ValueError(f"max_scan_lines must be > 0, got {self.max_scan_lines}")
+        if not (0 <= self.curator_boost <= 1):
+            raise ValueError(f"curator_boost must be between 0 and 1, got {self.curator_boost}")
+        if not (0 <= self.market_feed_boost <= 1):
+            raise ValueError(
+                f"market_feed_boost must be between 0 and 1, got {self.market_feed_boost}"
+            )
+        if not (0 <= self.low_recommendation_penalty <= 1):
+            raise ValueError(
+                f"low_recommendation_penalty must be between 0 and 1, got {self.low_recommendation_penalty}"
+            )
+        if not (0 <= self.anomaly_penalty_factor <= 1):
+            raise ValueError(
+                f"anomaly_penalty_factor must be between 0 and 1, got {self.anomaly_penalty_factor}"
+            )
+        if not (0 <= self.max_anomaly_veto <= 1):
+            raise ValueError(
+                f"max_anomaly_veto must be between 0 and 1, got {self.max_anomaly_veto}"
+            )
+        if not (0 <= self.signal_score_weight <= 1):
+            raise ValueError(
+                f"signal_score_weight must be between 0 and 1, got {self.signal_score_weight}"
+            )
+
+
+@dataclass
 class OpenAIConfig:
     """Configuration for OpenAI models"""
 
@@ -393,6 +455,31 @@ class ConfigManager:
             self.filters.validate()
         except ValueError as e:
             raise ValueError(f"Invalid filters config: {e}")
+
+        # Signal fusion configuration
+        signal_fusion_raw = raw_config.get('signal_fusion', {})
+        self.signal_fusion = SignalFusionConfig(
+            enabled=bool(signal_fusion_raw.get('enabled', False)),
+            mode=signal_fusion_raw.get('mode', 'none'),
+            curator_jsonl_path=signal_fusion_raw.get('curator_jsonl_path'),
+            market_feed_jsonl_path=signal_fusion_raw.get('market_feed_jsonl_path'),
+            ttl_seconds=signal_fusion_raw.get('ttl_seconds', 300),
+            max_event_age_seconds=signal_fusion_raw.get('max_event_age_seconds', 7200),
+            max_scan_lines=signal_fusion_raw.get('max_scan_lines', 4000),
+            curator_boost=signal_fusion_raw.get('curator_boost', 0.08),
+            market_feed_boost=signal_fusion_raw.get('market_feed_boost', 0.06),
+            low_recommendation_penalty=signal_fusion_raw.get(
+                'low_recommendation_penalty',
+                0.22,
+            ),
+            anomaly_penalty_factor=signal_fusion_raw.get('anomaly_penalty_factor', 0.70),
+            max_anomaly_veto=signal_fusion_raw.get('max_anomaly_veto', 0.95),
+            signal_score_weight=signal_fusion_raw.get('signal_score_weight', 0.20),
+        )
+        try:
+            self.signal_fusion.validate()
+        except ValueError as e:
+            raise ValueError(f"Invalid signal_fusion config: {e}")
         
         logger.info(f"✅ Configuration loaded and validated from {self.config_path}")
     
@@ -428,6 +515,11 @@ class ConfigManager:
     def allow_runtime_override(self) -> bool:
         """Whether runtime analyzer override is allowed"""
         return self.analysis.allow_runtime_override
+
+    @property
+    def signal_fusion_enabled(self) -> bool:
+        """Whether external signal fusion is enabled"""
+        return self.signal_fusion.enabled and self.signal_fusion.mode != "none"
     
     @property
     def polymarket_enabled(self) -> bool:
@@ -578,5 +670,9 @@ class ConfigManager:
             'filters': {
                 'min_volume': self.filters.min_volume,
                 'min_liquidity': self.filters.min_liquidity,
+            },
+            'signal_fusion': {
+                'enabled': self.signal_fusion.enabled,
+                'mode': self.signal_fusion.mode,
             },
         }
