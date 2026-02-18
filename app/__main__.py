@@ -470,6 +470,211 @@ def _prompt_enable_market_picker_after_setup(args, effective_dry_run: bool) -> b
     return choice not in {"n", "no"}
 
 
+def _parse_csv_values(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _truncate(raw: str, max_len: int) -> str:
+    text = str(raw or "")
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return text[: max_len - 3] + "..."
+
+
+def _parse_index_selection(raw: str, max_index: int, max_selected: int = 10) -> list[int]:
+    selected = set()
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError("selection cannot be empty")
+
+    for token in tokens:
+        if "-" in token:
+            left, right = token.split("-", 1)
+            start = int(left)
+            end = int(right)
+            if start > end:
+                raise ValueError(f"invalid range '{token}'")
+            if start < 1 or end > max_index:
+                raise ValueError(f"range '{token}' is out of bounds 1-{max_index}")
+            for idx in range(start, end + 1):
+                selected.add(idx)
+        else:
+            idx = int(token)
+            if idx < 1 or idx > max_index:
+                raise ValueError(f"index '{idx}' is out of bounds 1-{max_index}")
+            selected.add(idx)
+
+    ordered = sorted(selected)
+    if len(ordered) > max_selected:
+        raise ValueError(f"select at most {max_selected} series, got {len(ordered)}")
+    return ordered
+
+
+def _prompt_select_series_tickers(series_items: list[dict], max_selected: int = 10) -> list[str]:
+    if not series_items:
+        return []
+
+    print(f"\nDiscovered {len(series_items)} series. Select up to {max_selected}.")
+    print("Index | Ticker                     | Title")
+    print("------|----------------------------|----------------------------------------------")
+    for i, item in enumerate(series_items, start=1):
+        ticker = str(item.get("ticker", "")).strip()
+        title = _truncate(str(item.get("title", "")).strip(), 46)
+        print(f"{i:>5} | {ticker:<26} | {title}")
+
+    print("\nEnter IDs using comma/range format (example: 1,3,5-8)")
+    while True:
+        raw = input(f"Series IDs [max {max_selected}]: ").strip().lower()
+        if raw in {"", "none", "n"}:
+            return []
+        try:
+            selected_ids = _parse_index_selection(raw, len(series_items), max_selected=max_selected)
+            selected = [series_items[idx - 1] for idx in selected_ids]
+            selected_tickers = [str(item.get("ticker", "")).strip() for item in selected if item.get("ticker")]
+            print("\nSelected series:")
+            for item in selected:
+                print(f"  - {item.get('ticker', '')}: {item.get('title', '')}")
+            confirm = input("Confirm selection and continue? [Y/n]: ").strip().lower()
+            if confirm in {"", "y", "yes"}:
+                return selected_tickers
+        except Exception as e:
+            print(f"Invalid selection: {e}")
+
+
+async def _discover_series_candidates_for_scope(
+    bot: AdvancedTradingBot,
+    category: Optional[str] = None,
+    keyword: Optional[str] = None,
+) -> list[dict]:
+    if not bot.scanner.kalshi_client:
+        return []
+
+    series = await bot.discover_kalshi_series(category)
+    keyword_norm = (keyword or "").strip().lower()
+
+    candidates = []
+    seen = set()
+    for item in series:
+        ticker = str(item.get("ticker", "")).strip()
+        title = str(item.get("title", "")).strip()
+        category_val = str(item.get("category", "")).strip()
+        if not ticker:
+            continue
+        title_norm = title.lower()
+        category_norm = category_val.lower()
+        if keyword_norm and keyword_norm not in ticker.lower() and keyword_norm not in title_norm and keyword_norm not in category_norm:
+            continue
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        candidates.append({
+            "ticker": ticker,
+            "title": title,
+            "category": category_val,
+        })
+
+    return candidates
+
+
+async def _maybe_prompt_runtime_scan_scope(args, bot: AdvancedTradingBot, logger) -> None:
+    """
+    Interactive pre-scan scope selection for trade/analyze runs.
+
+    Lets user narrow fetches before API scanning begins.
+    """
+    if args.mode not in {"trade", "analyze"}:
+        return
+    if args.backup or args.discover_series:
+        return
+    if not sys.stdin.isatty():
+        return
+    if not bot.scanner.kalshi_client:
+        return
+
+    print("\nPre-scan scope (before market fetch):")
+    print("  1) All markets (default)")
+    print("  2) Sports -> NBA preset (Kalshi series discovery)")
+    print("  3) Category + optional keyword (Kalshi series discovery)")
+    print("  4) Manual Kalshi series tickers")
+    choice = input("Choose scope [1]: ").strip().lower()
+    if choice in {"", "1", "all", "a"}:
+        bot.runtime_scan_series_tickers = None
+        bot.runtime_scan_scope_description = "all_markets"
+        logger.info("Runtime scan scope: all markets")
+        return
+
+    try:
+        if choice in {"2", "sports", "nba"}:
+            candidates = await _discover_series_candidates_for_scope(
+                bot,
+                category="Sports",
+                keyword="nba",
+            )
+            if not candidates:
+                logger.warning("No Sports/NBA series found. Falling back to all markets.")
+                return
+            tickers = _prompt_select_series_tickers(candidates, max_selected=10)
+            if not tickers:
+                logger.warning("No series selected. Falling back to all markets.")
+                return
+            bot.runtime_scan_series_tickers = tickers
+            bot.runtime_scan_scope_description = "sports_nba_series_selected"
+            logger.info(f"Runtime scan scope set: sports_nba_series_selected ({len(tickers)} series)")
+            return
+
+        if choice in {"3", "category", "c"}:
+            category = input("Category (example: Sports, Economics) [Sports]: ").strip() or "Sports"
+            keyword = input("Optional keyword filter (example: nba) [none]: ").strip()
+            candidates = await _discover_series_candidates_for_scope(
+                bot,
+                category=category,
+                keyword=keyword or None,
+            )
+            if not candidates:
+                logger.warning(
+                    f"No series found for category='{category}'"
+                    + (f", keyword='{keyword}'" if keyword else "")
+                    + ". Falling back to all markets."
+                )
+                return
+            tickers = _prompt_select_series_tickers(candidates, max_selected=10)
+            if not tickers:
+                logger.warning("No series selected. Falling back to all markets.")
+                return
+            bot.runtime_scan_series_tickers = tickers
+            bot.runtime_scan_scope_description = (
+                f"category_selected:{category}" + (f":keyword:{keyword}" if keyword else "")
+            )
+            logger.info(f"Runtime scan scope set: {bot.runtime_scan_scope_description} ({len(tickers)} series)")
+            return
+
+        if choice in {"4", "series", "s"}:
+            while True:
+                raw = input("Enter series tickers (comma separated, max 10): ").strip()
+                tickers = list(dict.fromkeys(_parse_csv_values(raw)))
+                if not tickers:
+                    logger.warning("No valid series tickers entered. Falling back to all markets.")
+                    return
+                if len(tickers) > 10:
+                    print(f"Please enter at most 10 series tickers (you entered {len(tickers)}).")
+                    continue
+                print("Selected manual series:")
+                for ticker in tickers:
+                    print(f"  - {ticker}")
+                confirm = input("Confirm selection and continue? [Y/n]: ").strip().lower()
+                if confirm in {"", "y", "yes"}:
+                    bot.runtime_scan_series_tickers = tickers
+                    bot.runtime_scan_scope_description = "manual_series_tickers"
+                    logger.info(f"Runtime scan scope set: manual_series_tickers ({len(bot.runtime_scan_series_tickers)} series)")
+                    return
+
+        logger.info("Unrecognized scope option. Using all markets.")
+    except Exception as e:
+        logger.warning(f"Failed to configure pre-scan scope: {e}. Using all markets.")
+
+
 async def main():
     parser = argparse.ArgumentParser(description="AI Trading Bot CLI")
     parser.add_argument('--config', type=str, default='advanced_config.json', help='Path to config file')
@@ -574,6 +779,8 @@ async def main():
         elif _prompt_enable_market_picker_after_setup(args, effective_dry_run):
             bot.interactive_market_pick = True
             logger.info("Interactive market picker enabled for this run")
+
+        await _maybe_prompt_runtime_scan_scope(args, bot, logger)
 
         if args.backup:
             logger.info("Creating database backup...")

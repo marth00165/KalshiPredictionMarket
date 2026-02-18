@@ -105,6 +105,7 @@ python -m app --mode trade
 | `python -m app --mode trade --once --dry-run --skip-setup-wizard` | Runs without the startup questionnaire (good for automation).                                       |
 
 Note: In interactive dry-run `trade`/`analyze` runs, the CLI also asks after setup whether you want market picking for that run.
+Note: Before scanning starts, interactive `trade`/`analyze` runs now offer a pre-scan scope menu. For discovery-based scopes (`Sports->NBA` or `category+keyword`), you get an indexed ticker-to-title list, can choose up to 10 IDs, and then confirm before scan starts.
 
 ### Config + Validation
 

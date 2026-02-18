@@ -7,6 +7,12 @@ from app.models import MarketData, FairValueEstimate, TradeSignal
 from app.bot import AdvancedTradingBot
 from app.utils import InsufficientCapitalError, NoOpportunitiesError
 
+try:
+    import pytest_asyncio  # type: ignore # noqa: F401
+    HAS_PYTEST_ASYNCIO = True
+except Exception:
+    HAS_PYTEST_ASYNCIO = False
+
 @pytest.fixture
 def mock_config():
     config = MagicMock()
@@ -62,6 +68,119 @@ def test_strategy_duplicate_guard(mock_config):
     opportunities = [(market1, est1), (market1, est1)]
     signals = strategy.generate_trade_signals(opportunities, 1000, current_open_market_keys=set())
     assert len(signals) == 1 # Only one signal generated for same market
+
+
+def test_strategy_buy_no_uses_no_probability_for_kelly(mock_config):
+    strategy = Strategy(mock_config)
+    mock_config.risk.max_kelly_fraction = 1.0
+    mock_config.risk.max_position_size = 10_000
+
+    market = MarketData(
+        market_id="m_no",
+        platform="k",
+        title="Buy NO test",
+        description="D",
+        category="C",
+        end_date="Z",
+        yes_price=0.7,
+        no_price=0.3,
+        volume=1000,
+        liquidity=1000,
+    )
+    estimate = FairValueEstimate(
+        market_id="m_no",
+        estimated_probability=0.4,  # YES probability
+        confidence_level=0.8,
+        reasoning="R",
+        edge=-0.3,  # buy_no signal
+    )
+
+    signals = strategy.generate_trade_signals(
+        [(market, estimate)],
+        current_bankroll=1000,
+        current_open_market_keys=set(),
+        current_open_event_keys=set(),
+    )
+
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal.action == "buy_no"
+
+    # Kelly for buy_no must use p_no = 1 - p_yes = 0.6 at no_price=0.3
+    expected_kelly = (0.6 - 0.3) / (1 - 0.3)
+    assert signal.kelly_fraction == pytest.approx(expected_kelly, rel=1e-6)
+
+    expected_position_size = round(expected_kelly * 1000.0, 2)
+    assert signal.position_size == pytest.approx(expected_position_size, abs=0.01)
+
+    expected_ev = (0.6 * (1 - 0.3) - 0.4 * 0.3) * signal.position_size
+    assert signal.expected_value == pytest.approx(expected_ev, rel=1e-6)
+
+
+def test_strategy_event_level_duplicate_guard_keeps_best_score(mock_config):
+    strategy = Strategy(mock_config)
+    mock_config.risk.max_kelly_fraction = 1.0
+    mock_config.risk.max_position_size = 10_000
+
+    market_low = MarketData(
+        market_id="evt1-low",
+        platform="k",
+        title="E1 Low",
+        description="D",
+        category="C",
+        end_date="Z",
+        yes_price=0.5,
+        no_price=0.5,
+        volume=1000,
+        liquidity=1000,
+        event_ticker="EVT1",
+    )
+    market_high = MarketData(
+        market_id="evt1-high",
+        platform="k",
+        title="E1 High",
+        description="D",
+        category="C",
+        end_date="Z",
+        yes_price=0.5,
+        no_price=0.5,
+        volume=1000,
+        liquidity=1000,
+        event_ticker="EVT1",
+    )
+    est_low = FairValueEstimate(
+        market_id="evt1-low",
+        estimated_probability=0.6,
+        confidence_level=0.6,
+        reasoning="R",
+        edge=0.10,  # score=0.06
+    )
+    est_high = FairValueEstimate(
+        market_id="evt1-high",
+        estimated_probability=0.65,
+        confidence_level=0.7,
+        reasoning="R",
+        edge=0.15,  # score=0.105 (winner)
+    )
+
+    signals = strategy.generate_trade_signals(
+        [(market_low, est_low), (market_high, est_high)],
+        current_bankroll=1000,
+        current_open_market_keys=set(),
+        current_open_event_keys=set(),
+    )
+
+    assert len(signals) == 1
+    assert signals[0].market.market_id == "evt1-high"
+
+    open_event_keys = {strategy.get_event_key_for_market(market_high)}
+    with pytest.raises(NoOpportunitiesError):
+        strategy.generate_trade_signals(
+            [(market_low, est_low), (market_high, est_high)],
+            current_bankroll=1000,
+            current_open_market_keys=set(),
+            current_open_event_keys=open_event_keys,
+        )
 
 
 def test_strategy_exposure_reduces_position_size(mock_config):
@@ -147,6 +266,7 @@ def test_strategy_raises_when_exposure_exhausts_bankroll(mock_config):
         )
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_PYTEST_ASYNCIO, reason="pytest-asyncio plugin not installed in this environment")
 async def test_bot_duplicate_guard_reporting(mock_config):
     with patch('app.bot.DatabaseManager'), \
          patch('app.bot.MarketScanner') as MockScanner, \
@@ -178,6 +298,16 @@ async def test_bot_duplicate_guard_reporting(mock_config):
         bot.strategy.classify_volume_tier.return_value = "high"
         bot.strategy.categorize_markets_by_tier.return_value = {"high": [market1, market2], "medium":[], "low":[], "skip":[]}
         bot.strategy.filter_markets.return_value = [market1, market2]
+        bot.strategy.get_event_key_for_platform_market.side_effect = lambda platform, market_id: f"{platform}:{market_id.rsplit('-', 1)[0] if '-' in market_id else market_id}"
+        bot.strategy.get_event_key_for_market.side_effect = lambda market: f"{market.platform}:{market.event_ticker or (market.market_id.rsplit('-', 1)[0] if '-' in market.market_id else market.market_id)}"
+        bot.strategy.get_opportunity_score_tuple.side_effect = lambda market, est: (
+            abs(est.effective_edge) * est.effective_confidence,
+            abs(est.effective_edge),
+            market.market_id,
+        )
+        bot.strategy.is_better_score.side_effect = lambda cand, cur: (
+            cand[0] > cur[0] or (cand[0] == cur[0] and (cand[1] > cur[1] or (cand[1] == cur[1] and cand[2] < cur[2])))
+        )
 
         # Mock analyzer
         est1 = FairValueEstimate(market_id="m1", estimated_probability=0.7, confidence_level=0.8, reasoning="R", edge=0.2)

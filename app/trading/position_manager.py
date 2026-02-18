@@ -18,6 +18,19 @@ from app.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_utc_timestamp(value: str) -> datetime:
+    """
+    Parse DB timestamps that may include trailing 'Z'.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return datetime.utcnow()
+    if raw.endswith("Z"):
+        # datetime.fromisoformat does not accept 'Z' in Python 3.9
+        raw = raw[:-1] + "+00:00"
+    return datetime.fromisoformat(raw)
+
+
 @dataclass
 class Trade:
     """Record of an executed trade"""
@@ -98,7 +111,7 @@ class PositionManager:
                         quantity=row['quantity'],
                         position_size=row['cost'],
                         entry_price=row['entry_price'],
-                        timestamp=datetime.fromisoformat(row['opened_at_utc']),
+                        timestamp=_parse_utc_timestamp(row['opened_at_utc']),
                         status=row['status'],
                         external_order_id=row['external_order_id']
                     )
@@ -119,6 +132,26 @@ class PositionManager:
                         self.open_positions.append(trade)
 
         logger.info(f"📂 Loaded {len(self.open_positions)} open positions and {len(self.trade_history)} historical trades from database.")
+
+    async def reset_for_new_dry_run_session(self) -> None:
+        """
+        Clear persisted paper positions/executions for a fresh dry-run app start.
+
+        This is intentionally called once per process startup in dry-run mode.
+        """
+        async with self.db.connect() as db:
+            await db.execute("DELETE FROM positions")
+            await db.execute("DELETE FROM executions")
+            await db.commit()
+
+        self.open_positions = []
+        self.trade_history = []
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = 0.0
+        self.total_loss = 0.0
+        logger.info("🧹 Dry-run session reset: cleared paper positions and executions.")
 
     # ========================================================================
     # POSITION MANAGEMENT

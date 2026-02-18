@@ -86,6 +86,8 @@ class AdvancedTradingBot:
         self.cycle_count = 0
         self._initialized = False
         self.interactive_market_pick = False
+        self.runtime_scan_series_tickers: Optional[List[str]] = None
+        self.runtime_scan_scope_description: Optional[str] = None
 
     async def initialize(self):
         """Initialize database and managers."""
@@ -93,7 +95,14 @@ class AdvancedTradingBot:
             return
 
         await self.db.initialize()
-        await self.bankroll_manager.initialize()
+
+        if self.config.is_dry_run:
+            # Fresh paper session per app startup; continuous loops keep evolving in-process.
+            await self.position_manager.reset_for_new_dry_run_session()
+            await self.bankroll_manager.reset_for_new_dry_run_session()
+        else:
+            await self.bankroll_manager.initialize()
+
         await self.position_manager.load_positions()
 
         self.reconciliation_manager = ReconciliationManager(
@@ -583,6 +592,7 @@ class AdvancedTradingBot:
             "config": {
                 "analysis_provider": self.config.analysis_provider,
                 "dry_run": self.config.is_dry_run,
+                "scan_scope": self.runtime_scan_scope_description or "all_markets",
                 "api": {
                     "batch_size": self.config.api.batch_size,
                     "api_cost_limit_per_cycle": self.config.api.api_cost_limit_per_cycle,
@@ -664,7 +674,14 @@ class AdvancedTradingBot:
 
             # Step 1: Scan markets
             logger.info("\n📊 Step 1: Scanning markets...")
-            markets = await self.scanner.scan_all_markets()
+            if self.runtime_scan_series_tickers:
+                logger.info(
+                    f"Using scoped Kalshi series scan ({self.runtime_scan_scope_description or 'custom scope'}): "
+                    f"{self.runtime_scan_series_tickers}"
+                )
+                markets = await self.scan_series_markets(self.runtime_scan_series_tickers)
+            else:
+                markets = await self.scanner.scan_all_markets()
 
             # Initialize market rows for report
             market_rows_by_id = {}
@@ -748,7 +765,13 @@ class AdvancedTradingBot:
             report["counts"]["passed_filters"] = len(filtered)
 
             # Optional interactive picker for dry-run sessions.
-            filtered = self._prompt_market_selection(filtered)
+            if self.interactive_market_pick and not filtered and markets:
+                logger.info(
+                    "No markets passed filters; showing scanned markets for manual dry-run selection."
+                )
+                filtered = self._prompt_market_selection(markets)
+            else:
+                filtered = self._prompt_market_selection(filtered)
             if not filtered:
                 logger.warning("No markets selected for analysis, aborting cycle")
                 return
@@ -854,10 +877,64 @@ class AdvancedTradingBot:
 
             # Step 4.5: Mark and filter duplicate opportunities for reporting
             open_market_keys = self.position_manager.get_open_market_keys()
+            open_event_keys = {
+                self.strategy.get_event_key_for_platform_market(p.platform, p.market_id)
+                for p in self.position_manager.get_open_positions()
+            }
             filtered_opportunities = []
-            seen_opportunities_in_cycle = set()
+            seen_market_in_cycle = set()
+            seen_event_in_cycle = set()
 
+            # Keep one best opportunity per event using deterministic score ranking.
+            best_opportunity_by_event = {}
             for market, est in opportunities:
+                event_key = self.strategy.get_event_key_for_market(market)
+                score = self.strategy.get_opportunity_score_tuple(market, est)
+                existing = best_opportunity_by_event.get(event_key)
+                if existing is None:
+                    best_opportunity_by_event[event_key] = (market, est, score)
+                else:
+                    existing_market, _, existing_score = existing
+                    if self.strategy.is_better_score(score, existing_score):
+                        logger.info(
+                            f"Skipping opportunity for {existing_market.market_id} "
+                            f"(duplicate_event_guard: replaced_by_higher_score {market.market_id})"
+                        )
+                        report["counts"]["skipped_duplicates"] += 1
+                        existing_row = market_rows_by_id.get(existing_market.market_id)
+                        if existing_row is not None:
+                            existing_row["execution"] = {
+                                "success": False,
+                                "skipped": True,
+                                "reason": "duplicate_event_guard",
+                            }
+                        best_opportunity_by_event[event_key] = (market, est, score)
+                    else:
+                        logger.info(
+                            f"Skipping opportunity for {market.market_id} "
+                            f"(duplicate_event_guard: lower_score_same_event)"
+                        )
+                        report["counts"]["skipped_duplicates"] += 1
+                        row = market_rows_by_id.get(market.market_id)
+                        if row is not None:
+                            row["execution"] = {
+                                "success": False,
+                                "skipped": True,
+                                "reason": "duplicate_event_guard",
+                            }
+
+            deduped_opportunities = [
+                (market, est) for market, est, _ in best_opportunity_by_event.values()
+            ]
+            deduped_opportunities.sort(
+                key=lambda item: (
+                    -self.strategy.get_opportunity_score_tuple(item[0], item[1])[0],
+                    -self.strategy.get_opportunity_score_tuple(item[0], item[1])[1],
+                    self.strategy.get_opportunity_score_tuple(item[0], item[1])[2],
+                )
+            )
+
+            for market, est in deduped_opportunities:
                 row = market_rows_by_id.get(market.market_id)
                 if row is not None:
                     row["opportunity"] = {
@@ -867,7 +944,8 @@ class AdvancedTradingBot:
                     }
 
                 market_key = f"{market.platform}:{market.market_id}"
-                if market_key in open_market_keys or market_key in seen_opportunities_in_cycle:
+                event_key = self.strategy.get_event_key_for_market(market)
+                if market_key in open_market_keys or market_key in seen_market_in_cycle:
                     reason = "already open" if market_key in open_market_keys else "duplicate in cycle"
                     logger.info(f"Skipping opportunity for {market_key} (duplicate_market_guard: {reason})")
                     report["counts"]["skipped_duplicates"] += 1
@@ -878,9 +956,21 @@ class AdvancedTradingBot:
                             "reason": "duplicate_market_guard",
                         }
                     continue
+                if event_key in open_event_keys or event_key in seen_event_in_cycle:
+                    reason = "already open event" if event_key in open_event_keys else "duplicate event in cycle"
+                    logger.info(f"Skipping opportunity for {market_key} (duplicate_event_guard: {reason} {event_key})")
+                    report["counts"]["skipped_duplicates"] += 1
+                    if row is not None:
+                        row["execution"] = {
+                            "success": False,
+                            "skipped": True,
+                            "reason": "duplicate_event_guard",
+                        }
+                    continue
 
                 filtered_opportunities.append((market, est))
-                seen_opportunities_in_cycle.add(market_key)
+                seen_market_in_cycle.add(market_key)
+                seen_event_in_cycle.add(event_key)
             
             # Step 5: Generate trade signals
             logger.info("\n📐 Step 5: Calculating position sizes (Kelly)...")
@@ -922,6 +1012,7 @@ class AdvancedTradingBot:
                         current_exposure=current_exposure,
                         current_open_positions=self.position_manager.get_position_count(),
                         current_open_market_keys=open_market_keys,
+                        current_open_event_keys=open_event_keys,
                         max_new_allocation=max_new_allocation,
                     )
                 except (InsufficientCapitalError, NoOpportunitiesError, PositionLimitError) as e:
@@ -957,12 +1048,70 @@ class AdvancedTradingBot:
             if signals and current_bankroll > 0:
                 # Defense-in-depth: Filter out any duplicates that might have slipped through
                 executable_signals = []
-                seen_in_cycle = set()
+                seen_market_in_cycle = set()
+                seen_event_in_cycle = set()
 
+                # Keep one best signal per event.
+                best_signal_by_event = {}
                 for s in signals:
-                    market_key = f"{s.market.platform}:{s.market.market_id}"
+                    event_key = self.strategy.get_event_key_for_market(s.market)
+                    row = market_rows_by_id.get(s.market.market_id)
+                    analysis = row.get("analysis") if isinstance(row, dict) else {}
+                    confidence = 0.0
+                    if isinstance(analysis, dict):
+                        confidence = float(
+                            analysis.get("effective_confidence", analysis.get("confidence", 0.0))
+                            or 0.0
+                        )
+                    score = (abs(float(s.edge)) * confidence, abs(float(s.edge)), str(s.market.market_id))
+                    existing = best_signal_by_event.get(event_key)
+                    if existing is None:
+                        best_signal_by_event[event_key] = (s, score)
+                    else:
+                        existing_signal, existing_score = existing
+                        if self.strategy.is_better_score(score, existing_score):
+                            logger.warning(
+                                f"Skipping signal for {existing_signal.market.market_id} "
+                                f"(duplicate_event_guard: replaced_by_higher_score {s.market.market_id})"
+                            )
+                            report["counts"]["skipped_duplicates"] += 1
+                            existing_row = market_rows_by_id.get(existing_signal.market.market_id)
+                            if existing_row is not None:
+                                existing_row["execution"] = {
+                                    "success": False,
+                                    "skipped": True,
+                                    "reason": "duplicate_event_guard",
+                                }
+                            best_signal_by_event[event_key] = (s, score)
+                        else:
+                            logger.warning(
+                                f"Skipping signal for {s.market.market_id} "
+                                f"(duplicate_event_guard: lower_score_same_event)"
+                            )
+                            report["counts"]["skipped_duplicates"] += 1
+                            row = market_rows_by_id.get(s.market.market_id)
+                            if row is not None:
+                                row["execution"] = {
+                                    "success": False,
+                                    "skipped": True,
+                                    "reason": "duplicate_event_guard",
+                                }
 
-                    if market_key in open_market_keys or market_key in seen_in_cycle:
+                deduped_signal_entries = list(best_signal_by_event.values())
+                deduped_signal_entries.sort(
+                    key=lambda item: (
+                        -item[1][0],
+                        -item[1][1],
+                        item[0].market.market_id,
+                    ),
+                )
+                deduped_signals = [item[0] for item in deduped_signal_entries]
+
+                for s in deduped_signals:
+                    market_key = f"{s.market.platform}:{s.market.market_id}"
+                    event_key = self.strategy.get_event_key_for_market(s.market)
+
+                    if market_key in open_market_keys or market_key in seen_market_in_cycle:
                         reason = "already open" if market_key in open_market_keys else "duplicate in cycle"
                         logger.warning(f"Skipping signal for {market_key} (duplicate_market_guard: {reason})")
                         report["counts"]["skipped_duplicates"] += 1
@@ -976,8 +1125,23 @@ class AdvancedTradingBot:
                             }
                         continue
 
+                    if event_key in open_event_keys or event_key in seen_event_in_cycle:
+                        reason = "already open event" if event_key in open_event_keys else "duplicate event in cycle"
+                        logger.warning(f"Skipping signal for {market_key} (duplicate_event_guard: {reason} {event_key})")
+                        report["counts"]["skipped_duplicates"] += 1
+
+                        row = market_rows_by_id.get(s.market.market_id)
+                        if row is not None:
+                            row["execution"] = {
+                                "success": False,
+                                "skipped": True,
+                                "reason": "duplicate_event_guard",
+                            }
+                        continue
+
                     executable_signals.append(s)
-                    seen_in_cycle.add(market_key)
+                    seen_market_in_cycle.add(market_key)
+                    seen_event_in_cycle.add(event_key)
 
                 if not executable_signals:
                     logger.info("No executable signals after duplicate guard filtering")

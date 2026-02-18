@@ -90,6 +90,58 @@ class Strategy:
         """
         self.config = config
         self.kelly = KellyCriterion()
+
+    # ========================================================================
+    # DUPLICATE GUARD HELPERS
+    # ========================================================================
+
+    @staticmethod
+    def get_event_key_for_platform_market(platform: str, market_id: str) -> str:
+        """
+        Canonical event key for duplicate guards.
+
+        Falls back to market ticker prefix (without final '-' segment) when
+        richer event metadata is unavailable.
+        """
+        platform_norm = str(platform or "").strip().lower()
+        market_id_norm = str(market_id or "").strip()
+        if "-" in market_id_norm:
+            base = market_id_norm.rsplit("-", 1)[0]
+        else:
+            base = market_id_norm
+        return f"{platform_norm}:{base}"
+
+    def get_event_key_for_market(self, market: MarketData) -> str:
+        event_ticker = str(getattr(market, "event_ticker", "") or "").strip()
+        if event_ticker:
+            return f"{str(market.platform).strip().lower()}:{event_ticker}"
+        return self.get_event_key_for_platform_market(market.platform, market.market_id)
+
+    @staticmethod
+    def get_opportunity_score_tuple(
+        market: MarketData,
+        estimate: FairValueEstimate,
+    ) -> tuple[float, float, str]:
+        """
+        Deterministic ranking score for dedupe winner selection.
+        """
+        abs_edge = abs(float(estimate.effective_edge))
+        confidence = float(estimate.effective_confidence)
+        primary = abs_edge * confidence
+        return (primary, abs_edge, str(market.market_id))
+
+    @staticmethod
+    def is_better_score(
+        candidate: tuple[float, float, str],
+        current: tuple[float, float, str],
+    ) -> bool:
+        cand_primary, cand_abs_edge, cand_market_id = candidate
+        cur_primary, cur_abs_edge, cur_market_id = current
+        if cand_primary != cur_primary:
+            return cand_primary > cur_primary
+        if cand_abs_edge != cur_abs_edge:
+            return cand_abs_edge > cur_abs_edge
+        return cand_market_id < cur_market_id
     
     # ========================================================================
     # MARKET FILTERING
@@ -265,6 +317,7 @@ class Strategy:
         current_exposure: float = 0.0,
         current_open_positions: int = 0,
         current_open_market_keys: Optional[Set[str]] = None,
+        current_open_event_keys: Optional[Set[str]] = None,
         max_new_allocation: Optional[float] = None,
     ) -> List[TradeSignal]:
         """
@@ -318,8 +371,43 @@ class Strategy:
             )
         available_slots = max_positions - current_open_positions
         seen_in_cycle = set()
+        seen_event_in_cycle = set()
 
+        # Event-level dedupe before signal generation:
+        # keep only the best-ranked opportunity for each canonical event key.
+        best_by_event = {}
         for market, estimate in opportunities:
+            event_key = self.get_event_key_for_market(market)
+            score = self.get_opportunity_score_tuple(market, estimate)
+            existing = best_by_event.get(event_key)
+            if existing is None:
+                best_by_event[event_key] = (market, estimate, score)
+            else:
+                _, _, existing_score = existing
+                if self.is_better_score(score, existing_score):
+                    logger.info(
+                        f"Skipping signal candidate for {existing[0].market_id} "
+                        f"(duplicate_event_guard: replaced_by_higher_score {market.market_id})"
+                    )
+                    best_by_event[event_key] = (market, estimate, score)
+                else:
+                    logger.info(
+                        f"Skipping signal candidate for {market.market_id} "
+                        f"(duplicate_event_guard: lower_score_same_event)"
+                    )
+
+        deduped_opportunities = [
+            (market, estimate) for market, estimate, _ in best_by_event.values()
+        ]
+        deduped_opportunities.sort(
+            key=lambda item: (
+                -self.get_opportunity_score_tuple(item[0], item[1])[0],
+                -self.get_opportunity_score_tuple(item[0], item[1])[1],
+                self.get_opportunity_score_tuple(item[0], item[1])[2],
+            )
+        )
+
+        for market, estimate in deduped_opportunities:
             if len(signals) >= available_slots:
                 break
 
@@ -344,17 +432,27 @@ class Strategy:
                 logger.info(f"Skipping signal for {market_key} (duplicate_market_guard: duplicate in cycle)")
                 continue
 
+            event_key = self.get_event_key_for_market(market)
+            if current_open_event_keys and event_key in current_open_event_keys:
+                logger.info(f"Skipping signal for {market_key} (duplicate_event_guard: already open event {event_key})")
+                continue
+            if event_key in seen_event_in_cycle:
+                logger.info(f"Skipping signal for {market_key} (duplicate_event_guard: duplicate in cycle {event_key})")
+                continue
+
             # Determine action based on edge direction
             if estimate.is_buy_yes_signal():
                 action = 'buy_yes'
                 market_price = market.yes_price
+                probability_for_kelly = estimate.effective_probability
             else:
                 action = 'buy_no'
                 market_price = market.no_price
+                probability_for_kelly = 1 - estimate.effective_probability
             
             # Calculate Kelly fraction
             kelly_frac = self.kelly.calculate_kelly_fraction(
-                probability=estimate.effective_probability,
+                probability=probability_for_kelly,
                 market_price=market_price,
                 max_fraction=self.config.risk.max_kelly_fraction
             )
@@ -380,14 +478,15 @@ class Strategy:
             
             # Calculate expected value
             probability = estimate.effective_probability
+            no_probability = 1 - probability
             if estimate.is_buy_yes_signal():
                 # Buying YES at market_price
                 ev = (probability * (1 - market_price) - 
                       (1 - probability) * market_price) * position_size
             else:
                 # Buying NO at market_price
-                ev = ((1 - probability) * (1 - market_price) - 
-                      probability * market_price) * position_size
+                ev = (no_probability * (1 - market_price) - 
+                      (1 - no_probability) * market_price) * position_size
             
             # Create signal
             try:
@@ -404,6 +503,7 @@ class Strategy:
                 )
                 signals.append(signal)
                 seen_in_cycle.add(market_key)
+                seen_event_in_cycle.add(event_key)
                 allocated_this_cycle += position_size
                 logger.debug(f"Generated signal: {signal}")
             

@@ -54,6 +54,43 @@ class BankrollManager:
                     """, (now, self._current_balance, 0.0, "initialization", "init", now))
                     await db.commit()
 
+    async def reset_for_new_dry_run_session(self):
+        """
+        Reset paper bankroll to initial value for a fresh dry-run app start.
+
+        This should be called once per process startup in dry-run mode.
+        """
+        now = datetime.utcnow().isoformat() + "Z"
+        previous_balance: Optional[float] = None
+
+        async with self.db.connect() as db:
+            async with db.execute("SELECT balance FROM bankroll_history ORDER BY id DESC LIMIT 1") as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    previous_balance = float(row[0])
+
+            change = 0.0 if previous_balance is None else (self.initial_bankroll - previous_balance)
+            self._current_balance = self.initial_bankroll
+
+            await db.execute("""
+                INSERT INTO bankroll_history
+                (timestamp_utc, balance, change, reason, reference_id, created_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                now,
+                self._current_balance,
+                change,
+                "dry_run_session_reset",
+                "dry_run_reset",
+                now,
+            ))
+            await db.commit()
+
+        logger.info(
+            f"🧹 Dry-run session reset bankroll: ${previous_balance if previous_balance is not None else self.initial_bankroll:,.2f} "
+            f"-> ${self._current_balance:,.2f}"
+        )
+
     def get_balance(self) -> float:
         """Get current bankroll balance."""
         if self._current_balance is None:

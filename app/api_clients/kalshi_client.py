@@ -533,11 +533,21 @@ class KalshiClient(BaseAPIClient):
             # Clamp to valid range
             yes_price = max(0.01, min(0.99, yes_price))
             
+            base_title = market_json.get('title', '')
+            yes_option = market_json.get('yes_sub_title', '')
+            if yes_option and yes_option.lower() not in str(base_title).lower():
+                display_title = f"{base_title} [{yes_option}]"
+            else:
+                display_title = base_title
+
             return {
                 'platform': 'kalshi',
                 'market_id': ticker,
-                'title': market_json.get('title', ''),
-                'description': market_json.get('subtitle', ''),
+                'title': display_title,
+                'description': market_json.get('subtitle', '') or yes_option,
+                'yes_option': yes_option,
+                'no_option': market_json.get('no_sub_title', ''),
+                'event_ticker': market_json.get('event_ticker', '') or market_json.get('series_ticker', ''),
                 'yes_price': yes_price,
                 'no_price': 1 - yes_price,
                 'volume': float(market_json.get('volume', 0)),
