@@ -30,6 +30,7 @@ The bot uses SQLite with WAL (Write-Ahead Logging) enabled for concurrency.
 The bankroll is never kept purely in memory. Every adjustment is written to `bankroll_history`. On startup, the bot loads the latest balance. If the table is empty, it initializes with the `initial_bankroll` from the config.
 
 ### Safety Guards
+- **Duplicate-Market Guard**: The bot will never open a new position in a market if it already has an open position in that same market. This check is performed at both the signal generation stage and the execution stage.
 - **Zero-Bankroll Lock**: If the bankroll hits $0 or less, the bot disables the `TradeExecutor`. It will continue to collect data and perform AI analysis, but it will not place orders.
 - **API Cost Deduction**: After every cycle, the bot calculates the token cost from the AI provider (Claude/OpenAI) and deducts it from the bankroll to ensure the balance reflects net worth accurately.
 

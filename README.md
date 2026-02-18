@@ -92,6 +92,7 @@ python -m app --mode trade
 
 **"The bot stopped trading. Why?"**
 - Check your bankroll. The bot will automatically stop if your balance hits $0 to protect you.
+- Check if you already have an open position in that market. The bot will not open duplicate positions in the same market.
 - Check the logs. If your API keys expire, it will stop and tell you why.
 
 ---

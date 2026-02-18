@@ -247,6 +247,7 @@ class AdvancedTradingBot:
                 "estimates": 0,
                 "opportunities": 0,
                 "signals": 0,
+                "skipped_duplicates": 0,
                 "executed": 0,
             },
             "api_cost": None,
@@ -442,6 +443,7 @@ class AdvancedTradingBot:
                 "estimates": 0,
                 "opportunities": 0,
                 "signals": 0,
+                "skipped_duplicates": 0,
                 "executed": 0,
             },
             "api_cost": None,
@@ -665,6 +667,11 @@ class AdvancedTradingBot:
                 f">{self.config.min_edge_percentage:.0f}% edge"
             )
 
+            # Step 4.5: Mark and filter duplicate opportunities for reporting
+            open_market_keys = self.position_manager.get_open_market_keys()
+            filtered_opportunities = []
+            seen_opportunities_in_cycle = set()
+
             for market, est in opportunities:
                 row = market_rows_by_id.get(market.market_id)
                 if row is not None:
@@ -673,22 +680,40 @@ class AdvancedTradingBot:
                         "confidence": est.effective_confidence,
                         "estimated_probability": est.effective_probability,
                     }
+
+                market_key = f"{market.platform}:{market.market_id}"
+                if market_key in open_market_keys or market_key in seen_opportunities_in_cycle:
+                    reason = "already open" if market_key in open_market_keys else "duplicate in cycle"
+                    logger.info(f"Skipping opportunity for {market_key} (duplicate_market_guard: {reason})")
+                    report["counts"]["skipped_duplicates"] += 1
+                    if row is not None:
+                        row["execution"] = {
+                            "success": False,
+                            "skipped": True,
+                            "reason": "duplicate_market_guard",
+                        }
+                    continue
+
+                filtered_opportunities.append((market, est))
+                seen_opportunities_in_cycle.add(market_key)
             
             # Step 5: Generate trade signals
             logger.info("\n📐 Step 5: Calculating position sizes (Kelly)...")
 
             # Check bankroll before generating signals
             current_bankroll = self.bankroll_manager.get_balance()
+
             if current_bankroll <= 0:
                 logger.error("🛑 BANKROLL EXHAUSTED (<= 0). Trading execution disabled.")
                 signals = []
             else:
                 try:
                     signals = self.strategy.generate_trade_signals(
-                        opportunities=opportunities,
+                        opportunities=filtered_opportunities,
                         current_bankroll=current_bankroll,
                         current_exposure=self.position_manager.get_total_exposure(),
                         current_open_positions=self.position_manager.get_position_count(),
+                        current_open_market_keys=open_market_keys,
                     )
                 except (InsufficientCapitalError, NoOpportunitiesError, PositionLimitError) as e:
                     logger.warning(f"Strategy error: {e}")
@@ -721,42 +746,69 @@ class AdvancedTradingBot:
             # Step 6: Execute trades
             logger.info("\n⚡ Step 6: Executing trades...")
             if signals and current_bankroll > 0:
-                # Execute trades
-                try:
-                    results = await self.executor.execute_signals(signals)
-                    successful = sum(1 for r in results if r.get("success"))
-                    logger.info(f"Executed {successful}/{len(signals)} trades")
-                    report["counts"]["executed"] = int(successful)
+                # Defense-in-depth: Filter out any duplicates that might have slipped through
+                executable_signals = []
+                seen_in_cycle = set()
 
-                    for s, res in zip(signals, results):
+                for s in signals:
+                    market_key = f"{s.market.platform}:{s.market.market_id}"
+
+                    if market_key in open_market_keys or market_key in seen_in_cycle:
+                        reason = "already open" if market_key in open_market_keys else "duplicate in cycle"
+                        logger.warning(f"Skipping signal for {market_key} (duplicate_market_guard: {reason})")
+                        report["counts"]["skipped_duplicates"] += 1
+
                         row = market_rows_by_id.get(s.market.market_id)
                         if row is not None:
                             row["execution"] = {
-                                "success": res.get("success"),
-                                "order_id": res.get("order_id"),
-                                "dry_run": self.config.is_dry_run,
+                                "success": False,
+                                "skipped": True,
+                                "reason": "duplicate_market_guard",
                             }
+                        continue
 
-                        if res.get("success"):
-                            # Update local positions
-                            await self.position_manager.add_position(s, external_order_id=res.get("order_id"))
-                            # Update bankroll
-                            await self.bankroll_manager.adjust_balance(
-                                -s.position_size,
-                                reason="trade_execution",
-                                reference_id=res.get("order_id")
-                            )
+                    executable_signals.append(s)
+                    seen_in_cycle.add(market_key)
 
-                except ExecutionError as e:
-                    logger.error(f"Execution error: {e}")
-                    self.error_reporter.add_error_to_report(
-                        cycle_report, e, "trade execution"
-                    )
-                    report["errors"].append({
-                        "type": type(e).__name__,
-                        "message": str(e),
-                        "stage": "trade execution",
-                    })
+                if not executable_signals:
+                    logger.info("No executable signals after duplicate guard filtering")
+                else:
+                    # Execute trades
+                    try:
+                        results = await self.executor.execute_signals(executable_signals)
+                        successful = sum(1 for r in results if r.get("success"))
+                        logger.info(f"Executed {successful}/{len(executable_signals)} trades")
+                        report["counts"]["executed"] = int(successful)
+
+                        for s, res in zip(executable_signals, results):
+                            row = market_rows_by_id.get(s.market.market_id)
+                            if row is not None:
+                                row["execution"] = {
+                                    "success": res.get("success"),
+                                    "order_id": res.get("order_id"),
+                                    "dry_run": self.config.is_dry_run,
+                                }
+
+                            if res.get("success"):
+                                # Update local positions
+                                await self.position_manager.add_position(s, external_order_id=res.get("order_id"))
+                                # Update bankroll
+                                await self.bankroll_manager.adjust_balance(
+                                    -s.position_size,
+                                    reason="trade_execution",
+                                    reference_id=res.get("order_id")
+                                )
+
+                    except ExecutionError as e:
+                        logger.error(f"Execution error: {e}")
+                        self.error_reporter.add_error_to_report(
+                            cycle_report, e, "trade execution"
+                        )
+                        report["errors"].append({
+                            "type": type(e).__name__,
+                            "message": str(e),
+                            "stage": "trade execution",
+                        })
             else:
                 logger.info("No signals to execute")
             

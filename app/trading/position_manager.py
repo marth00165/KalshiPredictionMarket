@@ -308,6 +308,10 @@ class PositionManager:
         """Get all currently open positions"""
         return [p for p in self.open_positions if not p.closed]
     
+    def get_open_market_keys(self) -> set[str]:
+        """Get set of platform:market_id keys for all open positions"""
+        return {f"{p.platform}:{p.market_id}" for p in self.get_open_positions()}
+
     def get_position(self, market_id: str) -> Trade:
         """
         Get a specific open position

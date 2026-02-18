@@ -1,7 +1,7 @@
 """Strategy module for filtering markets and generating trade signals"""
 
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Set
 
 from app.models import MarketData, FairValueEstimate, TradeSignal
 from app.utils import (
@@ -264,6 +264,7 @@ class Strategy:
         current_bankroll: float,
         current_exposure: float = 0.0,
         current_open_positions: int = 0,
+        current_open_market_keys: Optional[Set[str]] = None,
     ) -> List[TradeSignal]:
         """
         Generate trade signals with Kelly criterion position sizing
@@ -273,6 +274,7 @@ class Strategy:
             current_bankroll: Current available capital
             current_exposure: Total capital already at risk
             current_open_positions: Number of positions currently open
+            current_open_market_keys: Set of 'platform:market_id' for already open positions
         
         Returns:
             List of ready-to-execute TradeSignal objects
@@ -300,11 +302,22 @@ class Strategy:
                 max_allowed=max_positions
             )
         available_slots = max_positions - current_open_positions
+        seen_in_cycle = set()
 
         for market, estimate in opportunities:
             if len(signals) >= available_slots:
                 break
             
+            # Duplicate market guard
+            market_key = f"{market.platform}:{market.market_id}"
+            if current_open_market_keys and market_key in current_open_market_keys:
+                logger.info(f"Skipping signal for {market_key} (duplicate_market_guard: already open)")
+                continue
+
+            if market_key in seen_in_cycle:
+                logger.info(f"Skipping signal for {market_key} (duplicate_market_guard: duplicate in cycle)")
+                continue
+
             # Determine action based on edge direction
             if estimate.is_buy_yes_signal():
                 action = 'buy_yes'
@@ -364,6 +377,7 @@ class Strategy:
                     reasoning=estimate.reasoning[:200] if estimate.reasoning else ""
                 )
                 signals.append(signal)
+                seen_in_cycle.add(market_key)
                 logger.debug(f"Generated signal: {signal}")
             
             except ValueError as e:
