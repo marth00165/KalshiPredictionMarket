@@ -1,8 +1,11 @@
 """Kalshi API client for fetching prediction market data"""
 
+import base64
 import logging
 import time
 from typing import List, Dict, Optional, Any, Tuple
+from pathlib import Path
+from urllib.parse import urlparse
 
 from dataclasses import dataclass
 
@@ -55,6 +58,8 @@ EXCLUDED_TICKER_PREFIXES = (
 class KalshiConfig:
     """Configuration for Kalshi API"""
     api_key: Optional[str] = None
+    private_key: Optional[str] = None
+    private_key_file: Optional[str] = None
     base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     max_markets: int = 500
     pagination_limit: int = 200  # Kalshi allows up to 1000
@@ -86,8 +91,129 @@ class KalshiClient(BaseAPIClient):
             base_url=config.base_url,
         )
         self.config = config
+        self._private_key_pem = self._resolve_private_key(config.private_key, config.private_key_file)
+        self._signing_key = None
         self.rate_limiter = RateLimiter(max_per_sec=8)  # Stay safely under Kalshi's 10/sec limit
         logger.info(f"[kalshi] KalshiClient initialized: use_orderbooks={config.use_orderbooks}, max_markets={config.max_markets}")
+
+    @staticmethod
+    def _resolve_private_key(
+        private_key: Optional[str],
+        private_key_file: Optional[str],
+    ) -> Optional[str]:
+        """Load and normalize Kalshi private key from env value or file path."""
+        raw = private_key
+        if not raw and private_key_file:
+            try:
+                raw = Path(private_key_file).expanduser().read_text()
+            except OSError as e:
+                logger.warning(f"[kalshi] Failed reading private key file '{private_key_file}': {e}")
+                raw = None
+
+        if not raw:
+            return None
+
+        # Support one-line env values with escaped newlines.
+        return str(raw).replace("\\n", "\n").strip()
+
+    @staticmethod
+    def _request_path(endpoint_or_path: str) -> str:
+        """Extract path-only component for Kalshi signing payload."""
+        parsed = urlparse(endpoint_or_path)
+        if parsed.scheme and parsed.netloc:
+            path = parsed.path or "/"
+        else:
+            path = endpoint_or_path or "/"
+            if not path.startswith("/"):
+                path = f"/{path}"
+            path = path.split("?", 1)[0]
+        return path
+
+    def _get_signing_key(self):
+        """Load and cache RSA private key object for request signing."""
+        if self._signing_key is not None:
+            return self._signing_key
+
+        if not self._private_key_pem:
+            raise RuntimeError("Kalshi private key is missing (KALSHI_PRIVATE_KEY or private_key_file required)")
+
+        try:
+            from cryptography.hazmat.primitives import serialization
+        except ImportError as e:
+            raise RuntimeError(
+                "Missing dependency 'cryptography'. Install requirements.txt to enable Kalshi signed auth."
+            ) from e
+
+        try:
+            self._signing_key = serialization.load_pem_private_key(
+                self._private_key_pem.encode("utf-8"),
+                password=None,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Unable to load Kalshi private key: {e}") from e
+
+        return self._signing_key
+
+    def _sign_request(self, method: str, endpoint_or_path: str, timestamp_ms: str) -> str:
+        """Return base64 signature for Kalshi authenticated request."""
+        signing_key = self._get_signing_key()
+        request_path = self._request_path(endpoint_or_path)
+        payload = f"{timestamp_ms}{method.upper()}{request_path}".encode("utf-8")
+
+        try:
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import padding
+        except ImportError as e:
+            raise RuntimeError(
+                "Missing dependency 'cryptography'. Install requirements.txt to enable Kalshi signed auth."
+            ) from e
+
+        salt_length = getattr(padding.PSS, "DIGEST_LENGTH", hashes.SHA256().digest_size)
+        signature = signing_key.sign(
+            payload,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=salt_length,
+            ),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(signature).decode("utf-8")
+
+    def _build_kalshi_headers(
+        self,
+        method: str,
+        endpoint_or_path: str,
+        *,
+        authenticated: bool = False,
+        additional_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """Build Kalshi headers. Uses signed auth for private endpoints."""
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if authenticated:
+            if not self.config.api_key:
+                raise RuntimeError("Kalshi API key is missing (KALSHI_API_KEY required)")
+            timestamp_ms = str(int(time.time() * 1000))
+            headers.update(
+                {
+                    "KALSHI-ACCESS-KEY": str(self.config.api_key),
+                    "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+                    "KALSHI-ACCESS-SIGNATURE": self._sign_request(method, endpoint_or_path, timestamp_ms),
+                }
+            )
+        if additional_headers:
+            headers.update(additional_headers)
+        return headers
+
+    @staticmethod
+    def _is_fatal_auth_setup_error(error: Exception) -> bool:
+        """Identify local auth/setup errors that should not be swallowed."""
+        msg = str(error).lower()
+        return (
+            "missing dependency 'cryptography'" in msg
+            or "private key is missing" in msg
+            or "api key is missing" in msg
+            or "unable to load kalshi private key" in msg
+        )
     
     async def fetch_markets(self) -> List[Dict[str, Any]]:
         """
@@ -169,7 +295,7 @@ class KalshiClient(BaseAPIClient):
             
             return parsed_markets, next_cursor
         
-        headers = self._build_headers()
+        headers = self._build_kalshi_headers("GET", url, authenticated=False)
 
         async with self:
             markets = await self._get_paginated(
@@ -284,7 +410,7 @@ class KalshiClient(BaseAPIClient):
         """
         
         url = f"{self.base_url}/markets/{ticker}/orderbook"
-        headers = self._build_headers()
+        headers = self._build_kalshi_headers("GET", url, authenticated=False)
         
         async def fetch_orderbook():
             if not self.session:
@@ -349,7 +475,7 @@ class KalshiClient(BaseAPIClient):
             List of standardized market data dicts
         """
         all_markets = []
-        headers = self._build_headers()
+        headers = self._build_kalshi_headers("GET", url, authenticated=False)
         
         async with self:
             for series_ticker in series_tickers:
@@ -418,7 +544,6 @@ class KalshiClient(BaseAPIClient):
         Fetch orders from Kalshi portfolio.
         """
         url = f"{self.base_url}/portfolio/orders"
-        headers = self._build_headers()
         all_orders: List[Dict[str, Any]] = []
         seen_keys = set()
         page = 0
@@ -439,6 +564,7 @@ class KalshiClient(BaseAPIClient):
                     async def fetch_orders_page():
                         if not self.session:
                             raise RuntimeError("Session not initialized")
+                        headers = self._build_kalshi_headers("GET", url, authenticated=True)
                         async with self.session.get(url, headers=headers, params=params) as response:
                             await self._handle_response_status(response)
                             return await response.json()
@@ -469,12 +595,11 @@ class KalshiClient(BaseAPIClient):
         Tries `/markets/{ticker}` first; falls back to `/markets?ticker=...`.
         Returns the raw market dict or None.
         """
-        headers = self._build_headers()
-
         async def _fetch_direct() -> Optional[Dict[str, Any]]:
             if not self.session:
                 raise RuntimeError("Session not initialized")
             url = f"{self.base_url}/markets/{ticker}"
+            headers = self._build_kalshi_headers("GET", url, authenticated=False)
             async with self.session.get(url, headers=headers) as response:
                 await self._handle_response_status(response)
                 data = await response.json()
@@ -490,6 +615,7 @@ class KalshiClient(BaseAPIClient):
                 raise RuntimeError("Session not initialized")
             url = f"{self.base_url}/markets"
             params = {"ticker": ticker, "limit": 1}
+            headers = self._build_kalshi_headers("GET", url, authenticated=False)
             async with self.session.get(url, headers=headers, params=params) as response:
                 await self._handle_response_status(response)
                 data = await response.json()
@@ -527,11 +653,10 @@ class KalshiClient(BaseAPIClient):
             }
         """
         url = f"{self.base_url}/portfolio/positions"
-        headers = self._build_headers()
-
         async def fetch_portfolio():
             if not self.session:
                 raise RuntimeError("Session not initialized")
+            headers = self._build_kalshi_headers("GET", url, authenticated=True)
             async with self.session.get(url, headers=headers) as response:
                 await self._handle_response_status(response)
                 return await response.json()
@@ -554,6 +679,139 @@ class KalshiClient(BaseAPIClient):
         except Exception as e:
             logger.error(f"[kalshi] Error fetching positions: {e}")
             return []
+
+    @staticmethod
+    def _extract_cash_balance_from_payload(data: Dict[str, Any]) -> Optional[float]:
+        """
+        Extract available cash balance from a Kalshi portfolio payload.
+
+        Supports several key variants and nested structures.
+        """
+        if not isinstance(data, dict):
+            return None
+
+        dollars_keys = {
+            "available_cash",
+            "cash",
+            "balance",
+            "buying_power",
+            "available_balance",
+        }
+        cents_keys = {
+            "available_cash_cents",
+            "cash_cents",
+            "balance_cents",
+            "buying_power_cents",
+            "available_balance_cents",
+        }
+
+        def _to_float(v: Any) -> Optional[float]:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        def _search(obj: Any, depth: int = 0) -> Optional[float]:
+            if depth > 3:
+                return None
+            if isinstance(obj, dict):
+                for key in dollars_keys:
+                    if key in obj:
+                        value = _to_float(obj.get(key))
+                        if value is not None:
+                            return value
+                for key in cents_keys:
+                    if key in obj:
+                        value = _to_float(obj.get(key))
+                        if value is not None:
+                            return value / 100.0
+                for value in obj.values():
+                    found = _search(value, depth + 1)
+                    if found is not None:
+                        return found
+            elif isinstance(obj, list):
+                for item in obj:
+                    found = _search(item, depth + 1)
+                    if found is not None:
+                        return found
+            return None
+
+        return _search(data)
+
+    async def get_cash_balance(self) -> float:
+        """
+        Fetch available cash balance from Kalshi portfolio endpoints.
+
+        Returns:
+            Available cash in dollars.
+
+        Raises:
+            RuntimeError: If no usable cash balance can be extracted.
+        """
+        endpoints = (
+            f"{self.base_url}/portfolio/balance",
+        )
+
+        async with self:
+            for endpoint in endpoints:
+                try:
+                    async def fetch_balance():
+                        if not self.session:
+                            raise RuntimeError("Session not initialized")
+                        headers = self._build_kalshi_headers("GET", endpoint, authenticated=True)
+                        async with self.session.get(endpoint, headers=headers) as response:
+                            await self._handle_response_status(response)
+                            return await response.json()
+
+                    data = await self._call_with_retry(fetch_balance, f"Fetch cash balance ({endpoint})", max_retries=1)
+                    balance = self._extract_cash_balance_from_payload(data)
+                    if balance is not None:
+                        return float(balance)
+                except Exception as e:
+                    if self._is_fatal_auth_setup_error(e):
+                        raise
+                    logger.debug(f"[kalshi] Balance endpoint failed ({endpoint}): {e}")
+                    continue
+
+        raise RuntimeError("Unable to fetch Kalshi cash balance from portfolio endpoints")
+
+    async def get_account_details(self) -> Dict[str, Any]:
+        """
+        Fetch account/portfolio details payload from Kalshi.
+
+        Returns:
+            Raw account details dict from the first successful endpoint.
+
+        Raises:
+            RuntimeError: If account details cannot be fetched.
+        """
+        endpoints = (
+            f"{self.base_url}/portfolio",
+            f"{self.base_url}/user",
+            f"{self.base_url}/me",
+        )
+
+        async with self:
+            for endpoint in endpoints:
+                try:
+                    async def fetch_details():
+                        if not self.session:
+                            raise RuntimeError("Session not initialized")
+                        headers = self._build_kalshi_headers("GET", endpoint, authenticated=True)
+                        async with self.session.get(endpoint, headers=headers) as response:
+                            await self._handle_response_status(response)
+                            return await response.json()
+
+                    data = await self._call_with_retry(fetch_details, f"Fetch account details ({endpoint})", max_retries=1)
+                    if isinstance(data, dict) and data:
+                        return data
+                except Exception as e:
+                    if self._is_fatal_auth_setup_error(e):
+                        raise
+                    logger.debug(f"[kalshi] Account details endpoint failed ({endpoint}): {e}")
+                    continue
+
+        raise RuntimeError("Unable to fetch Kalshi account details")
 
     async def place_order(
         self,
@@ -579,8 +837,6 @@ class KalshiClient(BaseAPIClient):
             Dict containing order_id and status
         """
         url = f"{self.base_url}/portfolio/orders"
-        headers = self._build_headers()
-
         payload = {
             "ticker": ticker,
             "side": side,
@@ -595,6 +851,7 @@ class KalshiClient(BaseAPIClient):
         async def execute_order():
             if not self.session:
                 raise RuntimeError("Session not initialized")
+            headers = self._build_kalshi_headers("POST", url, authenticated=True)
             async with self.session.post(url, headers=headers, json=payload) as response:
                 await self._handle_response_status(response)
                 return await response.json()
@@ -686,7 +943,7 @@ class KalshiClient(BaseAPIClient):
             List of dicts with series info: {ticker, title, category}
         """
         url = f"{self.base_url}/series"
-        headers = self._build_headers()
+        headers = self._build_kalshi_headers("GET", url, authenticated=False)
         series_list = []
         cursor = None
         

@@ -25,6 +25,7 @@ def mock_config():
     config.db_path = ":memory:"
     config.trading = MagicMock()
     config.trading.dry_run = True
+    config.trading.enforce_live_cash_check = True
     config.trading.require_scope_in_live = True
     config.trading.allowed_market_ids = []
     config.trading.allowed_event_tickers = []
@@ -104,6 +105,39 @@ async def test_live_requires_scope_when_enabled(mock_config):
 
     with pytest.raises(ValueError, match="Live trading requires an explicit market scope"):
         await bot.initialize()
+
+
+@pytest.mark.asyncio
+async def test_live_cash_balance_check_fails_when_insufficient(mock_config):
+    mock_config.is_dry_run = False
+    mock_config.trading.dry_run = False
+    mock_config.kalshi_enabled = True
+    mock_config.trading.initial_bankroll = 1000.0
+
+    bot = AdvancedTradingBot.__new__(AdvancedTradingBot)
+    bot.config = mock_config
+    bot.scanner = MagicMock()
+    bot.scanner.kalshi_client = MagicMock()
+    bot.scanner.kalshi_client.get_cash_balance = AsyncMock(return_value=250.0)
+
+    with pytest.raises(ValueError, match="Live mode bankroll check failed"):
+        await bot._verify_live_cash_balance()
+
+
+@pytest.mark.asyncio
+async def test_live_cash_balance_check_passes_when_sufficient(mock_config):
+    mock_config.is_dry_run = False
+    mock_config.trading.dry_run = False
+    mock_config.kalshi_enabled = True
+    mock_config.trading.initial_bankroll = 500.0
+
+    bot = AdvancedTradingBot.__new__(AdvancedTradingBot)
+    bot.config = mock_config
+    bot.scanner = MagicMock()
+    bot.scanner.kalshi_client = MagicMock()
+    bot.scanner.kalshi_client.get_cash_balance = AsyncMock(return_value=2000.0)
+
+    await bot._verify_live_cash_balance()
 
 @pytest.mark.asyncio
 async def test_kill_switch_blocks_execution(mock_config):

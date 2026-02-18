@@ -221,6 +221,7 @@ def _build_safe_config_view(cfg: ConfigManager) -> dict:
         "trading": {
             "initial_bankroll": cfg.trading.initial_bankroll,
             "dry_run": cfg.trading.dry_run,
+            "enforce_live_cash_check": cfg.trading.enforce_live_cash_check,
         },
         "strategy": {
             "min_edge": cfg.strategy.min_edge,

@@ -183,6 +183,7 @@ class TradingConfig:
     dry_run: bool = True
     autonomous_mode: bool = False
     non_interactive: Optional[bool] = None
+    enforce_live_cash_check: bool = True
     require_scope_in_live: bool = True
     allowed_market_ids: List[str] = field(default_factory=list)
     allowed_event_tickers: List[str] = field(default_factory=list)
@@ -405,6 +406,7 @@ class ConfigManager:
             dry_run=trading_raw.get('dry_run', True),
             autonomous_mode=trading_raw.get('autonomous_mode', False),
             non_interactive=trading_raw.get('non_interactive'),
+            enforce_live_cash_check=trading_raw.get('enforce_live_cash_check', True),
             require_scope_in_live=trading_raw.get('require_scope_in_live', True),
             allowed_market_ids=trading_raw.get('allowed_market_ids', []),
             allowed_event_tickers=trading_raw.get('allowed_event_tickers', []),
@@ -767,6 +769,7 @@ class ConfigManager:
         logger.info(f"\n💰 Trading:")
         logger.info(f"   Initial bankroll: ${self.trading.initial_bankroll:,.2f}")
         logger.info(f"   Mode: {'🏁 DRY RUN' if self.is_dry_run else '💸 LIVE TRADING'}")
+        logger.info(f"   Enforce live cash check: {'✅' if self.trading.enforce_live_cash_check else '❌'}")
         
         logger.info(f"\n📈 Strategy:")
         logger.info(f"   Min edge: {self.min_edge_percentage:.1f}%")
@@ -838,6 +841,7 @@ class ConfigManager:
             'trading': {
                 'initial_bankroll': self.trading.initial_bankroll,
                 'dry_run': self.trading.dry_run,
+                'enforce_live_cash_check': self.trading.enforce_live_cash_check,
             },
             'strategy': {
                 'min_edge': self.strategy.min_edge,

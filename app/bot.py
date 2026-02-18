@@ -3,8 +3,10 @@ import asyncio
 import os
 import sys
 import time
+import json
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+from pathlib import Path
 
 from app.config import ConfigManager
 from app.storage.db import DatabaseManager
@@ -114,6 +116,9 @@ class AdvancedTradingBot:
                     "Configure allowed_market_ids, allowed_event_tickers, or series_tickers."
                 )
 
+        # Live mode safety: verify configured bankroll does not exceed current Kalshi cash.
+        await self._verify_live_cash_balance()
+
         await self.db.initialize()
 
         # Load cycle count from DB for stable idempotency across restarts
@@ -142,6 +147,47 @@ class AdvancedTradingBot:
             await self.reconciliation_manager.reconcile()
 
         self._initialized = True
+
+    async def _verify_live_cash_balance(self) -> None:
+        """
+        In live mode, ensure Kalshi available cash can cover configured initial bankroll.
+        """
+        if self.config.is_dry_run:
+            return
+        if not bool(getattr(self.config.trading, "enforce_live_cash_check", True)):
+            logger.info("Live cash check disabled by trading.enforce_live_cash_check=false")
+            return
+        if not self.config.kalshi_enabled:
+            return
+
+        required = float(getattr(self.config.trading, "initial_bankroll", 0.0) or 0.0)
+        if required <= 0:
+            return
+
+        kalshi_client = getattr(self.scanner, "kalshi_client", None)
+        if not kalshi_client:
+            raise ValueError("Kalshi client is not available for live bankroll verification")
+
+        try:
+            available_cash = float(await kalshi_client.get_cash_balance())
+        except Exception as e:
+            raise ValueError(
+                "Unable to verify Kalshi available cash before live run. "
+                f"Error: {e}"
+            ) from e
+
+        if available_cash < required:
+            raise ValueError(
+                "Live mode bankroll check failed: "
+                f"Kalshi available cash (${available_cash:,.2f}) is below "
+                f"configured trading.initial_bankroll (${required:,.2f}). "
+                "Lower initial_bankroll or fund the account."
+            )
+
+        logger.info(
+            "✅ Live bankroll verified against Kalshi cash: "
+            f"required=${required:,.2f}, available=${available_cash:,.2f}"
+        )
 
     @property
     def analyzer(self):
@@ -213,8 +259,6 @@ class AdvancedTradingBot:
             "status": status
         }
 
-        from pathlib import Path
-        import json
         report_dir = Path("reports")
         try:
             report_dir.mkdir(exist_ok=True)
@@ -222,6 +266,71 @@ class AdvancedTradingBot:
                 json.dump(heartbeat, f, indent=2)
         except Exception as e:
             logger.warning(f"Failed to update heartbeat file: {e}")
+
+    def _trade_journal_path_for_today(self) -> Path:
+        """Path to UTC day trade journal JSON."""
+        date_key = datetime.utcnow().strftime("%Y-%m-%d")
+        journal_dir = Path("reports") / "trade_journal"
+        journal_dir.mkdir(parents=True, exist_ok=True)
+        return journal_dir / f"{date_key}.json"
+
+    def _ensure_daily_trade_journal(self) -> None:
+        """
+        Ensure today's trade journal exists, even if no trades are placed.
+        """
+        path = self._trade_journal_path_for_today()
+        now = datetime.utcnow().isoformat() + "Z"
+        base_payload = {
+            "date_utc": datetime.utcnow().strftime("%Y-%m-%d"),
+            "created_at_utc": now,
+            "updated_at_utc": now,
+            "trades": [],
+        }
+        try:
+            if path.exists():
+                with open(path, "r") as f:
+                    existing = json.load(f)
+                if isinstance(existing, dict) and isinstance(existing.get("trades"), list):
+                    existing["updated_at_utc"] = now
+                    with open(path, "w") as f:
+                        json.dump(existing, f, indent=2)
+                    return
+            with open(path, "w") as f:
+                json.dump(base_payload, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to initialize daily trade journal at {path}: {e}")
+
+    def _append_trade_journal_entry(self, entry: Dict[str, Any]) -> None:
+        """Append one trade entry to today's trade journal JSON."""
+        path = self._trade_journal_path_for_today()
+        now = datetime.utcnow().isoformat() + "Z"
+        try:
+            payload: Dict[str, Any]
+            if path.exists():
+                with open(path, "r") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict) and isinstance(loaded.get("trades"), list):
+                    payload = loaded
+                else:
+                    payload = {
+                        "date_utc": datetime.utcnow().strftime("%Y-%m-%d"),
+                        "created_at_utc": now,
+                        "trades": [],
+                    }
+            else:
+                payload = {
+                    "date_utc": datetime.utcnow().strftime("%Y-%m-%d"),
+                    "created_at_utc": now,
+                    "trades": [],
+                }
+
+            payload["trades"].append(entry)
+            payload["updated_at_utc"] = now
+            payload["trade_count"] = len(payload["trades"])
+            with open(path, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to append trade journal entry: {e}")
 
     async def _compute_current_equity(self) -> float:
         """
@@ -921,6 +1030,7 @@ class AdvancedTradingBot:
         cycle_report = self.error_reporter.create_report(
             f"Trading Cycle #{self.cycle_count}"
         )
+        self._ensure_daily_trade_journal()
 
         markets: List[MarketData] = []
         filtered: List[MarketData] = []
@@ -1467,6 +1577,9 @@ class AdvancedTradingBot:
                             status = res.get("status")
                             filled_qty = res.get("filled_quantity", 0.0)
                             avg_price = res.get("avg_fill_price", 0.0)
+                            submitted_qty = float(res.get("submitted_quantity", 0.0) or 0.0)
+                            submitted_price = float(res.get("submitted_price", 0.0) or 0.0)
+                            submitted_notional = float(res.get("submitted_notional", 0.0) or 0.0)
 
                             if row is not None:
                                 row["execution"] = {
@@ -1477,6 +1590,55 @@ class AdvancedTradingBot:
                                     "avg_fill_price": avg_price,
                                     "dry_run": self.config.is_dry_run,
                                 }
+
+                            # Persist a daily trade journal entry with reasoning (live and dry-run).
+                            selection = (
+                                s.market.yes_option
+                                if s.action in ("buy_yes", "sell_no")
+                                else s.market.no_option
+                            ) or ("YES" if s.action in ("buy_yes", "sell_no") else "NO")
+                            self._append_trade_journal_entry({
+                                "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+                                "cycle_id": self.cycle_count,
+                                "dry_run": self.config.is_dry_run,
+                                "platform": s.market.platform,
+                                "market_id": s.market.market_id,
+                                "event_ticker": s.market.event_ticker,
+                                "series_ticker": s.market.series_ticker,
+                                "question": s.market.title,
+                                "selection": selection,
+                                "action": s.action,
+                                "status": status,
+                                "success": bool(res.get("success")),
+                                "order_id": res.get("order_id"),
+                                "position_size_requested": float(s.position_size),
+                                "submitted_price": submitted_price,
+                                "submitted_quantity": submitted_qty,
+                                "submitted_notional": submitted_notional,
+                                "filled_quantity": float(filled_qty or 0.0),
+                                "avg_fill_price": float(avg_price or 0.0),
+                                "edge": float(s.edge),
+                                "fair_value": float(s.fair_value),
+                                "market_price": float(s.market_price),
+                                "kelly_fraction": float(s.kelly_fraction),
+                                "expected_value": float(s.expected_value),
+                                "reasoning": s.reasoning,
+                                "error": res.get("error"),
+                            })
+
+                            # Explicit live logs for order placement/opening.
+                            if (not self.config.is_dry_run) and res.get("success"):
+                                logger.info(
+                                    "💸 LIVE ORDER PLACED | %s | action=%s | order_id=%s | status=%s | "
+                                    "submitted_qty=%.2f | submitted_price=%.4f | submitted_notional=$%.2f",
+                                    s.market.market_id,
+                                    s.action,
+                                    res.get("order_id"),
+                                    status,
+                                    submitted_qty,
+                                    submitted_price,
+                                    submitted_notional,
+                                )
 
                             # Only update local state if we have a confirmed fill or it's a dry run
                             # dry_run status is used for simulation success
@@ -1496,6 +1658,15 @@ class AdvancedTradingBot:
                                     reason="trade_execution",
                                     reference_id=res.get("order_id")
                                 )
+                                if not self.config.is_dry_run:
+                                    logger.info(
+                                        "📌 LIVE POSITION OPENED | %s | side=%s | qty=%.2f | price=%.4f | cost=$%.2f",
+                                        s.market.market_id,
+                                        "yes" if s.action in ("buy_yes", "sell_no") else "no",
+                                        float(filled_qty),
+                                        float(avg_price),
+                                        float(cost),
+                                    )
                             elif status in ("submitted", "pending_fill", "resting", "open"):
                                 logger.info(f"⏳ Order {res.get('order_id')} accepted but not yet filled (status={status}). Will reconcile later.")
                             elif status == "pending_submit":

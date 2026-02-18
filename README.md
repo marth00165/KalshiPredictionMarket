@@ -167,6 +167,11 @@ Note: Before scanning starts, interactive `trade`/`analyze` runs now offer a pre
 | --------------------------------- | ----------------------------------- |
 | `python -m app --discover-series` | Lists Kalshi series you can target. |
 | `python -m app --backup`          | Creates a DB backup.                |
+| `python scripts/kalshi_user_details.py` | Prints current Kalshi account details, cash balance, open positions, and recent orders. |
+
+Live safety note:
+- In live mode, bot startup now verifies Kalshi available cash is at least `trading.initial_bankroll`. If not, startup fails fast.
+- You can disable this only if needed with `trading.enforce_live_cash_check=false` (not recommended).
 
 ---
 

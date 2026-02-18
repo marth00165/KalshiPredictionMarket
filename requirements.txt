@@ -1,5 +1,6 @@
 aiohttp
 aiosqlite
 python-dotenv
+cryptography
 pytest
 pytest-asyncio

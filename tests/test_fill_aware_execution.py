@@ -19,6 +19,7 @@ def mock_config(tmp_path):
             self.trading = MagicMock()
             self.trading.dry_run = False
             self.trading.initial_bankroll = 1000.0
+            self.trading.enforce_live_cash_check = False
             self.trading.require_scope_in_live = False
             self.trading.allowed_market_ids = []
             self.trading.allowed_event_tickers = []

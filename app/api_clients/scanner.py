@@ -1,6 +1,7 @@
 import logging
 import asyncio
-from typing import List
+from typing import List, Optional
+from pathlib import Path
 
 from app.config import ConfigManager
 from app.models import MarketData
@@ -14,6 +15,21 @@ from app.api_clients import (
 from app.utils import BatchParser
 
 logger = logging.getLogger(__name__)
+
+
+def _load_private_key_from_config(
+    private_key: Optional[str],
+    private_key_file: Optional[str],
+) -> Optional[str]:
+    """Resolve private key from env value or configured file path."""
+    if private_key:
+        return private_key
+    if private_key_file:
+        try:
+            return Path(private_key_file).expanduser().read_text()
+        except OSError as e:
+            logger.warning(f"Failed to read private key file '{private_key_file}': {e}")
+    return None
 
 class MarketScanner:
     """
@@ -50,6 +66,11 @@ class MarketScanner:
             KalshiClient(
                 KalshiConfig(
                     api_key=config.platforms.kalshi.api_key,
+                    private_key=_load_private_key_from_config(
+                        config.platforms.kalshi.private_key,
+                        config.platforms.kalshi.private_key_file,
+                    ),
+                    private_key_file=config.platforms.kalshi.private_key_file,
                     base_url="https://api.elections.kalshi.com/trade-api/v2",
                     max_markets=config.platforms.kalshi.max_markets,
                     use_orderbooks=not config.is_dry_run,  # Skip orderbooks in dry run to avoid rate limits
