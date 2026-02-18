@@ -306,38 +306,39 @@ class AdvancedTradingBot:
                 provider = (self.config.analysis_provider or "claude").strip().lower()
                 logger.info(f"\n🧠 Step 3: Analyzing {len(to_analyze)} markets with {provider}...")
                 
-                for market in to_analyze:
-                    try:
-                        estimate = await self.analyzer.analyze_market(market)
-                        if estimate:
-                            report["counts"]["analyzed"] += 1
-                            report["counts"]["estimates"] += 1
-                            
-                            # Update market row with analysis
-                            if market.market_id in market_rows_by_id:
-                                edge = estimate.probability - market.yes_price
-                                market_rows_by_id[market.market_id]["analysis"] = {
-                                    "estimated_probability": estimate.probability,
-                                    "confidence": estimate.confidence,
-                                    "edge": edge,
-                                    "reasoning": estimate.reasoning,
-                                }
-                                
-                                # Check if it's an opportunity
-                                if edge >= self.config.strategy.min_edge and estimate.confidence >= self.config.strategy.min_confidence:
-                                    report["counts"]["opportunities"] += 1
-                                    market_rows_by_id[market.market_id]["opportunity"] = {
-                                        "edge": edge,
-                                        "confidence": estimate.confidence,
-                                        "meets_threshold": True,
-                                    }
-                                    
-                    except Exception as e:
-                        logger.warning(f"Error analyzing {market.market_id}: {e}")
-                        report["errors"].append({
-                            "market_id": market.market_id,
-                            "error": str(e),
-                        })
+                try:
+                    estimates = await self.analyzer.analyze_market_batch(to_analyze)
+                    report["counts"]["analyzed"] = len(to_analyze)
+                    report["counts"]["estimates"] = len(estimates)
+
+                    for estimate in estimates:
+                        row = market_rows_by_id.get(estimate.market_id)
+                        if row is None:
+                            continue
+
+                        row["analysis"] = {
+                            "estimated_probability": estimate.estimated_probability,
+                            "confidence": estimate.confidence_level,
+                            "edge": estimate.edge,
+                            "reasoning": estimate.reasoning,
+                            "key_factors": estimate.key_factors,
+                            "data_sources": estimate.data_sources,
+                        }
+
+                        # Keep threshold logic consistent with strategy (absolute edge + confidence).
+                        if (
+                            abs(estimate.edge) >= self.config.strategy.min_edge and
+                            estimate.confidence_level >= self.config.strategy.min_confidence
+                        ):
+                            report["counts"]["opportunities"] += 1
+                            row["opportunity"] = {
+                                "edge": estimate.edge,
+                                "confidence": estimate.confidence_level,
+                                "meets_threshold": True,
+                            }
+                except Exception as e:
+                    logger.warning(f"Error during batch analysis: {e}")
+                    report["errors"].append({"error": str(e)})
                 
                 # Update markets list with analysis results
                 report["markets"] = list(market_rows_by_id.values())
