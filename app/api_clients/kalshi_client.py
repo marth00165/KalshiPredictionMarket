@@ -317,6 +317,16 @@ class KalshiClient(BaseAPIClient):
         except Exception as e:
             logger.warning(f"[kalshi] Error fetching price for {ticker}: {e}")
             return 0.5
+
+    async def get_market_yes_price(self, ticker: str) -> float:
+        """
+        Public helper to fetch current YES price for a market ticker.
+
+        Returns a normalized price in [0.0, 1.0].
+        """
+        async with self:
+            return await self._get_market_price(ticker)
+
     async def fetch_markets_by_series(
         self,
         series_tickers: List[str],

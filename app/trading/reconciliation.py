@@ -1,7 +1,6 @@
 """Portfolio reconciliation manager for syncing local state with Kalshi"""
 
 import logging
-from typing import List, Dict, Any
 
 from app.api_clients.kalshi_client import KalshiClient
 from app.trading.position_manager import PositionManager
@@ -25,6 +24,26 @@ class ReconciliationManager:
         """
         self.kalshi_client = kalshi_client
         self.position_manager = position_manager
+
+    async def _resolve_exit_price(self, ticker: str, side: str, fallback: float) -> float:
+        """
+        Resolve exit price for a local position that disappeared remotely.
+
+        close_position expects price of the side held:
+        - side=yes -> yes price
+        - side=no  -> no price (= 1 - yes price)
+        """
+        try:
+            yes_price = await self.kalshi_client.get_market_yes_price(ticker)
+            if side == "no":
+                return max(0.0, min(1.0, 1.0 - yes_price))
+            return max(0.0, min(1.0, yes_price))
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not fetch live exit price for {ticker} (side={side}). "
+                f"Falling back to entry price. Error: {e}"
+            )
+            return fallback
 
     async def reconcile(self):
         """
@@ -56,8 +75,11 @@ class ReconciliationManager:
         for ticker, local_pos in local_map.items():
             if ticker not in remote_map:
                 logger.info(f"ℹ️ Position {ticker} no longer on Kalshi. Marking as closed.")
-                # We don't know the actual exit price, so we use the entry price to avoid fake PnL
-                # or we could fetch the last market price.
-                await self.position_manager.close_position(ticker, exit_price=local_pos.entry_price)
+                exit_price = await self._resolve_exit_price(
+                    ticker=ticker,
+                    side=local_pos.side,
+                    fallback=local_pos.entry_price,
+                )
+                await self.position_manager.close_position(ticker, exit_price=exit_price)
 
         logger.info("✅ Portfolio reconciliation complete.")

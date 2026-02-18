@@ -76,6 +76,10 @@ python -m app --mode trade
 | `python -m app --mode trade --dry-run` | Runs full AI analysis without betting real money. |
 | `python -m app --discover-series` | Lists all types of events (like Economics, Politics) you can track. |
 | `python -m app --backup` | Saves a backup of your trading data. |
+| `python -m app --show-config` | Prints active non-secret configuration values. |
+| `python -m app --verify-config --mode trade` | Checks that required keys/settings are valid for trade mode. |
+| `python -m app --set-max-positions 3 --set-max-position-size 100 --set-dry-run true` | Updates risk settings in your config file. |
+| `python -m app --set-config risk.max_kelly_fraction=0.1` | Updates any config key via `dot.path=value`. |
 
 ---
 

@@ -262,7 +262,8 @@ class Strategy:
         self,
         opportunities: List[Tuple[MarketData, FairValueEstimate]],
         current_bankroll: float,
-        current_exposure: float = 0.0
+        current_exposure: float = 0.0,
+        current_open_positions: int = 0,
     ) -> List[TradeSignal]:
         """
         Generate trade signals with Kelly criterion position sizing
@@ -271,6 +272,7 @@ class Strategy:
             opportunities: List of (market, estimate) tuples
             current_bankroll: Current available capital
             current_exposure: Total capital already at risk
+            current_open_positions: Number of positions currently open
         
         Returns:
             List of ready-to-execute TradeSignal objects
@@ -292,14 +294,16 @@ class Strategy:
         
         signals = []
         max_positions = self.config.risk.max_positions
-        
-        for market, estimate in opportunities[:max_positions]:
-            # Don't add more positions if we already have the max
-            if len(signals) >= max_positions:
-                raise PositionLimitError(
-                    current_positions=len(signals),
-                    max_allowed=max_positions
-                )
+        if current_open_positions >= max_positions:
+            raise PositionLimitError(
+                current_positions=current_open_positions,
+                max_allowed=max_positions
+            )
+        available_slots = max_positions - current_open_positions
+
+        for market, estimate in opportunities:
+            if len(signals) >= available_slots:
+                break
             
             # Determine action based on edge direction
             if estimate.is_buy_yes_signal():

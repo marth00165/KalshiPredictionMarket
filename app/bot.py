@@ -19,6 +19,7 @@ from app.utils import (
     BatchParser,
     InsufficientCapitalError,
     NoOpportunitiesError,
+    PositionLimitError,
     ExecutionError,
 )
 
@@ -467,6 +468,19 @@ class AdvancedTradingBot:
         execution_results: List[bool] = []
         
         try:
+            # Step 0: Reconcile local vs remote live portfolio each cycle.
+            if not self.config.is_dry_run and self.reconciliation_manager:
+                logger.info("\n🔄 Step 0: Reconciling live portfolio...")
+                try:
+                    await self.reconciliation_manager.reconcile()
+                except Exception as e:
+                    logger.error(f"Reconciliation error: {e}")
+                    report["errors"].append({
+                        "type": type(e).__name__,
+                        "message": str(e),
+                        "stage": "reconciliation",
+                    })
+
             # Step 1: Scan markets
             logger.info("\n📊 Step 1: Scanning markets...")
             markets = await self.scanner.scan_all_markets()
@@ -673,9 +687,10 @@ class AdvancedTradingBot:
                     signals = self.strategy.generate_trade_signals(
                         opportunities=opportunities,
                         current_bankroll=current_bankroll,
-                        current_exposure=self.position_manager.get_total_exposure()
+                        current_exposure=self.position_manager.get_total_exposure(),
+                        current_open_positions=self.position_manager.get_position_count(),
                     )
-                except (InsufficientCapitalError, NoOpportunitiesError) as e:
+                except (InsufficientCapitalError, NoOpportunitiesError, PositionLimitError) as e:
                     logger.warning(f"Strategy error: {e}")
                     self.error_reporter.add_error_to_report(
                         cycle_report, e, "signal generation"
