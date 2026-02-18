@@ -23,6 +23,7 @@ class MarketData:
     end_date: str  # Market expiration/resolution date (ISO format)
     category: str  # Market category (politics, sports, finance, etc.)
     event_ticker: str = ""  # Parent event ticker (for grouping related markets)
+    series_ticker: str = ""  # Parent series ticker (Kalshi specific)
     yes_option: str = ""  # Specific option name (e.g., "Pam Bondi" for cabinet markets)
     no_option: str = ""  # Specific no option name
     

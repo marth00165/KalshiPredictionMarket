@@ -105,8 +105,20 @@ def _collect_config_updates(args) -> list:
         updates.append(("risk.max_positions", args.set_max_positions))
     if args.set_max_position_size is not None:
         updates.append(("risk.max_position_size", args.set_max_position_size))
+    if args.set_max_orders_per_cycle is not None:
+        updates.append(("risk.max_orders_per_cycle", args.set_max_orders_per_cycle))
+    if args.set_max_notional_per_cycle is not None:
+        updates.append(("risk.max_notional_per_cycle", args.set_max_notional_per_cycle))
+    if args.set_daily_loss_limit_fraction is not None:
+        updates.append(("risk.daily_loss_limit_fraction", args.set_daily_loss_limit_fraction))
     if args.set_dry_run is not None:
         updates.append(("trading.dry_run", args.set_dry_run))
+    if args.set_allowed_market_ids is not None:
+        updates.append(("trading.allowed_market_ids", args.set_allowed_market_ids))
+    if args.set_allowed_event_tickers is not None:
+        updates.append(("trading.allowed_event_tickers", args.set_allowed_event_tickers))
+    if args.set_allowed_series_tickers is not None:
+        updates.append(("platforms.kalshi.series_tickers", args.set_allowed_series_tickers))
 
     return updates
 
@@ -680,6 +692,10 @@ async def main():
     parser.add_argument('--config', type=str, default='advanced_config.json', help='Path to config file')
     parser.add_argument('--mode', type=str, choices=['collect', 'analyze', 'trade'], default='collect', help='Execution mode')
     parser.add_argument('--dry-run', action='store_true', help='Run in dry-run mode')
+    parser.add_argument('--non-interactive', action='store_true', help='Disable all interactive prompts')
+    parser.add_argument('--autonomous', action='store_true', help='Enable autonomous mode (implies non-interactive)')
+    parser.add_argument('--allow-live-legacy-db', action='store_true',
+                        help='Allow using legacy kalshi.sqlite in live mode')
     parser.add_argument('--once', action='store_true', help='Run one cycle and exit')
     parser.add_argument('--log-level', type=str, default='INFO', help='Logging level')
     parser.add_argument('--lock-file', type=str, help='Custom path to lock file')
@@ -708,7 +724,13 @@ async def main():
                         help='Set risk.max_new_exposure_per_day_fraction (0-1) and exit')
     parser.add_argument('--set-max-positions', type=int, help='Set risk.max_positions and exit')
     parser.add_argument('--set-max-position-size', type=float, help='Set risk.max_position_size and exit')
+    parser.add_argument('--set-max-orders-per-cycle', type=int, help='Set risk.max_orders_per_cycle and exit')
+    parser.add_argument('--set-max-notional-per-cycle', type=float, help='Set risk.max_notional_per_cycle and exit')
+    parser.add_argument('--set-daily-loss-limit-fraction', type=float, help='Set risk.daily_loss_limit_fraction (0-1) and exit')
     parser.add_argument('--set-dry-run', type=_parse_bool, help='Set trading.dry_run (true/false) and exit')
+    parser.add_argument('--set-allowed-market-ids', type=_parse_csv_values, help='Set trading.allowed_market_ids (comma-separated) and exit')
+    parser.add_argument('--set-allowed-event-tickers', type=_parse_csv_values, help='Set trading.allowed_event_tickers (comma-separated) and exit')
+    parser.add_argument('--set-allowed-series-tickers', type=_parse_csv_values, help='Set platforms.kalshi.series_tickers (comma-separated) and exit')
 
     args = parser.parse_args()
 
@@ -745,7 +767,16 @@ async def main():
             logger.error(f"Config utility operation failed: {e}", exc_info=True)
             sys.exit(1)
 
-    if not args.skip_setup_wizard and not args.backup:
+    # Pre-load config to check autonomous/non-interactive settings
+    try:
+        temp_cfg = ConfigManager(args.config)
+        is_autonomous = args.autonomous or temp_cfg.is_autonomous
+        is_non_interactive = args.non_interactive or args.autonomous or temp_cfg.is_non_interactive
+    except Exception:
+        is_autonomous = args.autonomous
+        is_non_interactive = args.non_interactive or args.autonomous
+
+    if not args.skip_setup_wizard and not args.backup and not is_non_interactive:
         try:
             _maybe_run_startup_setup_wizard(args, logger)
         except SystemExit:
@@ -763,12 +794,31 @@ async def main():
     try:
         bot = AdvancedTradingBot(args.config)
 
-        # Override dry-run if specified
+        # Override config with CLI flags
         if args.dry_run:
             bot.config.trading.dry_run = True
             logger.info("Dry-run mode enabled via CLI")
 
-        effective_dry_run = bool(args.dry_run or bot.config.is_dry_run)
+        if args.autonomous:
+            bot.config.trading.autonomous_mode = True
+            bot.config.trading.non_interactive = True
+            logger.info("Autonomous mode enabled via CLI")
+
+        if args.non_interactive:
+            bot.config.trading.non_interactive = True
+            logger.info("Non-interactive mode enabled via CLI")
+
+        effective_dry_run = bool(bot.config.is_dry_run)
+        is_non_interactive = bool(bot.config.is_non_interactive)
+
+        # DB path safety check
+        if not effective_dry_run and bot.config.db_path == "kalshi.sqlite" and not args.allow_live_legacy_db:
+            logger.error(
+                "Detected legacy 'kalshi.sqlite' in live mode. "
+                "For safety, live mode now defaults to 'kalshi_live.sqlite'. "
+                "Use --allow-live-legacy-db to override this safety check."
+            )
+            sys.exit(1)
 
         if args.pick_markets:
             if effective_dry_run:
@@ -776,11 +826,12 @@ async def main():
                 logger.info("Interactive market picker enabled")
             else:
                 logger.warning("--pick-markets ignored because bot is not in dry-run mode")
-        elif _prompt_enable_market_picker_after_setup(args, effective_dry_run):
+        elif not is_non_interactive and _prompt_enable_market_picker_after_setup(args, effective_dry_run):
             bot.interactive_market_pick = True
             logger.info("Interactive market picker enabled for this run")
 
-        await _maybe_prompt_runtime_scan_scope(args, bot, logger)
+        if not is_non_interactive:
+            await _maybe_prompt_runtime_scan_scope(args, bot, logger)
 
         if args.backup:
             logger.info("Creating database backup...")

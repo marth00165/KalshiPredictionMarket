@@ -134,6 +134,12 @@ class DatabaseManager:
                 balance REAL NOT NULL,
                 created_at_utc TEXT NOT NULL
             );
+            """,
+            # Version 5: Add client_order_id and cycle_id to executions
+            """
+            ALTER TABLE executions ADD COLUMN client_order_id TEXT;
+            ALTER TABLE executions ADD COLUMN cycle_id INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_executions_client_order_id ON executions(client_order_id);
             """
         ]
 

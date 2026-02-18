@@ -153,6 +153,8 @@ class PlatformConfig:
     enabled: bool = True
     max_markets: int = 25
     series_tickers: Optional[List[str]] = None  # For Kalshi: fetch only from these series
+    allowed_market_ids: Optional[List[str]] = None
+    allowed_event_tickers: Optional[List[str]] = None
     
     def validate(self) -> None:
         """Validate platform configuration"""
@@ -179,6 +181,11 @@ class TradingConfig:
     
     initial_bankroll: float = 10000
     dry_run: bool = True
+    autonomous_mode: bool = False
+    non_interactive: Optional[bool] = None
+    require_scope_in_live: bool = True
+    allowed_market_ids: List[str] = field(default_factory=list)
+    allowed_event_tickers: List[str] = field(default_factory=list)
     
     def validate(self) -> None:
         """Validate trading configuration"""
@@ -210,6 +217,11 @@ class RiskConfig:
     max_position_size: float = 1000  # Max dollars per position
     max_total_exposure_fraction: float = 0.80  # Lenient: max 80% capital at risk
     max_new_exposure_per_day_fraction: float = 0.80  # Lenient: max 80% newly deployed per UTC day
+    max_orders_per_cycle: int = 5
+    max_notional_per_cycle: float = 2000
+    daily_loss_limit_fraction: float = 0.10  # Stop if 10% of daily starting bankroll lost
+    kill_switch_env_var: str = "BOT_DISABLE_TRADING"
+    critical_webhook_url: Optional[str] = None
     
     def validate(self) -> None:
         """Validate risk configuration"""
@@ -228,6 +240,29 @@ class RiskConfig:
                 "max_new_exposure_per_day_fraction must be between 0 and 1, "
                 f"got {self.max_new_exposure_per_day_fraction}"
             )
+        if self.max_orders_per_cycle < 1:
+            raise ValueError(f"max_orders_per_cycle must be >= 1, got {self.max_orders_per_cycle}")
+        if self.max_notional_per_cycle <= 0:
+            raise ValueError(f"max_notional_per_cycle must be > 0, got {self.max_notional_per_cycle}")
+        if not (0 <= self.daily_loss_limit_fraction <= 1):
+            raise ValueError(f"daily_loss_limit_fraction must be between 0 and 1, got {self.daily_loss_limit_fraction}")
+        if not self.kill_switch_env_var:
+            raise ValueError("kill_switch_env_var cannot be empty")
+
+
+@dataclass
+class ExecutionConfig:
+    """Configuration for order execution revalidation"""
+
+    max_price_drift: float = 0.05  # Absolute probability diff (5%)
+    min_edge_at_execution: float = 0.02  # 2% minimum edge right before order
+
+    def validate(self) -> None:
+        """Validate execution configuration"""
+        if self.max_price_drift < 0:
+            raise ValueError(f"max_price_drift must be >= 0, got {self.max_price_drift}")
+        if self.min_edge_at_execution < 0:
+            raise ValueError(f"min_edge_at_execution must be >= 0, got {self.min_edge_at_execution}")
 
 
 @dataclass
@@ -330,10 +365,26 @@ class ConfigManager:
     def _parse_config(self, raw_config: Dict[str, Any]) -> None:
         """Parse raw JSON config into typed dataclasses"""
 
+        # Trading configuration (parsed early to help with defaults)
+        trading_raw = raw_config.get('trading', {})
+        self.trading = TradingConfig(
+            initial_bankroll=trading_raw.get('initial_bankroll', 10000),
+            dry_run=trading_raw.get('dry_run', True),
+            autonomous_mode=trading_raw.get('autonomous_mode', False),
+            non_interactive=trading_raw.get('non_interactive'),
+            require_scope_in_live=trading_raw.get('require_scope_in_live', True),
+            allowed_market_ids=trading_raw.get('allowed_market_ids', []),
+            allowed_event_tickers=trading_raw.get('allowed_event_tickers', []),
+        )
+        # Handle non_interactive default based on autonomous_mode
+        if self.trading.non_interactive is None:
+            self.trading.non_interactive = self.trading.autonomous_mode
+
         # Database configuration
         db_raw = raw_config.get('database', {})
+        default_db = 'kalshi_dryrun.sqlite' if self.trading.dry_run else 'kalshi_live.sqlite'
         self.db = DatabaseConfig(
-            path=db_raw.get('path', 'kalshi.sqlite')
+            path=db_raw.get('path', default_db)
         )
         try:
             self.db.validate()
@@ -413,6 +464,8 @@ class ConfigManager:
                 enabled=kalshi_raw.get('enabled', True), # Default to True if not in JSON
                 max_markets=kalshi_raw.get('max_markets', 500),
                 series_tickers=kalshi_raw.get('series_tickers'),  # Optional list of series to fetch
+                allowed_market_ids=kalshi_raw.get('allowed_market_ids'),
+                allowed_event_tickers=kalshi_raw.get('allowed_event_tickers'),
             ),
         )
         try:
@@ -420,12 +473,6 @@ class ConfigManager:
         except ValueError as e:
             raise ValueError(f"Invalid platforms config: {e}")
         
-        # Trading configuration
-        trading_raw = raw_config.get('trading', {})
-        self.trading = TradingConfig(
-            initial_bankroll=trading_raw.get('initial_bankroll', 10000),
-            dry_run=trading_raw.get('dry_run', True),
-        )
         try:
             self.trading.validate()
         except ValueError as e:
@@ -450,12 +497,28 @@ class ConfigManager:
             max_position_size=risk_raw.get('max_position_size', 1000),
             max_total_exposure_fraction=risk_raw.get('max_total_exposure_fraction', 0.80),
             max_new_exposure_per_day_fraction=risk_raw.get('max_new_exposure_per_day_fraction', 0.80),
+            max_orders_per_cycle=risk_raw.get('max_orders_per_cycle', 5),
+            max_notional_per_cycle=risk_raw.get('max_notional_per_cycle', 2000),
+            daily_loss_limit_fraction=risk_raw.get('daily_loss_limit_fraction', 0.10),
+            kill_switch_env_var=risk_raw.get('kill_switch_env_var', 'BOT_DISABLE_TRADING'),
+            critical_webhook_url=risk_raw.get('critical_webhook_url'),
         )
         try:
             self.risk.validate()
         except ValueError as e:
             raise ValueError(f"Invalid risk config: {e}")
         
+        # Execution configuration
+        execution_raw = raw_config.get('execution', {})
+        self.execution = ExecutionConfig(
+            max_price_drift=execution_raw.get('max_price_drift', 0.05),
+            min_edge_at_execution=execution_raw.get('min_edge_at_execution', 0.02),
+        )
+        try:
+            self.execution.validate()
+        except ValueError as e:
+            raise ValueError(f"Invalid execution config: {e}")
+
         # Filters configuration
         filters_raw = raw_config.get('filters', {})
         self.filters = FiltersConfig(
@@ -548,6 +611,26 @@ class ConfigManager:
     def is_dry_run(self) -> bool:
         """Check if trading is in dry-run mode"""
         return self.trading.dry_run
+
+    @property
+    def is_autonomous(self) -> bool:
+        """Check if bot is in autonomous mode"""
+        return self.trading.autonomous_mode
+
+    @property
+    def is_non_interactive(self) -> bool:
+        """Check if bot is in non-interactive mode"""
+        return bool(self.trading.non_interactive)
+
+    @property
+    def max_price_drift(self) -> float:
+        """Get maximum allowed price drift at execution"""
+        return self.execution.max_price_drift
+
+    @property
+    def min_edge_at_execution(self) -> float:
+        """Get minimum edge required at execution"""
+        return self.execution.min_edge_at_execution
     
     @property
     def min_edge_percentage(self) -> float:
@@ -597,12 +680,16 @@ class ConfigManager:
 
             # Plus private keys if not dry run
             if not self.is_dry_run:
+                if self.polymarket_enabled:
+                    # Platform safety gate: fail if Polymarket enabled in live
+                    raise ValueError(
+                        "Polymarket execution is not yet implemented. "
+                        "Disable Polymarket or use dry_run=true for live trading."
+                    )
+
                 if self.kalshi_enabled:
                     if not self.platforms.kalshi.private_key and not self.platforms.kalshi.private_key_file:
                         raise ValueError("Kalshi private key (env or file) is required for live trading")
-                if self.polymarket_enabled:
-                    if not self.platforms.polymarket.private_key and not self.platforms.polymarket.private_key_file:
-                        raise ValueError("Polymarket private key (env or file) is required for live trading")
 
     def log_config_summary(self) -> None:
         """Log a summary of the loaded configuration"""

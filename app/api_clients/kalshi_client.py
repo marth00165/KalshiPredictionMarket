@@ -261,7 +261,8 @@ class KalshiClient(BaseAPIClient):
                 'volume': float(market_json.get('volume', 0)),
                 'liquidity': float(market_json.get('open_interest', 0)),
                 'end_date': market_json.get('expiration_time', ''),
-                'category': market_json.get('category', 'other')
+                'category': market_json.get('category', 'other'),
+                'series_ticker': market_json.get('series_ticker', '')
             }
         
         except (KeyError, ValueError, TypeError) as e:
@@ -404,6 +405,33 @@ class KalshiClient(BaseAPIClient):
         
         logger.info(f"[kalshi] Total: {len(all_markets)} markets from {len(series_tickers)} series")
         return all_markets
+
+    async def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Fetch orders from Kalshi portfolio.
+        """
+        url = f"{self.base_url}/portfolio/orders"
+        headers = self._build_headers()
+        params = {}
+        if ticker:
+            params['ticker'] = ticker
+        if status:
+            params['status'] = status
+
+        async def fetch_orders():
+            if not self.session:
+                raise RuntimeError("Session not initialized")
+            async with self.session.get(url, headers=headers, params=params) as response:
+                await self._handle_response_status(response)
+                return await response.json()
+
+        try:
+            async with self:
+                data = await self._call_with_retry(fetch_orders, "Fetch portfolio orders")
+            return data.get('orders', [])
+        except Exception as e:
+            logger.error(f"[kalshi] Error fetching orders: {e}")
+            return []
 
     async def get_positions(self) -> List[Dict[str, Any]]:
         """

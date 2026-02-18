@@ -125,6 +125,30 @@ class BankrollManager:
         logger.info(f"💰 Bankroll adjusted: ${old_balance:,.2f} -> ${self._current_balance:,.2f} "
                     f"(change: ${amount:+,.2f}, reason: {reason})")
 
+    async def get_daily_starting_balance(self) -> float:
+        """Get the bankroll balance at the start of the current UTC day."""
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+
+        async with self.db.connect() as db:
+            # Try to find the last balance before today began
+            async with db.execute(
+                "SELECT balance FROM bankroll_history WHERE timestamp_utc < ? ORDER BY id DESC LIMIT 1",
+                (today_start,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return float(row[0])
+
+            # If no record before today, use the very first record
+            async with db.execute(
+                "SELECT balance FROM bankroll_history ORDER BY id ASC LIMIT 1",
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return float(row[0])
+
+            return self.get_balance()
+
     async def get_stats(self) -> Dict[str, Any]:
         """Get bankroll statistics."""
         return {
