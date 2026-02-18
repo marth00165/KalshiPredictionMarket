@@ -395,6 +395,106 @@ class KalshiClient(BaseAPIClient):
         logger.info(f"[kalshi] Total: {len(all_markets)} markets from {len(series_tickers)} series")
         return all_markets
 
+    async def get_positions(self) -> List[Dict[str, Any]]:
+        """
+        Fetch current open positions from Kalshi portfolio.
+
+        Returns:
+            List of position dicts:
+            {
+                'market_id': str (ticker),
+                'side': str ('yes' or 'no'),
+                'quantity': float,
+                'entry_price': float (0-1),
+                'platform': 'kalshi'
+            }
+        """
+        url = f"{self.base_url}/portfolio/positions"
+        headers = self._build_headers()
+
+        async def fetch_portfolio():
+            if not self.session:
+                raise RuntimeError("Session not initialized")
+            async with self.session.get(url, headers=headers) as response:
+                await self._handle_response_status(response)
+                return await response.json()
+
+        try:
+            async with self:
+                data = await self._call_with_retry(fetch_portfolio, "Fetch portfolio positions")
+
+            positions = []
+            for pos in data.get('positions', []):
+                # Standardize Kalshi position format
+                positions.append({
+                    'market_id': pos.get('ticker'),
+                    'side': pos.get('side', 'yes').lower(),
+                    'quantity': float(pos.get('position', 0)),
+                    'entry_price': float(pos.get('avg_cost_price', 0)) / 100,
+                    'platform': 'kalshi'
+                })
+            return positions
+        except Exception as e:
+            logger.error(f"[kalshi] Error fetching positions: {e}")
+            return []
+
+    async def place_order(
+        self,
+        ticker: str,
+        side: str,
+        action: str,
+        count: int,
+        price_cents: int,
+        client_order_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Place a limit order on Kalshi.
+
+        Args:
+            ticker: Market ticker
+            side: 'yes' or 'no'
+            action: 'buy' or 'sell'
+            count: Number of contracts
+            price_cents: Price in cents (1-99)
+            client_order_id: Optional UUID for the order
+
+        Returns:
+            Dict containing order_id and status
+        """
+        url = f"{self.base_url}/portfolio/orders"
+        headers = self._build_headers()
+
+        payload = {
+            "ticker": ticker,
+            "side": side,
+            "action": action,
+            "count": count,
+            "type": "limit",
+            "limit_price": price_cents
+        }
+        if client_order_id:
+            payload["client_order_id"] = client_order_id
+
+        async def execute_order():
+            if not self.session:
+                raise RuntimeError("Session not initialized")
+            async with self.session.post(url, headers=headers, json=payload) as response:
+                await self._handle_response_status(response)
+                return await response.json()
+
+        try:
+            async with self:
+                data = await self._call_with_retry(execute_order, f"Place {action} {side} order on {ticker}")
+
+            return {
+                "order_id": data.get("order_id"),
+                "status": data.get("status", "unknown"),
+                "raw_response": data
+            }
+        except Exception as e:
+            logger.error(f"[kalshi] Order placement failed for {ticker}: {e}")
+            raise
+
     def _parse_market_with_price(self, market_json: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Parse a Kalshi market JSON including price from the response.

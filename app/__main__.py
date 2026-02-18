@@ -52,7 +52,7 @@ async def main():
             # Initialize DB if it doesn't exist yet
             if not Path(bot.db.db_path).exists():
                 logger.info("Database does not exist. Initializing empty database first...")
-                await bot.db.initialize()
+                await bot.initialize()
 
             backup_path = await bot.db.backup()
             print(f"Database backup created at: {backup_path}")
@@ -60,6 +60,9 @@ async def main():
 
         # Validate config for the selected mode (discovery/collect/analyze/trade)
         bot.config.validate_for_mode(args.mode)
+
+        # Initialize bot (DB, Bankroll, Positions)
+        await bot.initialize()
 
         if args.discover_series:
             await discover_kalshi_series(bot, args.category)
