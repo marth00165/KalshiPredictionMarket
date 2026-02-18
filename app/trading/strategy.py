@@ -265,6 +265,7 @@ class Strategy:
         current_exposure: float = 0.0,
         current_open_positions: int = 0,
         current_open_market_keys: Optional[Set[str]] = None,
+        max_new_allocation: Optional[float] = None,
     ) -> List[TradeSignal]:
         """
         Generate trade signals with Kelly criterion position sizing
@@ -275,6 +276,7 @@ class Strategy:
             current_exposure: Total capital already at risk
             current_open_positions: Number of positions currently open
             current_open_market_keys: Set of 'platform:market_id' for already open positions
+            max_new_allocation: Optional hard cap on new capital deployed this cycle
         
         Returns:
             List of ready-to-execute TradeSignal objects
@@ -293,8 +295,21 @@ class Strategy:
                 required=1.0,
                 available=current_bankroll
             )
+
+        # Exposure-aware sizing: only allocate from remaining deployable capital.
+        # current_exposure reflects open capital already at risk.
+        effective_exposure = max(0.0, float(current_exposure))
+        deployable_capital = current_bankroll - effective_exposure
+        if max_new_allocation is not None:
+            deployable_capital = min(deployable_capital, max(0.0, float(max_new_allocation)))
+        if deployable_capital <= 0:
+            raise InsufficientCapitalError(
+                required=1.0,
+                available=deployable_capital
+            )
         
         signals = []
+        allocated_this_cycle = 0.0
         max_positions = self.config.risk.max_positions
         if current_open_positions >= max_positions:
             raise PositionLimitError(
@@ -306,6 +321,17 @@ class Strategy:
 
         for market, estimate in opportunities:
             if len(signals) >= available_slots:
+                break
+
+            # Remaining capital after accounting for already-open exposure and
+            # signals added earlier in this cycle.
+            remaining_capital = deployable_capital - allocated_this_cycle
+            if remaining_capital <= 0:
+                logger.info(
+                    "Stopping signal generation: no deployable capital remains "
+                    f"(bankroll=${current_bankroll:.2f}, exposure=${effective_exposure:.2f}, "
+                    f"allocated_this_cycle=${allocated_this_cycle:.2f})"
+                )
                 break
             
             # Duplicate market guard
@@ -340,15 +366,15 @@ class Strategy:
             # Calculate position size
             position_size = self.kelly.calculate_position_size(
                 kelly_fraction=kelly_frac,
-                bankroll=current_bankroll,
+                bankroll=remaining_capital,
                 max_position=self.config.risk.max_position_size
             )
             
             # Skip if position would exceed available capital
-            if position_size > current_bankroll:
+            if position_size > remaining_capital:
                 logger.warning(
                     f"Skipping {market.market_id}: position size ${position_size:.2f} "
-                    f"exceeds bankroll ${current_bankroll:.2f}"
+                    f"exceeds remaining deployable capital ${remaining_capital:.2f}"
                 )
                 continue
             
@@ -378,6 +404,7 @@ class Strategy:
                 )
                 signals.append(signal)
                 seen_in_cycle.add(market_key)
+                allocated_this_cycle += position_size
                 logger.debug(f"Generated signal: {signal}")
             
             except ValueError as e:

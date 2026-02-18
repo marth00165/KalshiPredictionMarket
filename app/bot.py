@@ -434,6 +434,8 @@ class AdvancedTradingBot:
                     "max_kelly_fraction": self.config.risk.max_kelly_fraction,
                     "max_positions": self.config.risk.max_positions,
                     "max_position_size": self.config.risk.max_position_size,
+                    "max_total_exposure_fraction": self.config.risk.max_total_exposure_fraction,
+                    "max_new_exposure_per_day_fraction": self.config.risk.max_new_exposure_per_day_fraction,
                 },
             },
             "counts": {
@@ -702,18 +704,42 @@ class AdvancedTradingBot:
 
             # Check bankroll before generating signals
             current_bankroll = self.bankroll_manager.get_balance()
+            current_exposure = self.position_manager.get_total_exposure()
+            opened_today = self.position_manager.get_opened_exposure_today_utc()
+            capital_base = max(0.0, current_bankroll + current_exposure)
+
+            max_total_exposure = capital_base * self.config.risk.max_total_exposure_fraction
+            remaining_total_exposure_room = max(0.0, max_total_exposure - current_exposure)
+
+            max_new_exposure_today = capital_base * self.config.risk.max_new_exposure_per_day_fraction
+            remaining_daily_exposure_room = max(0.0, max_new_exposure_today - opened_today)
+
+            max_new_allocation = min(
+                current_bankroll,
+                remaining_total_exposure_room,
+                remaining_daily_exposure_room,
+            )
 
             if current_bankroll <= 0:
                 logger.error("🛑 BANKROLL EXHAUSTED (<= 0). Trading execution disabled.")
+                signals = []
+            elif max_new_allocation <= 0:
+                logger.info(
+                    "🛑 Exposure cap reached. No new signals this cycle "
+                    f"(cash=${current_bankroll:.2f}, exposure=${current_exposure:.2f}, "
+                    f"opened_today=${opened_today:.2f}, total_room=${remaining_total_exposure_room:.2f}, "
+                    f"daily_room=${remaining_daily_exposure_room:.2f})"
+                )
                 signals = []
             else:
                 try:
                     signals = self.strategy.generate_trade_signals(
                         opportunities=filtered_opportunities,
                         current_bankroll=current_bankroll,
-                        current_exposure=self.position_manager.get_total_exposure(),
+                        current_exposure=current_exposure,
                         current_open_positions=self.position_manager.get_position_count(),
                         current_open_market_keys=open_market_keys,
+                        max_new_allocation=max_new_allocation,
                     )
                 except (InsufficientCapitalError, NoOpportunitiesError, PositionLimitError) as e:
                     logger.warning(f"Strategy error: {e}")

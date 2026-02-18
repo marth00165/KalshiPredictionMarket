@@ -208,6 +208,8 @@ class RiskConfig:
     max_kelly_fraction: float = 0.25  # Max 25% of bankroll per trade
     max_positions: int = 10  # Max simultaneous positions
     max_position_size: float = 1000  # Max dollars per position
+    max_total_exposure_fraction: float = 0.80  # Lenient: max 80% capital at risk
+    max_new_exposure_per_day_fraction: float = 0.80  # Lenient: max 80% newly deployed per UTC day
     
     def validate(self) -> None:
         """Validate risk configuration"""
@@ -217,6 +219,15 @@ class RiskConfig:
             raise ValueError(f"max_positions must be >= 1, got {self.max_positions}")
         if self.max_position_size <= 0:
             raise ValueError(f"max_position_size must be > 0, got {self.max_position_size}")
+        if not (0 <= self.max_total_exposure_fraction <= 1):
+            raise ValueError(
+                f"max_total_exposure_fraction must be between 0 and 1, got {self.max_total_exposure_fraction}"
+            )
+        if not (0 <= self.max_new_exposure_per_day_fraction <= 1):
+            raise ValueError(
+                "max_new_exposure_per_day_fraction must be between 0 and 1, "
+                f"got {self.max_new_exposure_per_day_fraction}"
+            )
 
 
 @dataclass
@@ -437,6 +448,8 @@ class ConfigManager:
             max_kelly_fraction=risk_raw.get('max_kelly_fraction', 0.25),
             max_positions=risk_raw.get('max_positions', 10),
             max_position_size=risk_raw.get('max_position_size', 1000),
+            max_total_exposure_fraction=risk_raw.get('max_total_exposure_fraction', 0.80),
+            max_new_exposure_per_day_fraction=risk_raw.get('max_new_exposure_per_day_fraction', 0.80),
         )
         try:
             self.risk.validate()
@@ -622,6 +635,8 @@ class ConfigManager:
         logger.info(f"   Max Kelly fraction: {self.risk.max_kelly_fraction:.1%}")
         logger.info(f"   Max positions: {self.risk.max_positions}")
         logger.info(f"   Max position size: ${self.risk.max_position_size:,.2f}")
+        logger.info(f"   Max total exposure: {self.risk.max_total_exposure_fraction:.1%}")
+        logger.info(f"   Max new exposure/day: {self.risk.max_new_exposure_per_day_fraction:.1%}")
         
         logger.info(f"\n🔍 Filters:")
         logger.info(f"   Min volume: ${self.filters.min_volume:,.2f}")
@@ -666,6 +681,8 @@ class ConfigManager:
                 'max_kelly_fraction': self.risk.max_kelly_fraction,
                 'max_positions': self.risk.max_positions,
                 'max_position_size': self.risk.max_position_size,
+                'max_total_exposure_fraction': self.risk.max_total_exposure_fraction,
+                'max_new_exposure_per_day_fraction': self.risk.max_new_exposure_per_day_fraction,
             },
             'filters': {
                 'min_volume': self.filters.min_volume,

@@ -94,6 +94,10 @@ def _collect_config_updates(args) -> list:
         updates.append(("strategy.min_confidence", args.set_min_confidence))
     if args.set_max_kelly_fraction is not None:
         updates.append(("risk.max_kelly_fraction", args.set_max_kelly_fraction))
+    if args.set_max_total_exposure_fraction is not None:
+        updates.append(("risk.max_total_exposure_fraction", args.set_max_total_exposure_fraction))
+    if args.set_max_new_exposure_per_day_fraction is not None:
+        updates.append(("risk.max_new_exposure_per_day_fraction", args.set_max_new_exposure_per_day_fraction))
     if args.set_max_positions is not None:
         updates.append(("risk.max_positions", args.set_max_positions))
     if args.set_max_position_size is not None:
@@ -181,6 +185,8 @@ def _build_safe_config_view(cfg: ConfigManager) -> dict:
             "max_kelly_fraction": cfg.risk.max_kelly_fraction,
             "max_positions": cfg.risk.max_positions,
             "max_position_size": cfg.risk.max_position_size,
+            "max_total_exposure_fraction": cfg.risk.max_total_exposure_fraction,
+            "max_new_exposure_per_day_fraction": cfg.risk.max_new_exposure_per_day_fraction,
         },
         "filters": {
             "min_volume": cfg.filters.min_volume,
@@ -214,6 +220,10 @@ async def main():
     parser.add_argument('--set-min-edge', type=float, help='Set strategy.min_edge (0-1) and exit')
     parser.add_argument('--set-min-confidence', type=float, help='Set strategy.min_confidence (0-1) and exit')
     parser.add_argument('--set-max-kelly-fraction', type=float, help='Set risk.max_kelly_fraction (0-1) and exit')
+    parser.add_argument('--set-max-total-exposure-fraction', type=float,
+                        help='Set risk.max_total_exposure_fraction (0-1) and exit')
+    parser.add_argument('--set-max-new-exposure-per-day-fraction', type=float,
+                        help='Set risk.max_new_exposure_per_day_fraction (0-1) and exit')
     parser.add_argument('--set-max-positions', type=int, help='Set risk.max_positions and exit')
     parser.add_argument('--set-max-position-size', type=float, help='Set risk.max_position_size and exit')
     parser.add_argument('--set-dry-run', type=_parse_bool, help='Set trading.dry_run (true/false) and exit')

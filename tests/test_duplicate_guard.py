@@ -5,6 +5,7 @@ from app.trading.strategy import Strategy
 from app.trading.position_manager import PositionManager, Trade
 from app.models import MarketData, FairValueEstimate, TradeSignal
 from app.bot import AdvancedTradingBot
+from app.utils import InsufficientCapitalError, NoOpportunitiesError
 
 @pytest.fixture
 def mock_config():
@@ -14,6 +15,8 @@ def mock_config():
     config.risk.max_positions = 5
     config.risk.max_kelly_fraction = 0.1
     config.risk.max_position_size = 100
+    config.risk.max_total_exposure_fraction = 0.8
+    config.risk.max_new_exposure_per_day_fraction = 0.8
     config.analysis_provider = "claude"
     type(config).min_edge_percentage = 5.0
     type(config).min_confidence_percentage = 50.0
@@ -51,7 +54,7 @@ def test_strategy_duplicate_guard(mock_config):
 
     # Case 1: Already open
     open_keys = {"k:m1"}
-    with pytest.raises(Exception): # NoOpportunitiesError
+    with pytest.raises(NoOpportunitiesError):
         strategy.generate_trade_signals([(market1, est1)], 1000, current_open_market_keys=open_keys)
 
     # Case 2: Duplicate in cycle
@@ -59,6 +62,89 @@ def test_strategy_duplicate_guard(mock_config):
     opportunities = [(market1, est1), (market1, est1)]
     signals = strategy.generate_trade_signals(opportunities, 1000, current_open_market_keys=set())
     assert len(signals) == 1 # Only one signal generated for same market
+
+
+def test_strategy_exposure_reduces_position_size(mock_config):
+    strategy = Strategy(mock_config)
+
+    market = MarketData(
+        market_id="m1", platform="k", title="T1", description="D", category="C", end_date="Z",
+        yes_price=0.5, no_price=0.5, volume=1000, liquidity=1000
+    )
+    est = FairValueEstimate(
+        market_id="m1", estimated_probability=0.7, confidence_level=0.8, reasoning="R", edge=0.2
+    )
+
+    # With no exposure, sizing uses full bankroll.
+    no_exposure_signals = strategy.generate_trade_signals(
+        [(market, est)],
+        current_bankroll=1000,
+        current_exposure=0,
+        current_open_market_keys=set(),
+    )
+
+    # With high exposure, sizing uses only remaining deployable capital.
+    high_exposure_signals = strategy.generate_trade_signals(
+        [(market, est)],
+        current_bankroll=1000,
+        current_exposure=900,
+        current_open_market_keys=set(),
+    )
+
+    assert no_exposure_signals[0].position_size == 100.0
+    assert high_exposure_signals[0].position_size == 10.0
+
+
+def test_strategy_exposure_caps_total_allocated_size(mock_config):
+    strategy = Strategy(mock_config)
+    mock_config.risk.max_kelly_fraction = 1.0
+    mock_config.risk.max_position_size = 1000
+
+    market1 = MarketData(
+        market_id="m1", platform="k", title="T1", description="D", category="C", end_date="Z",
+        yes_price=0.1, no_price=0.9, volume=1000, liquidity=1000
+    )
+    market2 = MarketData(
+        market_id="m2", platform="k", title="T2", description="D", category="C", end_date="Z",
+        yes_price=0.1, no_price=0.9, volume=1000, liquidity=1000
+    )
+    est1 = FairValueEstimate(
+        market_id="m1", estimated_probability=0.9, confidence_level=0.8, reasoning="R", edge=0.8
+    )
+    est2 = FairValueEstimate(
+        market_id="m2", estimated_probability=0.9, confidence_level=0.8, reasoning="R", edge=0.8
+    )
+
+    # Only $100 deployable ($1000 bankroll - $900 exposure).
+    signals = strategy.generate_trade_signals(
+        [(market1, est1), (market2, est2)],
+        current_bankroll=1000,
+        current_exposure=900,
+        current_open_market_keys=set(),
+    )
+
+    assert len(signals) == 2
+    assert sum(s.position_size for s in signals) <= 100.0
+
+
+def test_strategy_raises_when_exposure_exhausts_bankroll(mock_config):
+    strategy = Strategy(mock_config)
+
+    market = MarketData(
+        market_id="m1", platform="k", title="T1", description="D", category="C", end_date="Z",
+        yes_price=0.5, no_price=0.5, volume=1000, liquidity=1000
+    )
+    est = FairValueEstimate(
+        market_id="m1", estimated_probability=0.7, confidence_level=0.8, reasoning="R", edge=0.2
+    )
+
+    with pytest.raises(InsufficientCapitalError):
+        strategy.generate_trade_signals(
+            [(market, est)],
+            current_bankroll=1000,
+            current_exposure=1000,
+            current_open_market_keys=set(),
+        )
 
 @pytest.mark.asyncio
 async def test_bot_duplicate_guard_reporting(mock_config):

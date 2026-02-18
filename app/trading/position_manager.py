@@ -334,6 +334,15 @@ class PositionManager:
     def get_total_exposure(self) -> float:
         """Calculate total dollars currently at risk in open positions"""
         return sum(p.position_size for p in self.get_open_positions())
+
+    def get_opened_exposure_today_utc(self) -> float:
+        """Total position cost opened today in UTC (open + already-closed)."""
+        today = datetime.utcnow().date()
+        all_trades = list(self.open_positions) + list(self.trade_history)
+        return sum(
+            t.position_size for t in all_trades
+            if t.timestamp.date() == today
+        )
     
     def get_position_count(self) -> int:
         """Get count of open positions"""
