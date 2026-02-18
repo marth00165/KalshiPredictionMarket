@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+import hashlib
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -39,12 +40,13 @@ class TradeExecutor:
         self.dry_run = config.is_dry_run
         self.executed_trades = []
     
-    async def execute_signals(self, signals: List[TradeSignal]) -> List[Dict[str, Any]]:
+    async def execute_signals(self, signals: List[TradeSignal], cycle_id: int = 0) -> List[Dict[str, Any]]:
         """
         Execute a batch of trade signals
         
         Args:
             signals: List of TradeSignal objects to execute
+            cycle_id: Current trading cycle ID
         
         Returns:
             List of result dicts for each signal
@@ -59,7 +61,7 @@ class TradeExecutor:
         
         for signal in signals:
             try:
-                result = await self.execute_signal(signal)
+                result = await self.execute_signal(signal, cycle_id=cycle_id)
                 results.append(result)
             except Exception as e:
                 error_context.add_error(e)
@@ -71,12 +73,13 @@ class TradeExecutor:
         
         return results
     
-    async def execute_signal(self, signal: TradeSignal) -> Dict[str, Any]:
+    async def execute_signal(self, signal: TradeSignal, cycle_id: int = 0) -> Dict[str, Any]:
         """
         Execute a single trade signal
         
         Args:
             signal: TradeSignal to execute
+            cycle_id: Current trading cycle ID
         
         Returns:
             Dict containing success status and order_id
@@ -85,6 +88,8 @@ class TradeExecutor:
         # Log the signal
         self._log_signal(signal)
         
+        client_order_id = self._generate_client_order_id(cycle_id, signal)
+
         if self.dry_run:
             # Simulate success
             logger.info(
@@ -96,25 +101,42 @@ class TradeExecutor:
                 "order_id": f"dry_run_{uuid.uuid4().hex[:8]}",
                 "status": "dry_run"
             }
-            await self._record_execution(signal, result)
+            await self._record_execution(signal, result, cycle_id=cycle_id, client_order_id=client_order_id)
             return result
         
+        # Record pending execution for crash idempotency
+        await self._record_execution(
+            signal,
+            {"success": False, "status": "pending_submit"},
+            cycle_id=cycle_id,
+            client_order_id=client_order_id
+        )
+
         try:
-            result = await self._execute_on_platform(signal)
+            result = await self._execute_on_platform(signal, client_order_id=client_order_id)
             if result.get("success"):
                 logger.info(f"✅ Trade executed: {signal} (Order ID: {result.get('order_id')})")
             else:
-                logger.error(f"❌ Execution failed for {signal.market.market_id}: {result.get('error')}")
+                if result.get("skipped"):
+                    logger.warning(f"⏭️ Execution skipped for {signal.market.market_id}: {result.get('error')}")
+                else:
+                    logger.error(f"❌ Execution failed for {signal.market.market_id}: {result.get('error')}")
 
-            await self._record_execution(signal, result)
+            await self._record_execution(signal, result, cycle_id=cycle_id, client_order_id=client_order_id)
             return result
         
         except Exception as e:
             error_result = {"success": False, "error": str(e)}
-            await self._record_execution(signal, error_result)
+            await self._record_execution(signal, error_result, cycle_id=cycle_id, client_order_id=client_order_id)
             return error_result
+
+    def _generate_client_order_id(self, cycle_id: int, signal: TradeSignal) -> str:
+        """Generate a deterministic client order ID for idempotency."""
+        # Derived from cycle, market, action, and key sizing parameters
+        raw = f"{cycle_id}:{signal.market.market_id}:{signal.action}:{signal.market_price:.2f}:{signal.position_size:.2f}"
+        return hashlib.md5(raw.encode()).hexdigest()
     
-    async def _record_execution(self, signal: TradeSignal, result: Dict[str, Any]):
+    async def _record_execution(self, signal: TradeSignal, result: Dict[str, Any], cycle_id: int = 0, client_order_id: Optional[str] = None):
         """Persist execution record to database."""
         now = datetime.utcnow().isoformat() + "Z"
 
@@ -127,18 +149,34 @@ class TradeExecutor:
         quantity = signal.position_size / max(0.01, price)
 
         async with self.db.connect() as db:
+            if client_order_id:
+                # Check if record already exists for this client_order_id
+                async with db.execute("SELECT id FROM executions WHERE client_order_id = ?", (client_order_id,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        # Update existing record
+                        await db.execute("""
+                            UPDATE executions SET
+                                status = ?,
+                                external_order_id = ?,
+                                executed_at_utc = ?
+                            WHERE client_order_id = ?
+                        """, (result.get("status", "failed"), result.get("order_id"), now, client_order_id))
+                        await db.commit()
+                        return
+
             await db.execute("""
                 INSERT INTO executions
-                (market_id, platform, action, quantity, price, cost, external_order_id, status, executed_at_utc, created_at_utc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (market_id, platform, action, quantity, price, cost, external_order_id, status, executed_at_utc, created_at_utc, cycle_id, client_order_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.market.market_id, signal.market.platform, signal.action,
                 quantity, price, signal.position_size, result.get("order_id"),
-                result.get("status", "failed"), now, now
+                result.get("status", "failed"), now, now, cycle_id, client_order_id
             ))
             await db.commit()
 
-    async def _execute_on_platform(self, signal: TradeSignal) -> Dict[str, Any]:
+    async def _execute_on_platform(self, signal: TradeSignal, client_order_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Execute trade on the appropriate platform
         """
@@ -146,7 +184,7 @@ class TradeExecutor:
         if signal.market.platform == 'polymarket':
             return await self._execute_polymarket(signal)
         elif signal.market.platform == 'kalshi':
-            return await self._execute_kalshi(signal)
+            return await self._execute_kalshi(signal, client_order_id=client_order_id)
         else:
             return {"success": False, "error": f"Unknown platform: {signal.market.platform}"}
     
@@ -156,13 +194,16 @@ class TradeExecutor:
         logger.info(f"Polymarket execution not implemented: {signal}")
         return {"success": False, "error": "Polymarket execution not implemented"}
     
-    async def _execute_kalshi(self, signal: TradeSignal) -> Dict[str, Any]:
-        """Execute trade on Kalshi"""
+    async def _execute_kalshi(self, signal: TradeSignal, client_order_id: Optional[str] = None) -> Dict[str, Any]:
+        """Execute trade on Kalshi with price revalidation"""
         if not self.kalshi_client:
             return {"success": False, "error": "Kalshi client not configured for execution"}
 
         try:
-            # Standardize action and side for Kalshi
+            # 1. Fetch latest price for revalidation
+            latest_yes_price = await self.kalshi_client.get_market_yes_price(signal.market.market_id)
+
+            # 2. Standardize action and side for Kalshi
             # action: 'buy' or 'sell'
             # side: 'yes' or 'no'
             if signal.action.startswith('buy_'):
@@ -175,13 +216,42 @@ class TradeExecutor:
                 return {"success": False, "error": f"Unsupported action: {signal.action}"}
 
             # Price in cents
-            if side == 'yes':
-                price_cents = int(signal.market.yes_price * 100)
+            latest_price = latest_yes_price if side == 'yes' else (1.0 - latest_yes_price)
+
+            # 3. Revalidate price drift
+            original_price = signal.market_price
+            drift = abs(latest_price - original_price)
+            if drift > self.config.max_price_drift:
+                return {
+                    "success": False,
+                    "error": f"Price drift too large: {drift:.3f} > {self.config.max_price_drift}",
+                    "skipped": True,
+                    "status": "skipped_drift"
+                }
+
+            # 4. Revalidate edge
+            # edge = fair_value - latest_price (for buy_yes)
+            # edge = (1 - fair_value) - latest_price (for buy_no)
+            if signal.action == 'buy_yes':
+                new_edge = signal.fair_value - latest_price
+            elif signal.action == 'buy_no':
+                new_edge = (1.0 - signal.fair_value) - latest_price
             else:
-                price_cents = int(signal.market.no_price * 100)
+                new_edge = signal.edge # fallback for sells
+
+            if new_edge < self.config.min_edge_at_execution:
+                return {
+                    "success": False,
+                    "error": f"Edge decayed below minimum: {new_edge:.3f} < {self.config.min_edge_at_execution}",
+                    "skipped": True,
+                    "status": "skipped_edge"
+                }
+
+            # Price in cents
+            price_cents = int(latest_price * 100)
 
             # Count
-            count = int(signal.position_size / max(0.01, price_cents / 100))
+            count = int(signal.position_size / max(0.01, latest_price))
 
             if count <= 0:
                 return {"success": False, "error": f"Calculated count is zero: size=${signal.position_size}, price={price_cents}c"}
@@ -192,7 +262,7 @@ class TradeExecutor:
                 action=action,
                 count=count,
                 price_cents=price_cents,
-                client_order_id=uuid.uuid4().hex
+                client_order_id=client_order_id or uuid.uuid4().hex
             )
 
             return {

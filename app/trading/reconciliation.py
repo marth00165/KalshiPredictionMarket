@@ -1,9 +1,13 @@
 """Portfolio reconciliation manager for syncing local state with Kalshi"""
 
 import logging
+from typing import Optional
+
+import aiosqlite
 
 from app.api_clients.kalshi_client import KalshiClient
 from app.trading.position_manager import PositionManager
+from app.storage.db import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
@@ -14,16 +18,18 @@ class ReconciliationManager:
     Ensures that PositionManager accurately reflects actual holdings on Kalshi.
     """
 
-    def __init__(self, kalshi_client: KalshiClient, position_manager: PositionManager):
+    def __init__(self, kalshi_client: KalshiClient, position_manager: PositionManager, db: Optional[DatabaseManager] = None):
         """
         Initialize ReconciliationManager.
 
         Args:
             kalshi_client: KalshiClient for fetching remote portfolio
             position_manager: PositionManager for managing local state
+            db: Optional DatabaseManager for execution reconciliation
         """
         self.kalshi_client = kalshi_client
         self.position_manager = position_manager
+        self.db = db
 
     async def _resolve_exit_price(self, ticker: str, side: str, fallback: float) -> float:
         """
@@ -45,10 +51,56 @@ class ReconciliationManager:
             )
             return fallback
 
+    async def reconcile_pending_executions(self):
+        """
+        Check for any executions stuck in 'pending_submit' and resolve them.
+        """
+        if not self.db:
+            return
+
+        async with self.db.connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, market_id, client_order_id FROM executions WHERE status = 'pending_submit' AND platform = 'kalshi'"
+            ) as cursor:
+                pending = await cursor.fetchall()
+
+        if not pending:
+            return
+
+        logger.info(f"🔄 Found {len(pending)} pending executions to reconcile.")
+
+        recent_orders = await self.kalshi_client.get_orders()
+        orders_by_client_id = {o.get('client_order_id'): o for o in recent_orders if o.get('client_order_id')}
+
+        async with self.db.connect() as db:
+            for row in pending:
+                coid = row['client_order_id']
+                if not coid:
+                    continue
+
+                if coid in orders_by_client_id:
+                    order = orders_by_client_id[coid]
+                    logger.info(f"✅ Found pending order {coid} on exchange. Status: {order.get('status')}")
+                    await db.execute(
+                        "UPDATE executions SET status = ?, external_order_id = ? WHERE id = ?",
+                        (order.get('status', 'executed'), order.get('order_id'), row['id'])
+                    )
+                else:
+                    logger.warning(f"❌ Pending order {coid} NOT found on exchange. Marking as failed.")
+                    await db.execute(
+                        "UPDATE executions SET status = 'failed_not_found' WHERE id = ?",
+                        (row['id'],)
+                    )
+            await db.commit()
+
     async def reconcile(self):
         """
         Run full reconciliation cycle.
         """
+        # 0. Reconcile pending executions first
+        await self.reconcile_pending_executions()
+
         logger.info("🔄 Starting portfolio reconciliation...")
 
         # 1. Fetch remote positions from Kalshi

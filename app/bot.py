@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import os
 import sys
 import time
 from datetime import datetime
@@ -15,6 +16,7 @@ from app.trading import PositionManager, Strategy, TradeExecutor
 from app.trading.bankroll_manager import BankrollManager
 from app.trading.reconciliation import ReconciliationManager
 from app.signals import SignalFusionService
+from app.utils.notifier import Notifier
 from app.utils import (
     get_error_reporter,
     BatchParser,
@@ -81,7 +83,8 @@ class AdvancedTradingBot:
 
         # Error reporting
         self.error_reporter = get_error_reporter()
-        
+        self.notifier = Notifier(self.config.risk.critical_webhook_url)
+
         # Cycle counter
         self.cycle_count = 0
         self._initialized = False
@@ -93,6 +96,21 @@ class AdvancedTradingBot:
         """Initialize database and managers."""
         if self._initialized:
             return
+
+        # Live mode scope validation
+        if not self.config.is_dry_run and self.config.trading.require_scope_in_live:
+            has_scope = (
+                bool(self.config.trading.allowed_market_ids) or
+                bool(self.config.trading.allowed_event_tickers) or
+                (self.config.kalshi_enabled and bool(self.config.platforms.kalshi.series_tickers)) or
+                (self.config.kalshi_enabled and bool(self.config.platforms.kalshi.allowed_market_ids)) or
+                (self.config.kalshi_enabled and bool(self.config.platforms.kalshi.allowed_event_tickers))
+            )
+            if not has_scope:
+                raise ValueError(
+                    "Live trading requires an explicit market scope for safety. "
+                    "Configure allowed_market_ids, allowed_event_tickers, or series_tickers."
+                )
 
         await self.db.initialize()
 
@@ -107,7 +125,8 @@ class AdvancedTradingBot:
 
         self.reconciliation_manager = ReconciliationManager(
             self.scanner.kalshi_client,
-            self.position_manager
+            self.position_manager,
+            db=self.db
         )
 
         # Run reconciliation on startup if not in dry-run
@@ -128,6 +147,114 @@ class AdvancedTradingBot:
         if provider_norm == "openai":
             return OpenAIAnalyzer(self.config)
         return ClaudeAnalyzer(self.config)
+
+    def _is_market_in_allowed_scope(self, market: MarketData) -> bool:
+        """Check if a market is within the explicitly allowed scope."""
+        # Collect all allowed identifiers
+        allowed_market_ids = set(self.config.trading.allowed_market_ids)
+        allowed_event_tickers = set(self.config.trading.allowed_event_tickers)
+
+        if market.platform == 'kalshi':
+            if self.config.platforms.kalshi.series_tickers:
+                allowed_event_tickers.update(self.config.platforms.kalshi.series_tickers)
+            if self.config.platforms.kalshi.allowed_market_ids:
+                allowed_market_ids.update(self.config.platforms.kalshi.allowed_market_ids)
+            if self.config.platforms.kalshi.allowed_event_tickers:
+                allowed_event_tickers.update(self.config.platforms.kalshi.allowed_event_tickers)
+
+        # If no scope defined anywhere, everything is allowed
+        # (startup check ensures we have scope if required in live)
+        if not allowed_market_ids and not allowed_event_tickers:
+            return True
+
+        if market.market_id in allowed_market_ids:
+            return True
+        if market.event_ticker and market.event_ticker in allowed_event_tickers:
+            return True
+
+        return False
+
+    async def _update_heartbeat(self, status: str = "active"):
+        """Write current bot status to reports/heartbeat.json."""
+        stats = self.position_manager.get_stats()
+        bankroll = self.bankroll_manager.get_balance()
+
+        heartbeat = {
+            "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+            "cycle_count": self.cycle_count,
+            "bankroll": bankroll,
+            "open_positions": stats['open_positions'],
+            "total_exposure": stats['total_exposure'],
+            "total_trades": stats['total_trades'],
+            "win_rate": stats['win_rate_percent'],
+            "dry_run": self.config.is_dry_run,
+            "status": status
+        }
+
+        from pathlib import Path
+        import json
+        report_dir = Path("reports")
+        try:
+            report_dir.mkdir(exist_ok=True)
+            with open(report_dir / "heartbeat.json", "w") as f:
+                json.dump(heartbeat, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to update heartbeat file: {e}")
+
+    async def _run_risk_guards(self, signals: List[TradeSignal]) -> List[TradeSignal]:
+        """
+        Apply hard risk rails before execution.
+        """
+        if not signals:
+            return []
+
+        # 1. Kill switch env var
+        kill_switch_var = self.config.risk.kill_switch_env_var
+        if kill_switch_var and os.getenv(kill_switch_var):
+            msg = f"🛑 KILL SWITCH DETECTED ({kill_switch_var}). Skipping execution."
+            logger.warning(msg)
+            await self.notifier.send_notification(msg, level="CRITICAL")
+            return []
+
+        # 2. Daily Loss Limit
+        current_balance = self.bankroll_manager.get_balance()
+        current_exposure = self.position_manager.get_total_exposure()
+        current_equity = current_balance + current_exposure
+
+        starting_equity = await self.bankroll_manager.get_daily_starting_balance()
+
+        loss_limit_fraction = self.config.risk.daily_loss_limit_fraction
+        max_allowed_loss = starting_equity * loss_limit_fraction
+        current_loss = starting_equity - current_equity
+
+        if current_loss >= max_allowed_loss:
+            msg = (
+                f"🛑 DAILY LOSS LIMIT BREACHED: loss=${current_loss:.2f} >= limit=${max_allowed_loss:.2f}. "
+                "Skipping new orders."
+            )
+            logger.warning(msg)
+            await self.notifier.send_notification(msg, level="CRITICAL")
+            return []
+
+        # 3. Per-cycle caps
+        max_orders = self.config.risk.max_orders_per_cycle
+        max_notional = self.config.risk.max_notional_per_cycle
+
+        allowed_signals = []
+        cumulative_notional = 0.0
+
+        for s in signals:
+            if len(allowed_signals) >= max_orders:
+                logger.info(f"⏭️ Skipping signal {s.market.market_id}: max_orders_per_cycle reached ({max_orders})")
+                continue
+            if cumulative_notional + s.position_size > max_notional:
+                logger.info(f"⏭️ Skipping signal {s.market.market_id}: max_notional_per_cycle reached ({max_notional})")
+                continue
+
+            allowed_signals.append(s)
+            cumulative_notional += s.position_size
+
+        return allowed_signals
 
     def set_analysis_provider(self, provider: str) -> None:
         """Switch analysis provider before a scan begins."""
@@ -485,11 +612,16 @@ class AdvancedTradingBot:
                 report["finished_at"] = datetime.now().isoformat()
                 return report
             
-            # Step 2: Apply filters
-            logger.info("\n🔬 Step 2: Filtering markets...")
-            filtered = self.strategy.filter_markets(markets)
+            # Step 2: Apply filters and scope guard
+            logger.info("\n🔬 Step 2: Filtering markets and applying scope guard...")
+            all_filtered = self.strategy.filter_markets(markets)
+            filtered = [m for m in all_filtered if self._is_market_in_allowed_scope(m)]
+
+            if len(filtered) < len(all_filtered):
+                logger.info(f"   Scope guard excluded {len(all_filtered) - len(filtered)} markets")
+
             report["counts"]["passed_filters"] = len(filtered)
-            logger.info(f"   {len(filtered)} markets passed filters")
+            logger.info(f"   {len(filtered)} markets passed filters and scope guard")
             
             # Step 3: Optional AI analysis
             if analyze and filtered:
@@ -565,6 +697,7 @@ class AdvancedTradingBot:
             report["errors"].append({"error": str(e)})
         
         report["finished_at"] = datetime.now().isoformat()
+        await self._update_heartbeat()
         return report
     
     async def run_trading_cycle(self):
@@ -758,10 +891,15 @@ class AdvancedTradingBot:
                 logger.warning("No markets found, aborting cycle")
                 return
             
-            # Step 2: Filter markets
-            logger.info("\n🔬 Step 2: Filtering markets...")
-            filtered = self.strategy.filter_markets(markets)
-            logger.info(f"   {len(filtered)} markets passed filters")
+            # Step 2: Filter markets and apply scope guard
+            logger.info("\n🔬 Step 2: Filtering markets and applying scope guard...")
+            all_filtered = self.strategy.filter_markets(markets)
+            filtered = [m for m in all_filtered if self._is_market_in_allowed_scope(m)]
+
+            if len(filtered) < len(all_filtered):
+                logger.info(f"   Scope guard excluded {len(all_filtered) - len(filtered)} markets")
+
+            logger.info(f"   {len(filtered)} markets passed filters and scope guard")
             report["counts"]["passed_filters"] = len(filtered)
 
             # Optional interactive picker for dry-run sessions.
@@ -1146,14 +1284,46 @@ class AdvancedTradingBot:
                 if not executable_signals:
                     logger.info("No executable signals after duplicate guard filtering")
                 else:
+                    # Apply risk guards (kill switch, daily loss, per-cycle caps)
+                    guarded_signals = await self._run_risk_guards(executable_signals)
+
+                    if not guarded_signals:
+                        logger.info("No signals remaining after risk guards")
+                        return
+
+                    # Defense-in-depth: final scope check before execution
+                    execution_ready_signals = [
+                        s for s in guarded_signals
+                        if self._is_market_in_allowed_scope(s.market)
+                    ]
+
+                    if len(execution_ready_signals) < len(guarded_signals):
+                        logger.warning(
+                            f"Final scope guard excluded {len(guarded_signals) - len(execution_ready_signals)} "
+                            "signals right before execution!"
+                        )
+                        for s in guarded_signals:
+                            if s not in execution_ready_signals:
+                                row = market_rows_by_id.get(s.market.market_id)
+                                if row:
+                                    row["execution"] = {
+                                        "success": False,
+                                        "skipped": True,
+                                        "reason": "final_scope_guard_violation",
+                                    }
+
+                    if not execution_ready_signals:
+                        logger.info("No signals remaining after final scope guard")
+                        return
+
                     # Execute trades
                     try:
-                        results = await self.executor.execute_signals(executable_signals)
+                        results = await self.executor.execute_signals(execution_ready_signals, cycle_id=self.cycle_count)
                         successful = sum(1 for r in results if r.get("success"))
-                        logger.info(f"Executed {successful}/{len(executable_signals)} trades")
+                        logger.info(f"Executed {successful}/{len(execution_ready_signals)} trades")
                         report["counts"]["executed"] = int(successful)
 
-                        for s, res in zip(executable_signals, results):
+                        for s, res in zip(execution_ready_signals, results):
                             row = market_rows_by_id.get(s.market.market_id)
                             if row is not None:
                                 row["execution"] = {
@@ -1205,7 +1375,9 @@ class AdvancedTradingBot:
             self._print_cycle_summary(cycle_start)
         
         except Exception as e:
-            logger.error(f"Unexpected error in trading cycle: {e}")
+            msg = f"Unexpected error in trading cycle: {e}"
+            logger.error(msg)
+            await self.notifier.send_notification(msg, level="ERROR")
             self.error_reporter.add_error_to_report(
                 cycle_report, e, "trading cycle"
             )
@@ -1217,6 +1389,9 @@ class AdvancedTradingBot:
             })
         
         finally:
+            # Update heartbeat at end of cycle
+            await self._update_heartbeat()
+
             # Finish cycle report in memory only.
             # JSON artifacts are intentionally limited to collect mode.
             report["finished_at"] = datetime.now().isoformat() + "Z"
