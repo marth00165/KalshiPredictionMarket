@@ -46,6 +46,7 @@ class Trade:
     result: float = 0.0  # Profit/loss in dollars (calculated on close)
     status: str = "open"  # 'open', 'closed', 'recovered'
     external_order_id: Optional[str] = None
+    id: Optional[int] = None # DB ID
     
     @property
     def closed(self) -> bool:
@@ -113,7 +114,8 @@ class PositionManager:
                         entry_price=row['entry_price'],
                         timestamp=_parse_utc_timestamp(row['opened_at_utc']),
                         status=row['status'],
-                        external_order_id=row['external_order_id']
+                        external_order_id=row['external_order_id'],
+                        id=row['id']
                     )
 
                     if row['closed_at_utc']:
@@ -157,37 +159,48 @@ class PositionManager:
     # POSITION MANAGEMENT
     # ========================================================================
     
-    async def add_position(self, signal: TradeSignal, external_order_id: Optional[str] = None) -> Trade:
+    async def add_position(self, signal: TradeSignal, external_order_id: Optional[str] = None, quantity: Optional[float] = None, price: Optional[float] = None) -> Trade:
         """
         Open a new position from a trade signal and persist to DB
         
         Args:
             signal: TradeSignal with market and sizing information
             external_order_id: ID from the trading platform
+            quantity: Optional specific quantity filled
+            price: Optional specific fill price
         
         Returns:
             Trade object representing the opened position
         """
         
-        # Determine entry price based on action
-        if signal.action in ('buy_yes', 'sell_no'):
+        # Determine entry price based on action if not provided
+        if price is not None:
+            entry_price = price
+        elif signal.action in ('buy_yes', 'sell_no'):
             entry_price = signal.market.yes_price
-            side = 'yes'
         else:  # buy_no or sell_yes
             entry_price = signal.market.no_price
-            side = 'no'
         
-        # Kalshi count is usually position_size / price
-        # But signals already have position_size (dollars)
-        quantity = signal.position_size / max(0.01, entry_price)
+        if signal.action in ('buy_yes', 'sell_no'):
+            side = 'yes'
+        else:
+            side = 'no'
+
+        # Use provided quantity or derive from signal
+        if quantity is not None:
+            final_quantity = quantity
+        else:
+            final_quantity = signal.position_size / max(0.01, entry_price)
+
+        position_size = final_quantity * entry_price
 
         trade = Trade(
             market_id=signal.market.market_id,
             platform=signal.market.platform,
             side=side,
             action=signal.action,
-            quantity=quantity,
-            position_size=signal.position_size,
+            quantity=final_quantity,
+            position_size=position_size,
             entry_price=entry_price,
             external_order_id=external_order_id,
             status="open"
@@ -203,7 +216,7 @@ class PositionManager:
             timestamp_str += "Z"
 
         async with self.db.connect() as db:
-            await db.execute("""
+            async with db.execute("""
                 INSERT INTO positions
                 (market_id, platform, side, entry_price, quantity, cost, status, external_order_id, opened_at_utc, created_at_utc)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -211,10 +224,57 @@ class PositionManager:
                 trade.market_id, trade.platform, trade.side, trade.entry_price,
                 trade.quantity, trade.position_size, trade.status,
                 trade.external_order_id, timestamp_str, now
-            ))
+            )) as cursor:
+                trade.id = cursor.lastrowid
             await db.commit()
 
         logger.info(f"✅ Added position: {trade}")
+        return trade
+
+    async def add_fill(self, market_id: str, platform: str, action: str, quantity: float, price: float, external_order_id: Optional[str] = None) -> Trade:
+        """
+        Add a fill to local state. Useful for reconciliation.
+        """
+        if action in ('buy_yes', 'sell_no'):
+            side = 'yes'
+        else:
+            side = 'no'
+
+        position_size = quantity * price
+
+        trade = Trade(
+            market_id=market_id,
+            platform=platform,
+            side=side,
+            action=action,
+            quantity=quantity,
+            position_size=position_size,
+            entry_price=price,
+            external_order_id=external_order_id,
+            status="open"
+        )
+
+        self.open_positions.append(trade)
+
+        now = datetime.utcnow().isoformat() + "Z"
+        timestamp_str = trade.timestamp.isoformat()
+        if not timestamp_str.endswith("Z"):
+            timestamp_str += "Z"
+
+        async with self.db.connect() as db:
+            async with db.execute("""
+                INSERT INTO positions
+                (market_id, platform, side, entry_price, quantity, cost, status, external_order_id, opened_at_utc, created_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade.market_id, trade.platform, trade.side, trade.entry_price,
+                trade.quantity, trade.position_size, trade.status,
+                trade.external_order_id, timestamp_str, now
+            )) as cursor:
+                trade.id = cursor.lastrowid
+            await db.commit()
+
+        logger.info(f"✅ Added fill: {trade}")
         return trade
     
     async def add_recovered_position(self, pos_data: Dict[str, Any]) -> Trade:
@@ -254,69 +314,77 @@ class PositionManager:
         logger.info(f"🔄 Recovered position: {trade}")
         return trade
 
-    async def close_position(self, market_id: str, exit_price: float) -> Trade:
+    async def close_position(self, market_id: str, exit_price: float) -> List[Trade]:
         """
-        Close an open position and record the result
+        Close all open positions for a market and record the results.
         
         Args:
             market_id: ID of market to close
             exit_price: Price at which position is closed
         
         Returns:
-            Closed Trade object with result recorded
+            List of closed Trade objects
         
         Raises:
             PositionNotFoundError: If no open position found for market_id
-            PositionAlreadyClosedError: If position is already closed
         """
-        # Find position
-        position = None
-        for p in self.open_positions:
-            if p.market_id == market_id:
-                if p.status == "closed":
-                    raise PositionAlreadyClosedError(market_id)
-                position = p
-                break
+        # Find all open positions for this market
+        to_close = [p for p in self.open_positions if p.market_id == market_id and p.status != "closed"]
         
-        if not position:
+        if not to_close:
             raise PositionNotFoundError(market_id)
         
-        # Calculate profit/loss
-        # Assumption: exit_price is the price of the side held (YES or NO)
-        pnl = (exit_price - position.entry_price) * position.quantity
+        closed_trades = []
+        total_pnl = 0.0
+        now = datetime.utcnow().isoformat() + "Z"
+
+        for position in to_close:
+            # Calculate profit/loss
+            pnl = (exit_price - position.entry_price) * position.quantity
+            total_pnl += pnl
+
+            # Update position
+            position.result = pnl
+            position.status = "closed"
+
+            # Update stats (total profit/loss dollars)
+            self.total_profit += max(0, pnl)
+            self.total_loss += abs(min(0, pnl))
+
+            # Move to history
+            self.open_positions.remove(position)
+            self.trade_history.append(position)
+            closed_trades.append(position)
         
-        # Update position
-        position.result = pnl
-        position.status = "closed"
-        
-        # Update stats
-        self.total_profit += max(0, pnl)
-        self.total_loss += abs(min(0, pnl))
-        
-        # Move to history
-        self.open_positions.remove(position)
-        self.trade_history.append(position)
-        
-        # Update metrics
+        # Update metrics (counts) - treat the entire market closure as one trade
         self.total_trades += 1
-        if pnl > 0:
+        if total_pnl > 0:
             self.winning_trades += 1
         else:
             self.losing_trades += 1
         
-        # Persist to DB
-        now = datetime.utcnow().isoformat() + "Z"
+        # Persist all updates to DB
         async with self.db.connect() as db:
-            await db.execute("""
-                UPDATE positions
-                SET status = ?, closed_at_utc = ?, result = ?
-                WHERE market_id = ? AND status != 'closed'
-            """, (position.status, now, position.result, market_id))
+            for position in closed_trades:
+                if position.id:
+                    await db.execute("""
+                        UPDATE positions
+                        SET status = ?, closed_at_utc = ?, result = ?
+                        WHERE id = ?
+                    """, (position.status, now, position.result, position.id))
+                else:
+                    # Fallback for positions without ID (should not happen if all paths updated)
+                    await db.execute("""
+                        UPDATE positions
+                        SET status = ?, closed_at_utc = ?, result = ?
+                        WHERE market_id = ? AND status != 'closed'
+                    """, (position.status, now, position.result, market_id))
             await db.commit()
 
-        # Replenish bankroll: return cost + PnL (which is quantity * exit_price)
+        # Replenish bankroll: return (total cost + total PnL)
         if self.bankroll_manager:
-            replenishment = position.position_size + pnl
+            total_cost = sum(p.position_size for p in closed_trades)
+            replenishment = total_cost + total_pnl
             await self.bankroll_manager.adjust_balance(
                 replenishment,
                 reason="position_closed",
@@ -327,11 +395,12 @@ class PositionManager:
                 await db.execute("""
                     INSERT INTO pnl_history (timestamp_utc, profit, balance, created_at_utc)
                     VALUES (?, ?, ?, ?)
-                """, (now, pnl, self.bankroll_manager.get_balance(), now))
+                """, (now, total_pnl, self.bankroll_manager.get_balance(), now))
                 await db.commit()
 
-        logger.info(f"✅ Closed position: {position}")
-        return position
+        for position in closed_trades:
+            logger.info(f"✅ Closed position: {position}")
+        return closed_trades
     
     # ========================================================================
     # QUERY METHODS

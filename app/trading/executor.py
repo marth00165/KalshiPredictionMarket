@@ -117,10 +117,20 @@ class TradeExecutor:
                 f"DRY RUN: would execute {signal.action} on {signal.market.platform} "
                 f"for {signal.market.market_id} (${signal.position_size:,.2f})"
             )
+
+            # Determine price/quantity for dry run record
+            if signal.action in ('buy_yes', 'sell_no'):
+                price = signal.market.yes_price
+            else:
+                price = signal.market.no_price
+            quantity = signal.position_size / max(0.01, price)
+
             result = {
                 "success": True,
                 "order_id": f"dry_run_{uuid.uuid4().hex[:8]}",
-                "status": "dry_run"
+                "status": "dry_run",
+                "filled_quantity": quantity,
+                "avg_fill_price": price
             }
             await self._record_execution(signal, result, cycle_id=cycle_id, client_order_id=client_order_id)
             return result
@@ -168,6 +178,10 @@ class TradeExecutor:
             price = signal.market.no_price
 
         quantity = signal.position_size / max(0.01, price)
+        status = result.get("status", "failed")
+        filled_quantity = result.get("filled_quantity", 0.0)
+        avg_fill_price = result.get("avg_fill_price", 0.0)
+        remaining_quantity = max(0.0, quantity - filled_quantity)
 
         async with self.db.connect() as db:
             if client_order_id:
@@ -180,20 +194,29 @@ class TradeExecutor:
                             UPDATE executions SET
                                 status = ?,
                                 external_order_id = ?,
+                                filled_quantity = ?,
+                                avg_fill_price = ?,
+                                remaining_quantity = ?,
                                 executed_at_utc = ?
                             WHERE client_order_id = ?
-                        """, (result.get("status", "failed"), result.get("order_id"), now, client_order_id))
+                        """, (
+                            status, result.get("order_id"),
+                            filled_quantity, avg_fill_price,
+                            remaining_quantity,
+                            now, client_order_id
+                        ))
                         await db.commit()
                         return
 
             await db.execute("""
                 INSERT INTO executions
-                (market_id, platform, action, quantity, price, cost, external_order_id, status, executed_at_utc, created_at_utc, cycle_id, client_order_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (market_id, platform, action, quantity, price, cost, external_order_id, status, executed_at_utc, created_at_utc, cycle_id, client_order_id, filled_quantity, avg_fill_price, remaining_quantity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.market.market_id, signal.market.platform, signal.action,
                 quantity, price, signal.position_size, result.get("order_id"),
-                result.get("status", "failed"), now, now, cycle_id, client_order_id
+                status, now, now, cycle_id, client_order_id,
+                filled_quantity, avg_fill_price, remaining_quantity
             ))
             await db.commit()
 
@@ -286,11 +309,23 @@ class TradeExecutor:
                 client_order_id=client_order_id or uuid.uuid4().hex
             )
 
+            # Map Kalshi response to our execution lifecycle
+            # result contains: order_id, status, raw_response
+            raw = result.get("raw_response", {})
+            status = result.get("status", "unknown")
+
+            # Kalshi V2 sometimes returns filled info in order placement response
+            # if it was matched immediately.
+            filled_quantity = float(raw.get("filled_count", 0.0))
+            avg_fill_price = float(raw.get("avg_fill_price", 0.0)) / 100.0 if raw.get("avg_fill_price") else 0.0
+
             return {
                 "success": result.get("order_id") is not None,
                 "order_id": result.get("order_id"),
-                "status": result.get("status"),
-                "raw": result.get("raw_response")
+                "status": status,
+                "filled_quantity": filled_quantity,
+                "avg_fill_price": avg_fill_price,
+                "raw": raw
             }
 
         except Exception as e:
