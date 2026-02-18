@@ -30,11 +30,23 @@ async def run_collect(bot: AdvancedTradingBot, series_tickers: Optional[List[str
 
         logger.info(f"Collected {len(markets)} markets.")
 
-        # Persist to SQLite
+
+        # Persist to SQLite and save JSON report
         if markets:
             market_dicts = [asdict(m) for m in markets]
             await bot.db.save_market_snapshots(market_dicts)
             logger.info(f"✅ Successfully stored {len(markets)} snapshots to database.")
+
+            # Save JSON report
+            import json
+            import os
+            reports_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "reports")
+            os.makedirs(reports_dir, exist_ok=True)
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            report_path = os.path.join(reports_dir, f"collect_{timestamp}.json")
+            with open(report_path, "w") as f:
+                json.dump(market_dicts, f, indent=2)
+            logger.info(f"📝 JSON report saved to {report_path}")
 
         duration = time.time() - start_time
 
