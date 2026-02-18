@@ -1,10 +1,8 @@
-import json
 import logging
 import asyncio
 import time
 from datetime import datetime
 from typing import List, Optional
-from pathlib import Path
 
 from app.config import ConfigManager
 from app.storage.db import DatabaseManager
@@ -312,32 +310,15 @@ class AdvancedTradingBot:
                 logger.info(f"\n🧠 Step 3: Analyzing {len(to_analyze)} markets with {provider}...")
                 analyzed_estimates: List[FairValueEstimate] = []
                 
-                for market in to_analyze:
-                    try:
-                        estimate = await self.analyzer.analyze_market(market)
-                        if estimate:
-                            report["counts"]["analyzed"] += 1
-                            report["counts"]["estimates"] += 1
-                            analyzed_estimates.append(estimate)
-                            
-                            # Update market row with analysis
-                            if market.market_id in market_rows_by_id:
-                                market_rows_by_id[market.market_id]["analysis"] = {
-                                    "estimated_probability": estimate.estimated_probability,
-                                    "confidence": estimate.confidence_level,
-                                    "edge": estimate.edge,
-                                    "effective_probability": estimate.effective_probability,
-                                    "effective_confidence": estimate.effective_confidence,
-                                    "effective_edge": estimate.effective_edge,
-                                    "reasoning": estimate.reasoning,
-                                }
-                                    
-                    except Exception as e:
-                        logger.warning(f"Error analyzing {market.market_id}: {e}")
-                        report["errors"].append({
-                            "market_id": market.market_id,
-                            "error": str(e),
-                        })
+                try:
+                    estimates = await self.analyzer.analyze_market_batch(to_analyze)
+                    analyzed_estimates = list(estimates) if estimates else []
+                    report["counts"]["analyzed"] = len(to_analyze)
+                    report["counts"]["estimates"] = len(analyzed_estimates)
+                except Exception as e:
+                    logger.warning(f"Error during batch analysis: {e}")
+                    report["errors"].append({"error": str(e)})
+                    analyzed_estimates = []
                 
                 # Apply optional external feature fusion.
                 if analyzed_estimates and self.signal_fusion_service.enabled:
@@ -795,18 +776,9 @@ class AdvancedTradingBot:
             })
         
         finally:
-            # Finish and write JSON report
+            # Finish cycle report in memory only.
+            # JSON artifacts are intentionally limited to collect mode.
             report["finished_at"] = datetime.now().isoformat() + "Z"
-            try:
-                reports_dir = Path(__file__).resolve().parent.parent / "reports"
-                reports_dir.mkdir(parents=True, exist_ok=True)
-
-                safe_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                report_path = reports_dir / f"cycle_{self.cycle_count}_{safe_ts}.json"
-                report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-                logger.info(f"🧾 Wrote cycle report: {report_path}")
-            except Exception as e:
-                logger.warning(f"Failed to write JSON report: {e}")
 
             # Log any errors from this cycle
             cycle_report.log_summary()
