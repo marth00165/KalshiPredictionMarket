@@ -91,6 +91,27 @@ This is the remaining work needed before running the bot unattended with real mo
 
 ---
 
+## Additional TODOs From Design Discussion
+
+TODO 10. Explicit settlement-by-outcome lifecycle (result correctness)
+
+- Files: `app/trading/reconciliation.py`, `app/trading/position_manager.py`, `app/api_clients/kalshi_client.py`
+- Add:
+  - explicit handling for settled market outcomes (`YES`/`NO`) to close positions with deterministic payout logic,
+  - payout/PnL accounting assertions for both `buy_yes` and `buy_no`,
+  - guardrails so “missing from remote positions” is not the only closure signal.
+
+TODO 11. VPS runtime operations checklist + automation
+
+- Files: `OPERATIONS.md`, `README.md`, `deploy/` (new scripts/unit examples if needed)
+- Add:
+  - system service setup (e.g., `systemd`) with restart policy and startup ordering,
+  - log rotation and retention policy,
+  - health watchdog expectations (heartbeat freshness + alert path),
+  - one-command start/stop/status runbook for unattended week-long operation.
+
+---
+
 ## Recommended Config Contract For Live Autonomous Run
 
 In `advanced_config.json`:
