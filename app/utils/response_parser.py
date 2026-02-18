@@ -161,6 +161,7 @@ class MarketDataParser:
                 end_date=data.get('end_date', ''),
                 category=data.get('category', 'other'),
                 event_ticker=data.get('event_ticker', ''),
+                series_ticker=data.get('series_ticker', ''),
                 yes_option=data.get('yes_option', ''),
                 no_option=data.get('no_option', ''),
             )

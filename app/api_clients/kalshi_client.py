@@ -261,7 +261,8 @@ class KalshiClient(BaseAPIClient):
                 'volume': float(market_json.get('volume', 0)),
                 'liquidity': float(market_json.get('open_interest', 0)),
                 'end_date': market_json.get('expiration_time', ''),
-                'category': market_json.get('category', 'other')
+                'category': market_json.get('category', 'other'),
+                'series_ticker': market_json.get('series_ticker', '')
             }
         
         except (KeyError, ValueError, TypeError) as e:

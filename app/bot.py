@@ -102,9 +102,11 @@ class AdvancedTradingBot:
             has_scope = (
                 bool(self.config.trading.allowed_market_ids) or
                 bool(self.config.trading.allowed_event_tickers) or
-                (self.config.kalshi_enabled and bool(self.config.platforms.kalshi.series_tickers)) or
-                (self.config.kalshi_enabled and bool(self.config.platforms.kalshi.allowed_market_ids)) or
-                (self.config.kalshi_enabled and bool(self.config.platforms.kalshi.allowed_event_tickers))
+                (self.config.kalshi_enabled and (
+                    bool(self.config.platforms.kalshi.series_tickers) or
+                    bool(self.config.platforms.kalshi.allowed_market_ids) or
+                    bool(self.config.platforms.kalshi.allowed_event_tickers)
+                ))
             )
             if not has_scope:
                 raise ValueError(
@@ -113,6 +115,11 @@ class AdvancedTradingBot:
                 )
 
         await self.db.initialize()
+
+        # Load cycle count from DB for stable idempotency across restarts
+        status = await self.db.get_last_status()
+        self.cycle_count = int(status.get('cycle_count', 0))
+        logger.info(f"Loaded cycle_count: {self.cycle_count}")
 
         if self.config.is_dry_run:
             # Fresh paper session per app startup; continuous loops keep evolving in-process.
@@ -153,10 +160,11 @@ class AdvancedTradingBot:
         # Collect all allowed identifiers
         allowed_market_ids = set(self.config.trading.allowed_market_ids)
         allowed_event_tickers = set(self.config.trading.allowed_event_tickers)
+        allowed_series_tickers = set()
 
         if market.platform == 'kalshi':
             if self.config.platforms.kalshi.series_tickers:
-                allowed_event_tickers.update(self.config.platforms.kalshi.series_tickers)
+                allowed_series_tickers.update(self.config.platforms.kalshi.series_tickers)
             if self.config.platforms.kalshi.allowed_market_ids:
                 allowed_market_ids.update(self.config.platforms.kalshi.allowed_market_ids)
             if self.config.platforms.kalshi.allowed_event_tickers:
@@ -164,13 +172,26 @@ class AdvancedTradingBot:
 
         # If no scope defined anywhere, everything is allowed
         # (startup check ensures we have scope if required in live)
-        if not allowed_market_ids and not allowed_event_tickers:
+        if not allowed_market_ids and not allowed_event_tickers and not allowed_series_tickers:
             return True
 
+        # 1. market_id match
         if market.market_id in allowed_market_ids:
             return True
+
+        # 2. event_ticker match
         if market.event_ticker and market.event_ticker in allowed_event_tickers:
             return True
+
+        # 3. series_ticker match
+        if market.series_ticker and market.series_ticker in allowed_series_tickers:
+            return True
+
+        # 4. Kalshi fallback: market_id starts with series-
+        if market.platform == 'kalshi' and market.market_id:
+            for series in allowed_series_tickers:
+                if market.market_id.startswith(f"{series}-"):
+                    return True
 
         return False
 
@@ -524,6 +545,7 @@ class AdvancedTradingBot:
         """
         await self.initialize()
         self.cycle_count += 1
+        await self.db.update_status('cycle_count', self.cycle_count)
         cycle_started_at = datetime.now().isoformat() + "Z"
         
         logger.info("=" * 60)
@@ -715,6 +737,7 @@ class AdvancedTradingBot:
         """
         await self.initialize()
         self.cycle_count += 1
+        await self.db.update_status('cycle_count', self.cycle_count)
 
         # Report container (written to JSON at end of cycle)
         cycle_started_at = datetime.now().isoformat() + "Z"

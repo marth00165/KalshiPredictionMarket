@@ -88,7 +88,28 @@ class TradeExecutor:
         # Log the signal
         self._log_signal(signal)
         
-        client_order_id = self._generate_client_order_id(cycle_id, signal)
+        client_order_id = self._generate_client_order_id(signal)
+
+        # Idempotency short-circuit: Check if this signal was already processed
+        async with self.db.connect() as db:
+            import aiosqlite
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT status, external_order_id FROM executions WHERE client_order_id = ?",
+                (client_order_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    status = row['status']
+                    # If already submitted, executed, or pending, skip new attempt
+                    if status in ('executed', 'submitted', 'dry_run', 'pending_submit', 'skipped_drift', 'skipped_edge'):
+                        logger.info(f"⏭️ Signal already handled (status={status}), short-circuiting: {signal}")
+                        return {
+                            "success": status in ('executed', 'submitted', 'dry_run'),
+                            "order_id": row['external_order_id'],
+                            "status": status,
+                            "idempotent": True
+                        }
 
         if self.dry_run:
             # Simulate success
@@ -130,11 +151,11 @@ class TradeExecutor:
             await self._record_execution(signal, error_result, cycle_id=cycle_id, client_order_id=client_order_id)
             return error_result
 
-    def _generate_client_order_id(self, cycle_id: int, signal: TradeSignal) -> str:
+    def _generate_client_order_id(self, signal: TradeSignal) -> str:
         """Generate a deterministic client order ID for idempotency."""
-        # Derived from cycle, market, action, and key sizing parameters
-        raw = f"{cycle_id}:{signal.market.market_id}:{signal.action}:{signal.market_price:.2f}:{signal.position_size:.2f}"
-        return hashlib.md5(raw.encode()).hexdigest()
+        # Derived from stable signal identity only: platform, market, action, rounded price/size
+        raw = f"{signal.market.platform}:{signal.market.market_id}:{signal.action}:{signal.market_price:.2f}:{signal.position_size:.2f}"
+        return hashlib.sha256(raw.encode()).hexdigest()
     
     async def _record_execution(self, signal: TradeSignal, result: Dict[str, Any], cycle_id: int = 0, client_order_id: Optional[str] = None):
         """Persist execution record to database."""

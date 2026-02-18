@@ -240,6 +240,14 @@ class RiskConfig:
                 "max_new_exposure_per_day_fraction must be between 0 and 1, "
                 f"got {self.max_new_exposure_per_day_fraction}"
             )
+        if self.max_orders_per_cycle < 1:
+            raise ValueError(f"max_orders_per_cycle must be >= 1, got {self.max_orders_per_cycle}")
+        if self.max_notional_per_cycle <= 0:
+            raise ValueError(f"max_notional_per_cycle must be > 0, got {self.max_notional_per_cycle}")
+        if not (0 <= self.daily_loss_limit_fraction <= 1):
+            raise ValueError(f"daily_loss_limit_fraction must be between 0 and 1, got {self.daily_loss_limit_fraction}")
+        if not self.kill_switch_env_var:
+            raise ValueError("kill_switch_env_var cannot be empty")
 
 
 @dataclass
