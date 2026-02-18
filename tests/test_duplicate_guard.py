@@ -23,6 +23,11 @@ def mock_config():
     config.risk.max_position_size = 100
     config.risk.max_total_exposure_fraction = 0.8
     config.risk.max_new_exposure_per_day_fraction = 0.8
+    config.risk.max_orders_per_cycle = 5
+    config.risk.max_notional_per_cycle = 1000.0
+    config.risk.daily_loss_limit_fraction = 0.2
+    config.risk.kill_switch_env_var = "BOT_DISABLE_TRADING"
+    config.risk.critical_webhook_url = None
     config.analysis_provider = "claude"
     type(config).min_edge_percentage = 5.0
     type(config).min_confidence_percentage = 50.0
@@ -282,10 +287,26 @@ async def test_bot_duplicate_guard_reporting(mock_config):
         bot.executor = MockExecutor.return_value
         bot.bankroll_manager = MockBankrollManager.return_value
         bot.scanner = MockScanner.return_value
+        bot.db.update_status = AsyncMock()
 
         # Setup managers
         bot.bankroll_manager.get_balance.return_value = 1000
+        bot.bankroll_manager.get_daily_starting_balance = AsyncMock(return_value=1000.0)
+        bot.bankroll_manager.adjust_balance = AsyncMock()
         bot.position_manager.get_open_market_keys.return_value = {"k:m1"}
+        bot.position_manager.get_open_positions.return_value = []
+        bot.position_manager.get_total_exposure.return_value = 0.0
+        bot.position_manager.get_opened_exposure_today_utc.return_value = 0.0
+        bot.position_manager.get_position_count.return_value = 0
+        bot.position_manager.get_stats.return_value = {
+            "open_positions": 0,
+            "total_exposure": 0.0,
+            "total_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "win_rate_percent": 0.0,
+        }
+        bot.position_manager.add_position = AsyncMock()
 
         market1 = MarketData(market_id="m1", platform="k", title="T1", description="D", category="C", end_date="Z", yes_price=0.5, no_price=0.5, volume=1000, liquidity=1000)
         market2 = MarketData(market_id="m2", platform="k", title="T2", description="D", category="C", end_date="Z", yes_price=0.5, no_price=0.5, volume=1000, liquidity=1000)
@@ -312,8 +333,10 @@ async def test_bot_duplicate_guard_reporting(mock_config):
         # Mock analyzer
         est1 = FairValueEstimate(market_id="m1", estimated_probability=0.7, confidence_level=0.8, reasoning="R", edge=0.2)
         est2 = FairValueEstimate(market_id="m2", estimated_probability=0.7, confidence_level=0.8, reasoning="R", edge=0.2)
-        bot.analyzer.analyze_market_batch = AsyncMock(return_value=[est1, est2])
-        bot.analyzer.get_api_stats.return_value = {"total_cost": 0.0}
+        mock_analyzer = MagicMock()
+        mock_analyzer.analyze_market_batch = AsyncMock(return_value=[est1, est2])
+        mock_analyzer.get_api_stats.return_value = {"total_cost": 0.0}
+        bot._analyzer = mock_analyzer
 
         # Two opportunities for m2 (duplicate in cycle) and one for m1 (already open)
         bot.strategy.find_opportunities.return_value = [(market1, est1), (market2, est2), (market2, est2)]
