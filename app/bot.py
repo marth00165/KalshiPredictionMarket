@@ -1,10 +1,8 @@
-import json
 import logging
 import asyncio
 import time
 from datetime import datetime
 from typing import List, Optional
-from pathlib import Path
 
 from app.config import ConfigManager
 from app.storage.db import DatabaseManager
@@ -725,18 +723,9 @@ class AdvancedTradingBot:
             })
         
         finally:
-            # Finish and write JSON report
+            # Finish cycle report in memory only.
+            # JSON artifacts are intentionally limited to collect mode.
             report["finished_at"] = datetime.now().isoformat() + "Z"
-            try:
-                reports_dir = Path(__file__).resolve().parent.parent / "reports"
-                reports_dir.mkdir(parents=True, exist_ok=True)
-
-                safe_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                report_path = reports_dir / f"cycle_{self.cycle_count}_{safe_ts}.json"
-                report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-                logger.info(f"🧾 Wrote cycle report: {report_path}")
-            except Exception as e:
-                logger.warning(f"Failed to write JSON report: {e}")
 
             # Log any errors from this cycle
             cycle_report.log_summary()
