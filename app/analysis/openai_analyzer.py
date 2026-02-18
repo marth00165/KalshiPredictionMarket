@@ -10,6 +10,7 @@ from app.analytics import EloEngine
 from app.api_clients.base_client import BaseAPIClient, APIError
 from app.analysis.context_loader import load_context_json_block
 from app.models import MarketData, FairValueEstimate
+from app.trading.engine import calculate_adjusted_yes_probability
 from app.utils import ClaudeResponseParser, ConfigManager
 
 logger = logging.getLogger(__name__)
@@ -37,9 +38,6 @@ class OpenAIAnalyzer:
                 data_path=str(getattr(self.config.analysis, "nba_elo_data_path", "context/kaggleGameData.csv")),
                 output_path=str(getattr(self.config.analysis, "nba_elo_output_path", "app/outputs/elo_ratings.json")),
             )
-        self._llm_adjustment_max_delta = float(
-            getattr(self.config.analysis, "llm_adjustment_max_delta", 0.03)
-        )
 
     def set_runtime_context_block(self, context_text: str) -> None:
         """Set optional runtime context block (e.g., prior analysis blurbs)."""
@@ -87,11 +85,17 @@ class OpenAIAnalyzer:
                     response_text=response.get("content_text", ""),
                     market_id=market.market_id,
                     market_price=market.yes_price,
-                    base_probability=float(nba_elo_context["yes_probability"]),
-                    max_delta=self._llm_adjustment_max_delta,
+                    yes_team=str(nba_elo_context["yes_team"]),
+                    home_team=str(nba_elo_context["home_team"]),
+                    away_team=str(nba_elo_context["away_team"]),
+                    home_elo=float(nba_elo_context["home_elo"]),
+                    away_elo=float(nba_elo_context["away_elo"]),
+                    home_court_bonus=float(nba_elo_context["home_court_bonus"]),
                 )
                 if estimate is None:
                     estimate = self._build_elo_fallback_estimate(market, nba_elo_context, "llm_parse_failed")
+                else:
+                    self._log_elo_decision_fields(market, estimate)
             else:
                 estimate = ClaudeResponseParser.parse_fair_value_estimate(
                     response_text=response.get("content_text", ""),
@@ -167,16 +171,16 @@ Respond in JSON format:
 
 Return ONLY valid JSON."""
 
-    def _build_nba_elo_adjustment_prompt(self, market: MarketData, elo_ctx: Dict[str, str]) -> str:
+    def _build_nba_elo_adjustment_prompt(self, market: MarketData, elo_ctx: Dict[str, object]) -> str:
         context_section = self._build_context_section()
-        max_delta = abs(self._llm_adjustment_max_delta)
+        max_elo_delta = 75
         return f"""You are assisting an NBA trading model.
 
 IMPORTANT:
 - Elo is the PRIMARY probability source.
 - Do NOT generate a probability from scratch.
-- You may only suggest a SMALL adjustment delta to Elo YES probability.
-- Keep delta in [-{max_delta:.4f}, +{max_delta:.4f}] unless there is concrete, high-confidence evidence.
+- You may only suggest an Elo adjustment for the YES team.
+- Keep elo_delta in [-{max_elo_delta}, +{max_elo_delta}] unless there is concrete, high-confidence evidence.
 
 MARKET DETAILS:
 Title: {market.title}
@@ -197,9 +201,9 @@ Adjust only for concrete factors such as:
 
 Respond in JSON format:
 {{
-  "delta": <float in [-{max_delta:.4f}, +{max_delta:.4f}]>,
-  "confidence": <float 0-100>,
-  "reasoning": "<detailed explanation>",
+  "elo_delta": <integer in [-{max_elo_delta}, +{max_elo_delta}]>,
+  "confidence": <float 0-1 or 0-100>,
+  "reason": "<detailed explanation>",
   "key_factors": ["factor1", "factor2", ...],
   "data_sources": ["source1", "source2", ...]
 }}
@@ -213,7 +217,7 @@ Return ONLY valid JSON."""
         market_id = str(getattr(market, "market_id", "") or "").strip().upper()
         return series == "KXNBAGAME" or market_id.startswith("KXNBAGAME-")
 
-    def _get_nba_elo_context(self, market: MarketData) -> Optional[Dict[str, str]]:
+    def _get_nba_elo_context(self, market: MarketData) -> Optional[Dict[str, object]]:
         if not self._elo_enabled or not self._elo_engine:
             return None
         if not self._is_nba_game_market(market):
@@ -230,13 +234,14 @@ Return ONLY valid JSON."""
             if home_elo is None or away_elo is None:
                 return None
             return {
-                "yes_probability": f"{float(yes_probability):.6f}",
-                "home_elo": f"{float(home_elo):.2f}",
-                "away_elo": f"{float(away_elo):.2f}",
+                "yes_probability": float(yes_probability),
+                "home_elo": float(home_elo),
+                "away_elo": float(away_elo),
                 "home_team": matchup.home_team,
                 "away_team": matchup.away_team,
                 "yes_team": matchup.yes_team,
-                "elo_edge": f"{float(yes_probability - market.yes_price):+.6f}",
+                "home_court_bonus": float(self._elo_engine.home_advantage),
+                "elo_edge": float(yes_probability - market.yes_price),
             }
         except Exception as e:
             logger.debug("NBA Elo context unavailable for %s: %s", market.market_id, e)
@@ -245,11 +250,20 @@ Return ONLY valid JSON."""
     @staticmethod
     def _build_elo_fallback_estimate(
         market: MarketData,
-        elo_ctx: Dict[str, str],
+        elo_ctx: Dict[str, object],
         reason: str,
     ) -> FairValueEstimate:
         base_prob = float(elo_ctx["yes_probability"])
         edge = base_prob - float(market.yes_price)
+        adjusted = calculate_adjusted_yes_probability(
+            yes_team=str(elo_ctx["yes_team"]),
+            home_team=str(elo_ctx["home_team"]),
+            away_team=str(elo_ctx["away_team"]),
+            home_elo=float(elo_ctx["home_elo"]),
+            away_elo=float(elo_ctx["away_elo"]),
+            llm_elo_delta=0,
+            home_court_bonus=float(elo_ctx["home_court_bonus"]),
+        )
         return FairValueEstimate(
             market_id=market.market_id,
             estimated_probability=base_prob,
@@ -261,7 +275,46 @@ Return ONLY valid JSON."""
             data_sources=["nba_elo"],
             key_factors=["elo_baseline_only"],
             edge=edge,
+            fusion_metadata={
+                "elo_adjustment": {
+                    "yes_team": str(elo_ctx["yes_team"]),
+                    "home_team": str(elo_ctx["home_team"]),
+                    "away_team": str(elo_ctx["away_team"]),
+                    "home_elo": float(elo_ctx["home_elo"]),
+                    "away_elo": float(elo_ctx["away_elo"]),
+                    "base_probability": float(base_prob),
+                    "applied_elo_delta": 0.0,
+                    "yes_adjusted_elo": float(adjusted["yes_adjusted_elo"]),
+                    "yes_effective_elo": float(adjusted["yes_effective_elo"]),
+                    "opponent_effective_elo": float(adjusted["opponent_effective_elo"]),
+                    "final_probability": float(base_prob),
+                    "market_probability": float(market.yes_price),
+                    "edge": float(edge),
+                }
+            },
         )
+
+    def _log_elo_decision_fields(self, market: MarketData, estimate: FairValueEstimate) -> None:
+        meta = (estimate.fusion_metadata or {}).get("elo_adjustment", {})
+        if not isinstance(meta, dict):
+            return
+        try:
+            logger.info(
+                "ELO_DECISION | team=%s | opponent=%s | elo_base=%.2f | elo_delta=%+.0f | "
+                "elo_adjusted=%.2f | probability_base=%.4f | probability_final=%.4f | "
+                "market_probability=%.4f | edge=%+.4f",
+                str(meta.get("yes_team") or ""),
+                str(meta.get("away_team") if str(meta.get("yes_team")) == str(meta.get("home_team")) else meta.get("home_team")),
+                float(meta.get("home_elo") if str(meta.get("yes_team")) == str(meta.get("home_team")) else meta.get("away_elo")),
+                float(meta.get("applied_elo_delta", 0.0)),
+                float(meta.get("yes_adjusted_elo", 0.0)),
+                float(meta.get("base_probability", 0.0)),
+                float(meta.get("final_probability", estimate.estimated_probability)),
+                float(meta.get("market_probability", market.yes_price)),
+                float(meta.get("edge", estimate.edge)),
+            )
+        except Exception:
+            logger.debug("Failed logging Elo decision metadata for %s", market.market_id)
 
     async def _call_openai_api(self, prompt: str) -> dict:
         logger.debug("Calling OpenAI API with prompt:\n" + prompt)

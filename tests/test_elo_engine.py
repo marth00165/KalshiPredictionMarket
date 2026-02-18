@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 from app.analytics import EloEngine
 from app.utils.response_parser import ClaudeResponseParser
@@ -70,9 +71,9 @@ def test_kalshi_matchup_parser_and_yes_probability():
 def test_parse_elo_adjusted_estimate_clamps_delta():
     text = json.dumps(
         {
-            "delta": 0.25,  # Should clamp to max_delta.
-            "confidence": 85,
-            "reasoning": "Major injuries favor the underdog.",
+            "elo_delta": 300,  # Should clamp to +75.
+            "confidence": 0.85,
+            "reason": "Major injuries favor the underdog.",
             "key_factors": ["injury report"],
             "data_sources": ["official report"],
         }
@@ -81,10 +82,70 @@ def test_parse_elo_adjusted_estimate_clamps_delta():
         response_text=text,
         market_id="KXNBAGAME-26FEB19BKNCLE-BKN",
         market_price=0.40,
-        base_probability=0.45,
-        max_delta=0.03,
+        yes_team="BKN",
+        home_team="CLE",
+        away_team="BKN",
+        home_elo=1650.0,
+        away_elo=1450.0,
+        home_court_bonus=100.0,
     )
     assert est is not None
-    assert abs(est.estimated_probability - 0.48) < 1e-6
-    assert abs(est.edge - 0.08) < 1e-6
+    # Away team gets +75 Elo, still underdog versus home+HCA.
+    assert 0.0 < est.estimated_probability < 0.5
+    assert abs(est.edge - (est.estimated_probability - 0.40)) < 1e-9
     assert est.confidence_level == 0.85
+
+
+def test_parse_elo_adjusted_estimate_missing_required_field_returns_none():
+    text = json.dumps(
+        {
+            "elo_delta": -40,
+            "confidence": 0.80,
+            # reason intentionally omitted
+        }
+    )
+    est = ClaudeResponseParser.parse_elo_adjusted_estimate(
+        response_text=text,
+        market_id="KXNBAGAME-26FEB19BKNCLE-BKN",
+        market_price=0.40,
+        yes_team="BKN",
+        home_team="CLE",
+        away_team="BKN",
+        home_elo=1650.0,
+        away_elo=1450.0,
+        home_court_bonus=100.0,
+    )
+    assert est is None
+
+
+def test_elo_ratings_last_updated_freshness_guard(tmp_path):
+    out_path = tmp_path / "elo_ratings.json"
+
+    stale_payload = {
+        "last_updated": "2000-01-01T00:00:00Z",
+        "ratings": {"DEN": 1700.0},
+        "games_processed": 1,
+    }
+    out_path.write_text(json.dumps(stale_payload))
+
+    engine_stale = EloEngine(
+        data_path=str(tmp_path / "missing.csv"),
+        output_path=str(out_path),
+        max_age_hours=24,
+    )
+    assert engine_stale.load_ratings(rebuild_if_missing=False) == {}
+
+    fresh_payload = {
+        "last_updated": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "ratings": {"DEN": 1700.0},
+        "games_processed": 1,
+    }
+    out_path.write_text(json.dumps(fresh_payload))
+
+    engine_fresh = EloEngine(
+        data_path=str(tmp_path / "missing.csv"),
+        output_path=str(out_path),
+        max_age_hours=24,
+    )
+    loaded = engine_fresh.load_ratings(rebuild_if_missing=False)
+    assert loaded["DEN"] == 1700.0

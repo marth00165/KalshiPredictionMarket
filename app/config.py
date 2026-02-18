@@ -802,7 +802,7 @@ class ConfigManager:
             "   NBA Elo: "
             f"{'✅ enabled' if self.analysis.nba_elo_enabled else '❌ disabled'} | "
             f"data={self.analysis.nba_elo_data_path} | "
-            f"max_llm_delta=±{self.analysis.llm_adjustment_max_delta:.1%}"
+            "llm_elo_delta_bounds=[-75,+75]"
         )
         logger.info(
             "   DB reasoning memory: "

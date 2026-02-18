@@ -8,7 +8,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -97,6 +97,7 @@ class EloEngine:
     DEFAULT_INITIAL_RATING = 1300.0
     DEFAULT_HOME_ADVANTAGE = 100.0
     DEFAULT_K_FACTOR = 20.0
+    DEFAULT_MAX_AGE_HOURS = 24
     DEFAULT_DATA_PATH = "context/kaggleGameData.csv"
     DEFAULT_OUTPUT_PATH = "app/outputs/elo_ratings.json"
 
@@ -109,6 +110,7 @@ class EloEngine:
         initial_rating: float = DEFAULT_INITIAL_RATING,
         home_advantage: float = DEFAULT_HOME_ADVANTAGE,
         k_factor: float = DEFAULT_K_FACTOR,
+        max_age_hours: int = DEFAULT_MAX_AGE_HOURS,
         include_game_types: Optional[Iterable[str]] = None,
     ) -> None:
         self.data_path = Path(data_path)
@@ -116,6 +118,7 @@ class EloEngine:
         self.initial_rating = float(initial_rating)
         self.home_advantage = float(home_advantage)
         self.k_factor = float(k_factor)
+        self.max_age_hours = max(1, int(max_age_hours))
         self.include_game_types = set(include_game_types or {
             "Regular Season",
             "Playoffs",
@@ -177,10 +180,12 @@ class EloEngine:
         """
         Persist current ratings snapshot to JSON.
         """
+        now_utc = datetime.now(timezone.utc)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "last_updated": (self.last_game_date.strftime("%Y-%m-%d") if self.last_game_date else None),
-            "build_completed_at_utc": datetime.utcnow().isoformat() + "Z",
+            "last_updated": now_utc.isoformat().replace("+00:00", "Z"),
+            "last_game_date": (self.last_game_date.strftime("%Y-%m-%d") if self.last_game_date else None),
+            "build_completed_at_utc": now_utc.isoformat().replace("+00:00", "Z"),
             "games_processed": int(self.games_processed),
             "params": {
                 "initial_rating": self.initial_rating,
@@ -233,10 +238,11 @@ class EloEngine:
                     if self._normalize_team_code(k)
                 }
                 self.games_processed = int(payload.get("games_processed", 0) or 0)
-                last_updated = payload.get("last_updated")
+                # Backward compatibility: older payloads used last_updated as last game date.
+                last_game_date = payload.get("last_game_date", payload.get("last_updated"))
                 self.last_game_date = (
-                    datetime.strptime(last_updated, "%Y-%m-%d")
-                    if isinstance(last_updated, str) and last_updated
+                    datetime.strptime(last_game_date, "%Y-%m-%d")
+                    if isinstance(last_game_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", last_game_date)
                     else None
                 )
                 return dict(self.ratings)
@@ -328,8 +334,33 @@ class EloEngine:
         if not self.output_path.exists():
             return True
         if not self.data_path.exists():
-            return False
-        return self.output_path.stat().st_mtime < self.data_path.stat().st_mtime
+            data_is_newer = False
+        else:
+            data_is_newer = self.output_path.stat().st_mtime < self.data_path.stat().st_mtime
+        if data_is_newer:
+            return True
+
+        try:
+            with self.output_path.open("r") as f:
+                payload = json.load(f)
+            last_updated = self._parse_last_updated_utc(payload.get("last_updated"))
+            if last_updated is None:
+                return True
+            return datetime.now(timezone.utc) - last_updated > timedelta(hours=self.max_age_hours)
+        except Exception:
+            return True
+
+    @staticmethod
+    def _parse_last_updated_utc(value: object) -> Optional[datetime]:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        raw = value.strip()
+        try:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+                return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            return None
 
     def _load_games_with_pandas(self, as_of_date: Optional[str]) -> List[GameRecord]:
         required = {
@@ -563,4 +594,3 @@ def get_win_probability(
         team_a_is_home=team_a_is_home,
         home_advantage=home_advantage,
     )
-

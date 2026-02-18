@@ -131,19 +131,24 @@ class ClaudeResponseParser:
         response_text: str,
         market_id: str,
         market_price: float,
-        base_probability: float,
-        max_delta: float = 0.03,
+        *,
+        yes_team: str,
+        home_team: str,
+        away_team: str,
+        home_elo: float,
+        away_elo: float,
+        home_court_bonus: float = 100.0,
     ) -> Optional[FairValueEstimate]:
         """
-        Parse LLM output where Elo probability is the baseline and model returns only a delta.
+        Parse LLM output where Elo is baseline and model returns Elo delta only.
 
         Expected JSON shape:
         {
-          "delta": <float -0.03..0.03>,  // may also be named probability_adjustment
-          "confidence": <float 0-100>,
-          "reasoning": "...",
-          "key_factors": [...],
-          "data_sources": [...]
+          "elo_delta": <integer in [-75, +75]>,
+          "confidence": <float 0-1 or 0-100>,
+          "reason": "...",
+          "key_factors": [...],      // optional
+          "data_sources": [...]      // optional
         }
         """
         data = ClaudeResponseParser.extract_json_from_text(response_text)
@@ -152,40 +157,86 @@ class ClaudeResponseParser:
             return None
 
         try:
-            delta_value = data.get("delta", data.get("probability_adjustment", 0.0))
-            delta = float(delta_value)
-            # Allow both fraction and percent inputs.
-            if abs(delta) > 1:
-                delta = delta / 100.0
-            max_delta = abs(float(max_delta))
-            if max_delta <= 0:
-                max_delta = 0.03
-            delta = max(-max_delta, min(max_delta, delta))
+            # Local import avoids circular dependency at module import time.
+            from app.trading.engine import (
+                calculate_adjusted_yes_probability,
+                validate_llm_elo_delta,
+            )
+
+            if "elo_delta" not in data or "confidence" not in data or "reason" not in data:
+                logger.warning("Ignoring Elo adjustment due to missing required fields")
+                return None
+
+            delta = validate_llm_elo_delta(data.get("elo_delta"))
 
             confidence = float(data.get("confidence", 0.0))
             if confidence > 1:
                 confidence = confidence / 100.0
             confidence = max(0.0, min(1.0, confidence))
 
-            final_probability = max(0.01, min(0.99, float(base_probability) + delta))
+            adjusted = calculate_adjusted_yes_probability(
+                yes_team=yes_team,
+                home_team=home_team,
+                away_team=away_team,
+                home_elo=float(home_elo),
+                away_elo=float(away_elo),
+                llm_elo_delta=delta,
+                home_court_bonus=float(home_court_bonus),
+            )
+            base_probability = calculate_adjusted_yes_probability(
+                yes_team=yes_team,
+                home_team=home_team,
+                away_team=away_team,
+                home_elo=float(home_elo),
+                away_elo=float(away_elo),
+                llm_elo_delta=0,
+                home_court_bonus=float(home_court_bonus),
+            )["yes_probability"]
+
+            final_probability = float(adjusted["yes_probability"])
             edge = final_probability - float(market_price)
-            reasoning = str(data.get("reasoning", "") or "").strip()
+            reason = str(data.get("reason", "") or "").strip()
+            key_factors = data.get("key_factors", [])
+            data_sources = data.get("data_sources", [])
+            if not isinstance(key_factors, list):
+                key_factors = []
+            if not isinstance(data_sources, list):
+                data_sources = []
+
+            reasoning = reason
             if reasoning:
                 reasoning = (
-                    f"Elo base={base_probability:.3f}, llm_delta={delta:+.3f}. "
+                    f"Elo base={base_probability:.3f}, elo_delta={delta:+d}. "
                     f"{reasoning}"
                 )
             else:
-                reasoning = f"Elo base={base_probability:.3f}, llm_delta={delta:+.3f}."
+                reasoning = f"Elo base={base_probability:.3f}, elo_delta={delta:+d}."
 
             return FairValueEstimate(
                 market_id=market_id,
                 estimated_probability=final_probability,
                 confidence_level=confidence,
                 reasoning=reasoning,
-                data_sources=data.get("data_sources", []),
-                key_factors=data.get("key_factors", []),
+                data_sources=data_sources,
+                key_factors=key_factors,
                 edge=edge,
+                fusion_metadata={
+                    "elo_adjustment": {
+                        "yes_team": yes_team,
+                        "home_team": home_team,
+                        "away_team": away_team,
+                        "home_elo": float(home_elo),
+                        "away_elo": float(away_elo),
+                        "base_probability": float(base_probability),
+                        "applied_elo_delta": float(delta),
+                        "yes_adjusted_elo": float(adjusted["yes_adjusted_elo"]),
+                        "yes_effective_elo": float(adjusted["yes_effective_elo"]),
+                        "opponent_effective_elo": float(adjusted["opponent_effective_elo"]),
+                        "final_probability": float(final_probability),
+                        "market_probability": float(market_price),
+                        "edge": float(edge),
+                    }
+                },
             )
         except Exception as e:
             logger.error(f"Error parsing Elo-adjusted estimate: {e}\nData: {data}")
