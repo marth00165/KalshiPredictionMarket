@@ -2,8 +2,10 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
+from typing import Callable, Optional
 
 from app.bot import AdvancedTradingBot
 from app.config import ConfigManager
@@ -22,6 +24,7 @@ ALLOWED_CONFIG_TOP_LEVEL_KEYS = {
     "strategy",
     "risk",
     "filters",
+    "signal_fusion",
 }
 
 
@@ -197,6 +200,275 @@ def _build_safe_config_view(cfg: ConfigManager) -> dict:
     }
 
 
+def _get_nested(config: dict, path: str, default=None):
+    cur = config
+    for key in path.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _is_effectively_set(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return False
+        if cleaned.startswith("YOUR_") or "YOUR_" in cleaned:
+            return False
+    return True
+
+
+def _parse_choice(raw: str, choices: set[str]) -> str:
+    value = raw.strip().lower()
+    if value not in choices:
+        raise ValueError(f"expected one of {sorted(choices)}, got {raw!r}")
+    return value
+
+
+def _parse_float(raw: str, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ValueError("expected a number") from e
+    if min_value is not None and value < min_value:
+        raise ValueError(f"must be >= {min_value}")
+    if max_value is not None and value > max_value:
+        raise ValueError(f"must be <= {max_value}")
+    return value
+
+
+def _parse_int(raw: str, min_value: Optional[int] = None) -> int:
+    try:
+        value = int(raw)
+    except ValueError as e:
+        raise ValueError("expected an integer") from e
+    if min_value is not None and value < min_value:
+        raise ValueError(f"must be >= {min_value}")
+    return value
+
+
+def _parse_nonempty(raw: str) -> str:
+    value = raw.strip()
+    if not value:
+        raise ValueError("cannot be empty")
+    return value
+
+
+def _prompt_setting(
+    raw_config: dict,
+    path: str,
+    label: str,
+    parser: Callable[[str], object],
+    required: bool = False,
+) -> object:
+    current = _get_nested(raw_config, path, None)
+    is_secret = path.endswith("api_key")
+    if is_secret:
+        current_display = "set" if _is_effectively_set(current) else "unset"
+    else:
+        current_display = current
+    while True:
+        suffix = f" [{current_display}]" if current_display is not None else ""
+        user_input = input(f"{label}{suffix}: ").strip()
+        if user_input == "":
+            if current is not None and (not required or _is_effectively_set(current)):
+                return current
+            if not required:
+                return None
+            print("This value is required.")
+            continue
+        try:
+            return parser(user_input)
+        except Exception as e:
+            print(f"Invalid value: {e}")
+
+
+def _env_or_config_set(raw_config: dict, env_var: str, config_path: str) -> bool:
+    return _is_effectively_set(os.getenv(env_var)) or _is_effectively_set(
+        _get_nested(raw_config, config_path, None)
+    )
+
+
+def _write_config_file(config_path: str, raw_config: dict) -> None:
+    path = Path(config_path)
+    with path.open("w") as f:
+        json.dump(raw_config, f, indent=2)
+        f.write("\n")
+
+
+def _missing_required_settings(cfg: ConfigManager, mode: str, cli_dry_run: bool) -> list[str]:
+    missing: list[str] = []
+    effective_dry_run = bool(cli_dry_run or cfg.is_dry_run)
+
+    if mode in {"collect", "trade"}:
+        if cfg.kalshi_enabled and not cfg.platforms.kalshi.api_key:
+            missing.append("platforms.kalshi.api_key")
+        if cfg.polymarket_enabled and not cfg.platforms.polymarket.api_key:
+            missing.append("platforms.polymarket.api_key")
+
+    if mode in {"analyze", "trade"}:
+        provider = cfg.analysis_provider
+        if provider == "claude" and not cfg.api.claude_api_key:
+            missing.append("api.claude_api_key")
+        if provider == "openai" and not cfg.api.openai_api_key:
+            missing.append("api.openai_api_key")
+
+    if mode == "trade" and not effective_dry_run:
+        if cfg.kalshi_enabled and not (cfg.platforms.kalshi.private_key or cfg.platforms.kalshi.private_key_file):
+            missing.append("platforms.kalshi.private_key_file")
+        if cfg.polymarket_enabled and not (cfg.platforms.polymarket.private_key or cfg.platforms.polymarket.private_key_file):
+            missing.append("platforms.polymarket.private_key_file")
+
+    return missing
+
+
+def _run_edit_mode(raw_config: dict, mode: str, cli_dry_run: bool) -> None:
+    print("\nEntering config edit mode. Press Enter to keep current value.\n")
+
+    base_fields = [
+        ("analysis.provider", "Analysis provider (claude/openai)", lambda s: _parse_choice(s, {"claude", "openai"})),
+        ("platforms.kalshi.enabled", "Enable Kalshi (true/false)", _parse_bool),
+        ("platforms.polymarket.enabled", "Enable Polymarket (true/false)", _parse_bool),
+        ("trading.dry_run", "Dry run mode (true/false)", _parse_bool),
+        ("trading.initial_bankroll", "Initial bankroll (>0)", lambda s: _parse_float(s, min_value=0.01)),
+        ("api.batch_size", "LLM batch size (>=1)", lambda s: _parse_int(s, min_value=1)),
+        ("api.api_cost_limit_per_cycle", "API cost limit per cycle (>=0)", lambda s: _parse_float(s, min_value=0)),
+        ("strategy.min_edge", "Minimum edge (0-1)", lambda s: _parse_float(s, min_value=0, max_value=1)),
+        ("strategy.min_confidence", "Minimum confidence (0-1)", lambda s: _parse_float(s, min_value=0, max_value=1)),
+        ("risk.max_kelly_fraction", "Max Kelly fraction (0-1)", lambda s: _parse_float(s, min_value=0, max_value=1)),
+        ("risk.max_positions", "Max open positions (>=1)", lambda s: _parse_int(s, min_value=1)),
+        ("risk.max_position_size", "Max position size (>0)", lambda s: _parse_float(s, min_value=0.01)),
+        ("risk.max_total_exposure_fraction", "Max total exposure fraction (0-1)", lambda s: _parse_float(s, min_value=0, max_value=1)),
+        ("risk.max_new_exposure_per_day_fraction", "Max new exposure per day fraction (0-1)", lambda s: _parse_float(s, min_value=0, max_value=1)),
+        ("filters.min_volume", "Minimum volume filter (>=0)", lambda s: _parse_float(s, min_value=0)),
+        ("filters.min_liquidity", "Minimum liquidity filter (>=0)", lambda s: _parse_float(s, min_value=0)),
+    ]
+
+    for path, label, parser in base_fields:
+        value = _prompt_setting(raw_config, path, label, parser, required=False)
+        if value is not None:
+            _set_nested(raw_config, path, value)
+
+    provider = str(_get_nested(raw_config, "analysis.provider", "claude")).lower()
+    kalshi_enabled = bool(_get_nested(raw_config, "platforms.kalshi.enabled", True))
+    polymarket_enabled = bool(_get_nested(raw_config, "platforms.polymarket.enabled", False))
+    effective_dry_run = bool(cli_dry_run or _get_nested(raw_config, "trading.dry_run", True))
+
+    # Credentials/settings required for selected mode/provider/platforms.
+    if mode in {"collect", "trade"} and kalshi_enabled:
+        required = not _env_or_config_set(raw_config, "KALSHI_API_KEY", "platforms.kalshi.api_key")
+        value = _prompt_setting(raw_config, "platforms.kalshi.api_key", "Kalshi API key", _parse_nonempty, required=required)
+        if value is not None:
+            _set_nested(raw_config, "platforms.kalshi.api_key", value)
+
+    if mode in {"collect", "trade"} and polymarket_enabled:
+        required = not _env_or_config_set(raw_config, "POLYMARKET_API_KEY", "platforms.polymarket.api_key")
+        value = _prompt_setting(raw_config, "platforms.polymarket.api_key", "Polymarket API key", _parse_nonempty, required=required)
+        if value is not None:
+            _set_nested(raw_config, "platforms.polymarket.api_key", value)
+
+    if mode in {"analyze", "trade"} and provider == "claude":
+        required = not _env_or_config_set(raw_config, "ANTHROPIC_API_KEY", "api.claude_api_key")
+        value = _prompt_setting(raw_config, "api.claude_api_key", "Anthropic API key", _parse_nonempty, required=required)
+        if value is not None:
+            _set_nested(raw_config, "api.claude_api_key", value)
+
+    if mode in {"analyze", "trade"} and provider == "openai":
+        required = not _env_or_config_set(raw_config, "OPENAI_API_KEY", "api.openai_api_key")
+        value = _prompt_setting(raw_config, "api.openai_api_key", "OpenAI API key", _parse_nonempty, required=required)
+        if value is not None:
+            _set_nested(raw_config, "api.openai_api_key", value)
+
+    if mode == "trade" and not effective_dry_run and kalshi_enabled:
+        has_env_private = bool(os.getenv("KALSHI_PRIVATE_KEY"))
+        required = not (has_env_private or bool(_get_nested(raw_config, "platforms.kalshi.private_key_file", None)))
+        value = _prompt_setting(
+            raw_config,
+            "platforms.kalshi.private_key_file",
+            "Kalshi private key file path (required if no KALSHI_PRIVATE_KEY env)",
+            _parse_nonempty,
+            required=required
+        )
+        if value is not None:
+            _set_nested(raw_config, "platforms.kalshi.private_key_file", value)
+
+    if mode == "trade" and not effective_dry_run and polymarket_enabled:
+        has_env_private = bool(os.getenv("POLYMARKET_PRIVATE_KEY"))
+        required = not (has_env_private or bool(_get_nested(raw_config, "platforms.polymarket.private_key_file", None)))
+        value = _prompt_setting(
+            raw_config,
+            "platforms.polymarket.private_key_file",
+            "Polymarket private key file path (required if no POLYMARKET_PRIVATE_KEY env)",
+            _parse_nonempty,
+            required=required
+        )
+        if value is not None:
+            _set_nested(raw_config, "platforms.polymarket.private_key_file", value)
+
+
+def _maybe_run_startup_setup_wizard(args, logger) -> None:
+    if not sys.stdin.isatty():
+        return
+
+    path = Path(args.config)
+    cfg_error = None
+    if path.exists():
+        try:
+            with path.open("r") as f:
+                raw_config = json.load(f)
+        except Exception as e:
+            cfg_error = f"Config file parse error: {e}"
+            raw_config = {}
+    else:
+        raw_config = {}
+
+    missing = []
+    try:
+        cfg = ConfigManager(args.config)
+        missing = _missing_required_settings(cfg, args.mode, cli_dry_run=args.dry_run)
+    except Exception as e:
+        cfg_error = cfg_error or str(e)
+
+    force_edit = bool(cfg_error or missing)
+    if force_edit:
+        print("\nConfig setup is required before continuing.")
+        if cfg_error:
+            print(f"- Current config is invalid: {cfg_error}")
+        if missing:
+            print("- Missing required settings:")
+            for item in missing:
+                print(f"  - {item}")
+        choice = input("Start edit mode now? [Y/n]: ").strip().lower()
+        if choice in {"n", "no"}:
+            raise SystemExit(1)
+    else:
+        choice = input(
+            f"\nUse defaults from {args.config}? [Y/e] (type 'e' to edit settings): "
+        ).strip().lower()
+        if choice not in {"e", "edit"}:
+            return
+
+    while True:
+        _run_edit_mode(raw_config, mode=args.mode, cli_dry_run=args.dry_run)
+        _write_config_file(args.config, raw_config)
+
+        try:
+            cfg = ConfigManager(args.config)
+            if args.dry_run:
+                cfg.trading.dry_run = True
+            cfg.validate_for_mode(args.mode)
+            logger.info(f"Setup wizard completed and saved {args.config}")
+            break
+        except Exception as e:
+            print(f"\nUpdated config is still invalid: {e}")
+            retry = input("Retry edit mode? [Y/n]: ").strip().lower()
+            if retry in {"n", "no"}:
+                raise SystemExit(1)
+
+
 async def main():
     parser = argparse.ArgumentParser(description="AI Trading Bot CLI")
     parser.add_argument('--config', type=str, default='advanced_config.json', help='Path to config file')
@@ -205,6 +477,8 @@ async def main():
     parser.add_argument('--once', action='store_true', help='Run one cycle and exit')
     parser.add_argument('--log-level', type=str, default='INFO', help='Logging level')
     parser.add_argument('--lock-file', type=str, help='Custom path to lock file')
+    parser.add_argument('--skip-setup-wizard', action='store_true',
+                        help='Skip interactive startup setup wizard')
 
     # Discovery/Utility arguments
     parser.add_argument('--backup', action='store_true', help='Create a backup of the database')
@@ -261,6 +535,15 @@ async def main():
             return
         except Exception as e:
             logger.error(f"Config utility operation failed: {e}", exc_info=True)
+            sys.exit(1)
+
+    if not args.skip_setup_wizard and not args.backup:
+        try:
+            _maybe_run_startup_setup_wizard(args, logger)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.error(f"Startup setup wizard failed: {e}", exc_info=True)
             sys.exit(1)
 
     # Acquire lock before proceeding

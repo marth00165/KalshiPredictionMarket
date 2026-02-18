@@ -43,7 +43,9 @@
   "risk": {
     "max_kelly_fraction": 0.25,
     "max_positions": 10,
-    "max_position_size": 1000
+    "max_position_size": 1000,
+    "max_total_exposure_fraction": 0.80,
+    "max_new_exposure_per_day_fraction": 0.80
   },
   "filters": {
     "min_volume": 1000,

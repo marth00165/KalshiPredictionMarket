@@ -33,6 +33,7 @@ You need to tell the bot how to access your accounts and the AI.
 1. Copy the template: `cp advanced_config.template.json advanced_config.json`
 2. Open `advanced_config.json`.
 3. **Important for Beginners**: Make sure `"dry_run": true` is set. This lets the bot "pretend" to trade so you don't lose money while learning.
+4. On startup, the bot now prompts you to either use defaults from `advanced_config.json` or enter interactive edit mode to update/validate key settings.
 
 ---
 
@@ -81,6 +82,7 @@ python -m app --mode trade
 | `python -m app --set-max-positions 3 --set-max-position-size 100 --set-dry-run true` | Updates risk settings in your config file. |
 | `python -m app --set-max-total-exposure-fraction 0.8 --set-max-new-exposure-per-day-fraction 0.8` | Sets lenient portfolio/day exposure caps. |
 | `python -m app --set-config risk.max_kelly_fraction=0.1` | Updates any config key via `dot.path=value`. |
+| `python -m app --skip-setup-wizard --mode trade --once` | Skips interactive setup (useful for cron/systemd/autonomous runs). |
 
 ---
 
