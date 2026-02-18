@@ -1,0 +1,22 @@
+[Unit]
+Description=Kalshi Autonomous Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME_USER
+WorkingDirectory=CHANGE_ME_WORKDIR
+EnvironmentFile=CHANGE_ME_WORKDIR/.env
+ExecStart=CHANGE_ME_WORKDIR/.venv/bin/python -m app --mode trade --skip-setup-wizard --non-interactive
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Journald
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

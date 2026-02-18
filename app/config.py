@@ -220,6 +220,9 @@ class RiskConfig:
     max_orders_per_cycle: int = 5
     max_notional_per_cycle: float = 2000
     daily_loss_limit_fraction: float = 0.10  # Stop if 10% of daily starting bankroll lost
+    max_trades_per_market_per_day: int = 0  # 0 disables cap
+    failure_streak_cooldown_threshold: int = 0  # 0 disables cooldown logic
+    failure_cooldown_cycles: int = 0  # 0 disables cooldown logic
     kill_switch_env_var: str = "BOT_DISABLE_TRADING"
     critical_webhook_url: Optional[str] = None
     
@@ -246,6 +249,21 @@ class RiskConfig:
             raise ValueError(f"max_notional_per_cycle must be > 0, got {self.max_notional_per_cycle}")
         if not (0 <= self.daily_loss_limit_fraction <= 1):
             raise ValueError(f"daily_loss_limit_fraction must be between 0 and 1, got {self.daily_loss_limit_fraction}")
+        if self.max_trades_per_market_per_day < 0:
+            raise ValueError(
+                "max_trades_per_market_per_day must be >= 0 "
+                f"(0 disables), got {self.max_trades_per_market_per_day}"
+            )
+        if self.failure_streak_cooldown_threshold < 0:
+            raise ValueError(
+                "failure_streak_cooldown_threshold must be >= 0 "
+                f"(0 disables), got {self.failure_streak_cooldown_threshold}"
+            )
+        if self.failure_cooldown_cycles < 0:
+            raise ValueError(
+                "failure_cooldown_cycles must be >= 0 "
+                f"(0 disables), got {self.failure_cooldown_cycles}"
+            )
         if not self.kill_switch_env_var:
             raise ValueError("kill_switch_env_var cannot be empty")
 
@@ -256,6 +274,11 @@ class ExecutionConfig:
 
     max_price_drift: float = 0.05  # Absolute probability diff (5%)
     min_edge_at_execution: float = 0.02  # 2% minimum edge right before order
+    max_submit_slippage: float = 0.10  # Absolute probability diff allowed at submit
+    pending_not_found_retries: int = 3
+    pending_timeout_minutes: int = 30
+    order_reconciliation_max_pages: int = 5
+    order_reconciliation_page_limit: int = 200
 
     def validate(self) -> None:
         """Validate execution configuration"""
@@ -263,6 +286,16 @@ class ExecutionConfig:
             raise ValueError(f"max_price_drift must be >= 0, got {self.max_price_drift}")
         if self.min_edge_at_execution < 0:
             raise ValueError(f"min_edge_at_execution must be >= 0, got {self.min_edge_at_execution}")
+        if self.max_submit_slippage < 0:
+            raise ValueError(f"max_submit_slippage must be >= 0, got {self.max_submit_slippage}")
+        if self.pending_not_found_retries < 1:
+            raise ValueError(f"pending_not_found_retries must be >= 1, got {self.pending_not_found_retries}")
+        if self.pending_timeout_minutes < 1:
+            raise ValueError(f"pending_timeout_minutes must be >= 1, got {self.pending_timeout_minutes}")
+        if self.order_reconciliation_max_pages < 1:
+            raise ValueError(f"order_reconciliation_max_pages must be >= 1, got {self.order_reconciliation_max_pages}")
+        if self.order_reconciliation_page_limit < 1:
+            raise ValueError(f"order_reconciliation_page_limit must be >= 1, got {self.order_reconciliation_page_limit}")
 
 
 @dataclass
@@ -500,6 +533,9 @@ class ConfigManager:
             max_orders_per_cycle=risk_raw.get('max_orders_per_cycle', 5),
             max_notional_per_cycle=risk_raw.get('max_notional_per_cycle', 2000),
             daily_loss_limit_fraction=risk_raw.get('daily_loss_limit_fraction', 0.10),
+            max_trades_per_market_per_day=risk_raw.get('max_trades_per_market_per_day', 0),
+            failure_streak_cooldown_threshold=risk_raw.get('failure_streak_cooldown_threshold', 0),
+            failure_cooldown_cycles=risk_raw.get('failure_cooldown_cycles', 0),
             kill_switch_env_var=risk_raw.get('kill_switch_env_var', 'BOT_DISABLE_TRADING'),
             critical_webhook_url=risk_raw.get('critical_webhook_url'),
         )
@@ -513,6 +549,11 @@ class ConfigManager:
         self.execution = ExecutionConfig(
             max_price_drift=execution_raw.get('max_price_drift', 0.05),
             min_edge_at_execution=execution_raw.get('min_edge_at_execution', 0.02),
+            max_submit_slippage=execution_raw.get('max_submit_slippage', 0.10),
+            pending_not_found_retries=execution_raw.get('pending_not_found_retries', 3),
+            pending_timeout_minutes=execution_raw.get('pending_timeout_minutes', 30),
+            order_reconciliation_max_pages=execution_raw.get('order_reconciliation_max_pages', 5),
+            order_reconciliation_page_limit=execution_raw.get('order_reconciliation_page_limit', 200),
         )
         try:
             self.execution.validate()
@@ -737,6 +778,31 @@ class ConfigManager:
         logger.info(f"   Max position size: ${self.risk.max_position_size:,.2f}")
         logger.info(f"   Max total exposure: {self.risk.max_total_exposure_fraction:.1%}")
         logger.info(f"   Max new exposure/day: {self.risk.max_new_exposure_per_day_fraction:.1%}")
+        logger.info(f"   Max orders/cycle: {self.risk.max_orders_per_cycle}")
+        logger.info(f"   Max notional/cycle: ${self.risk.max_notional_per_cycle:,.2f}")
+        logger.info(f"   Daily loss limit: {self.risk.daily_loss_limit_fraction:.1%}")
+        if self.risk.max_trades_per_market_per_day > 0:
+            logger.info(f"   Max trades/market/day: {self.risk.max_trades_per_market_per_day}")
+        if (
+            self.risk.failure_streak_cooldown_threshold > 0
+            and self.risk.failure_cooldown_cycles > 0
+        ):
+            logger.info(
+                "   Failure cooldown: "
+                f"threshold={self.risk.failure_streak_cooldown_threshold}, "
+                f"cooldown_cycles={self.risk.failure_cooldown_cycles}"
+            )
+
+        logger.info(f"\n⚙️  Execution:")
+        logger.info(f"   Max price drift: {self.execution.max_price_drift:.1%}")
+        logger.info(f"   Min edge at execution: {self.execution.min_edge_at_execution:.1%}")
+        logger.info(f"   Max submit slippage: {self.execution.max_submit_slippage:.1%}")
+        logger.info(
+            "   Pending reconcile: "
+            f"retries={self.execution.pending_not_found_retries}, "
+            f"timeout={self.execution.pending_timeout_minutes}m, "
+            f"pages={self.execution.order_reconciliation_max_pages}"
+        )
         
         logger.info(f"\n🔍 Filters:")
         logger.info(f"   Min volume: ${self.filters.min_volume:,.2f}")
@@ -783,6 +849,21 @@ class ConfigManager:
                 'max_position_size': self.risk.max_position_size,
                 'max_total_exposure_fraction': self.risk.max_total_exposure_fraction,
                 'max_new_exposure_per_day_fraction': self.risk.max_new_exposure_per_day_fraction,
+                'max_orders_per_cycle': self.risk.max_orders_per_cycle,
+                'max_notional_per_cycle': self.risk.max_notional_per_cycle,
+                'daily_loss_limit_fraction': self.risk.daily_loss_limit_fraction,
+                'max_trades_per_market_per_day': self.risk.max_trades_per_market_per_day,
+                'failure_streak_cooldown_threshold': self.risk.failure_streak_cooldown_threshold,
+                'failure_cooldown_cycles': self.risk.failure_cooldown_cycles,
+            },
+            'execution': {
+                'max_price_drift': self.execution.max_price_drift,
+                'min_edge_at_execution': self.execution.min_edge_at_execution,
+                'max_submit_slippage': self.execution.max_submit_slippage,
+                'pending_not_found_retries': self.execution.pending_not_found_retries,
+                'pending_timeout_minutes': self.execution.pending_timeout_minutes,
+                'order_reconciliation_max_pages': self.execution.order_reconciliation_max_pages,
+                'order_reconciliation_page_limit': self.execution.order_reconciliation_page_limit,
             },
             'filters': {
                 'min_volume': self.filters.min_volume,

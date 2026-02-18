@@ -96,6 +96,50 @@ python -m app --mode trade
 | `python -m app --mode trade --once --dry-run` | One dry-run trade cycle with analysis + no real orders. |
 | `python -m app --mode trade --dry-run`        | Continuous dry-run trade cycles.                        |
 | `python -m app --mode trade`                  | Live trade mode (real orders if config is live).        |
+| `python -m app --mode trade --once --dry-run --skip-setup-wizard --non-interactive` | One autonomous-style dry-run cycle (no prompts). |
+
+### Autonomous Live Run (VPS)
+
+Required `advanced_config.json` keys:
+
+- `trading.dry_run = false`
+- `trading.autonomous_mode = true`
+- `trading.non_interactive = true`
+- `trading.require_scope_in_live = true`
+- One scope must be set:
+  - `platforms.kalshi.series_tickers`, or
+  - `trading.allowed_market_ids`, or
+  - `trading.allowed_event_tickers`
+- Risk rails:
+  - `risk.max_orders_per_cycle`
+  - `risk.max_notional_per_cycle`
+  - `risk.daily_loss_limit_fraction`
+  - `risk.max_trades_per_market_per_day` (optional, `0` disables)
+  - `risk.failure_streak_cooldown_threshold` + `risk.failure_cooldown_cycles` (optional, `0` disables)
+- Execution rails:
+  - `execution.max_price_drift`
+  - `execution.min_edge_at_execution`
+  - `execution.max_submit_slippage`
+  - `execution.pending_not_found_retries`
+  - `execution.pending_timeout_minutes`
+
+Autonomous one-cycle run:
+
+```bash
+python -m app --mode trade --once --skip-setup-wizard --non-interactive
+```
+
+Continuous autonomous run:
+
+```bash
+python -m app --mode trade --skip-setup-wizard --non-interactive
+```
+
+Kill switch:
+
+```bash
+export BOT_DISABLE_TRADING=1
+```
 
 ### Dry-Run UX Commands
 

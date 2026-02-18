@@ -437,6 +437,24 @@ class PositionManager:
         """Calculate total dollars currently at risk in open positions"""
         return sum(p.position_size for p in self.get_open_positions())
 
+    def get_mark_to_market_value(self, yes_prices: Dict[str, float]) -> float:
+        """
+        Mark-to-market value of open positions given current YES prices.
+
+        Args:
+            yes_prices: Mapping market_id -> current YES price (0-1)
+        """
+        total = 0.0
+        for p in self.get_open_positions():
+            yes_price = yes_prices.get(p.market_id)
+            if yes_price is None:
+                # Fall back to entry-side valuation if price unavailable.
+                side_price = p.entry_price
+            else:
+                side_price = yes_price if p.side == "yes" else (1.0 - yes_price)
+            total += p.quantity * side_price
+        return total
+
     def get_opened_exposure_today_utc(self) -> float:
         """Total position cost opened today in UTC (open + already-closed)."""
         today = datetime.utcnow().date()

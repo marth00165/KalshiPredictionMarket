@@ -146,6 +146,11 @@ class DatabaseManager:
             ALTER TABLE executions ADD COLUMN filled_quantity REAL DEFAULT 0.0;
             ALTER TABLE executions ADD COLUMN avg_fill_price REAL DEFAULT 0.0;
             ALTER TABLE executions ADD COLUMN remaining_quantity REAL DEFAULT 0.0;
+            """,
+            # Version 7: Add reconciliation tracking to executions
+            """
+            ALTER TABLE executions ADD COLUMN reconcile_attempts INTEGER DEFAULT 0;
+            ALTER TABLE executions ADD COLUMN last_reconciled_at_utc TEXT;
             """
         ]
 

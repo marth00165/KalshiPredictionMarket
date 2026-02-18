@@ -18,6 +18,8 @@ This is the remaining work needed before running the bot unattended with real mo
 
 1. Fill-aware execution lifecycle (do not treat accepted order as filled)
 
+### COMPLETED
+
 - Files: `app/trading/executor.py`, `app/bot.py`, `app/trading/position_manager.py`, `app/trading/reconciliation.py`
 - Problem: current flow can add position + deduct bankroll immediately when an order is accepted, even if unfilled/partially filled.
 - Required change:
@@ -27,6 +29,8 @@ This is the remaining work needed before running the bot unattended with real mo
 
 2. Daily loss guard must use true equity, not entry-cost exposure
 
+### COMPLETED
+
 - Files: `app/bot.py`, `app/trading/position_manager.py`, `app/trading/reconciliation.py`
 - Problem: guard uses `balance + total_exposure` where exposure is local cost basis, not mark-to-market/live account equity.
 - Required change:
@@ -34,6 +38,8 @@ This is the remaining work needed before running the bot unattended with real mo
   - Use that value in daily loss stop.
 
 3. Idempotency should not permanently block valid future trades
+
+### COMPLETED
 
 - File: `app/trading/executor.py`
 - Problem: short-circuit includes `skipped_drift` and `skipped_edge`; those are retryable and should not suppress future attempts.
@@ -43,6 +49,8 @@ This is the remaining work needed before running the bot unattended with real mo
 
 4. Persist actual execution price/quantity from execution-time values
 
+### COMPLETED
+
 - File: `app/trading/executor.py`
 - Problem: execution record currently uses signal-time prices, not revalidated submission price.
 - Required change:
@@ -50,6 +58,8 @@ This is the remaining work needed before running the bot unattended with real mo
   - Keep this consistent with exchange payload.
 
 5. Fix DB mode split edge case with CLI `--dry-run`
+
+### COMPLETED
 
 - Files: `app/config.py`, `app/__main__.py`
 - Problem: DB default path is chosen during config parse; later CLI dry-run override can mismatch mode vs DB file.
@@ -63,6 +73,8 @@ This is the remaining work needed before running the bot unattended with real mo
 
 6. Pending order reconciliation robustness
 
+### COMPLETED
+
 - Files: `app/trading/reconciliation.py`, `app/api_clients/kalshi_client.py`
 - Add:
   - bounded retry window before marking `failed_not_found`,
@@ -70,6 +82,8 @@ This is the remaining work needed before running the bot unattended with real mo
   - stale pending timeout policy.
 
 7. Improve execution risk controls
+
+### COMPLETED
 
 - Files: `app/config.py`, `app/bot.py`, `app/trading/executor.py`
 - Add:
@@ -79,11 +93,15 @@ This is the remaining work needed before running the bot unattended with real mo
 
 8. Clarify production logs and docs
 
+### COMPLETED
+
 - Files: `app/__main__.py`, `README.md`, `OPERATIONS.md`
 - Remove/update “Trade mode not fully implemented…” log line.
 - Document autonomous live commands and required config fields explicitly.
 
 9. Test cleanup + reliability
+
+### COMPLETED
 
 - Files: `tests/test_live_autonomous_v1_v2.py`, `tests/test_live_autonomous_v1_final.py`
 - Consolidate duplicate test files into one canonical suite.
@@ -95,6 +113,8 @@ This is the remaining work needed before running the bot unattended with real mo
 
 TODO 10. Explicit settlement-by-outcome lifecycle (result correctness)
 
+### COMPLETED
+
 - Files: `app/trading/reconciliation.py`, `app/trading/position_manager.py`, `app/api_clients/kalshi_client.py`
 - Add:
   - explicit handling for settled market outcomes (`YES`/`NO`) to close positions with deterministic payout logic,
@@ -102,6 +122,8 @@ TODO 10. Explicit settlement-by-outcome lifecycle (result correctness)
   - guardrails so “missing from remote positions” is not the only closure signal.
 
 TODO 11. VPS runtime operations checklist + automation
+
+### COMPLETED
 
 - Files: `OPERATIONS.md`, `README.md`, `deploy/` (new scripts/unit examples if needed)
 - Add:

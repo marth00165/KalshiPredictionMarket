@@ -39,6 +39,26 @@ class TradeExecutor:
         self.kalshi_client = kalshi_client
         self.dry_run = config.is_dry_run
         self.executed_trades = []
+
+    @staticmethod
+    def _is_terminal_idempotent_status(status: Optional[str]) -> bool:
+        """
+        Return True if an execution status should short-circuit duplicate attempts.
+
+        Retryable statuses (e.g. skipped_drift/skipped_edge/failed) are intentionally excluded.
+        """
+        status_norm = str(status or "").strip().lower()
+        return status_norm in {
+            "executed",
+            "submitted",
+            "dry_run",
+            "pending_submit",
+            "pending_fill",
+            "resting",
+            "open",
+            "filled",
+            "partially_filled",
+        }
     
     async def execute_signals(self, signals: List[TradeSignal], cycle_id: int = 0) -> List[Dict[str, Any]]:
         """
@@ -101,11 +121,11 @@ class TradeExecutor:
                 row = await cursor.fetchone()
                 if row:
                     status = row['status']
-                    # If already submitted, executed, or pending, skip new attempt
-                    if status in ('executed', 'submitted', 'dry_run', 'pending_submit', 'skipped_drift', 'skipped_edge'):
+                    # Only terminal/non-retryable statuses should short-circuit.
+                    if self._is_terminal_idempotent_status(status):
                         logger.info(f"⏭️ Signal already handled (status={status}), short-circuiting: {signal}")
                         return {
-                            "success": status in ('executed', 'submitted', 'dry_run'),
+                            "success": status in ('executed', 'submitted', 'dry_run', 'filled', 'partially_filled'),
                             "order_id": row['external_order_id'],
                             "status": status,
                             "idempotent": True
@@ -130,7 +150,10 @@ class TradeExecutor:
                 "order_id": f"dry_run_{uuid.uuid4().hex[:8]}",
                 "status": "dry_run",
                 "filled_quantity": quantity,
-                "avg_fill_price": price
+                "avg_fill_price": price,
+                "submitted_price": price,
+                "submitted_quantity": quantity,
+                "submitted_notional": quantity * price,
             }
             await self._record_execution(signal, result, cycle_id=cycle_id, client_order_id=client_order_id)
             return result
@@ -171,13 +194,26 @@ class TradeExecutor:
         """Persist execution record to database."""
         now = datetime.utcnow().isoformat() + "Z"
 
-        # Determine price based on action
-        if signal.action in ('buy_yes', 'sell_no'):
-            price = signal.market.yes_price
-        else:
-            price = signal.market.no_price
+        # Persist actual execution-time values when available.
+        submitted_price = result.get("submitted_price")
+        submitted_quantity = result.get("submitted_quantity")
+        submitted_notional = result.get("submitted_notional")
 
-        quantity = signal.position_size / max(0.01, price)
+        # Fall back to signal-time values if execution-time values are unavailable.
+        if submitted_price is None:
+            if signal.action in ('buy_yes', 'sell_no'):
+                submitted_price = signal.market.yes_price
+            else:
+                submitted_price = signal.market.no_price
+
+        if submitted_quantity is None:
+            submitted_quantity = signal.position_size / max(0.01, float(submitted_price))
+        if submitted_notional is None:
+            submitted_notional = float(submitted_quantity) * float(submitted_price)
+
+        price = float(submitted_price)
+        quantity = float(submitted_quantity)
+        cost = float(submitted_notional)
         status = result.get("status", "failed")
         filled_quantity = result.get("filled_quantity", 0.0)
         avg_fill_price = result.get("avg_fill_price", 0.0)
@@ -192,14 +228,19 @@ class TradeExecutor:
                         # Update existing record
                         await db.execute("""
                             UPDATE executions SET
+                                quantity = ?,
+                                price = ?,
+                                cost = ?,
                                 status = ?,
                                 external_order_id = ?,
                                 filled_quantity = ?,
                                 avg_fill_price = ?,
                                 remaining_quantity = ?,
+                                reconcile_attempts = 0,
                                 executed_at_utc = ?
                             WHERE client_order_id = ?
                         """, (
+                            quantity, price, cost,
                             status, result.get("order_id"),
                             filled_quantity, avg_fill_price,
                             remaining_quantity,
@@ -214,7 +255,7 @@ class TradeExecutor:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.market.market_id, signal.market.platform, signal.action,
-                quantity, price, signal.position_size, result.get("order_id"),
+                quantity, price, cost, result.get("order_id"),
                 status, now, now, cycle_id, client_order_id,
                 filled_quantity, avg_fill_price, remaining_quantity
             ))
@@ -261,9 +302,9 @@ class TradeExecutor:
 
             # Price in cents
             latest_price = latest_yes_price if side == 'yes' else (1.0 - latest_yes_price)
+            original_price = signal.market_price
 
             # 3. Revalidate price drift
-            original_price = signal.market_price
             drift = abs(latest_price - original_price)
             if drift > self.config.max_price_drift:
                 return {
@@ -293,6 +334,22 @@ class TradeExecutor:
 
             # Price in cents
             price_cents = int(latest_price * 100)
+            submitted_price = price_cents / 100.0
+
+            # 4b. Slippage guard at submit-time (independent from drift guard)
+            execution_cfg = getattr(self.config, "execution", None)
+            max_submit_slippage = getattr(execution_cfg, "max_submit_slippage", None)
+            if max_submit_slippage is None:
+                max_submit_slippage = getattr(self.config, "max_submit_slippage", 0.10)
+            submit_slippage = abs(submitted_price - original_price)
+            if submit_slippage > float(max_submit_slippage):
+                return {
+                    "success": False,
+                    "error": f"Submit slippage too large: {submit_slippage:.3f} > {float(max_submit_slippage):.3f}",
+                    "skipped": True,
+                    "status": "skipped_slippage",
+                    "submitted_price": submitted_price,
+                }
 
             # Count
             count = int(signal.position_size / max(0.01, latest_price))
@@ -316,8 +373,18 @@ class TradeExecutor:
 
             # Kalshi V2 sometimes returns filled info in order placement response
             # if it was matched immediately.
-            filled_quantity = float(raw.get("filled_count", 0.0))
+            filled_quantity = float(raw.get("filled_count", 0.0) or 0.0)
             avg_fill_price = float(raw.get("avg_fill_price", 0.0)) / 100.0 if raw.get("avg_fill_price") else 0.0
+
+            # Safety fallback: some responses mark an order as filled/executed
+            # without including fill_count/avg_fill_price.
+            status_norm = str(status).lower()
+            if status_norm in ("filled", "executed") and filled_quantity <= 0:
+                filled_quantity = float(count)
+            if filled_quantity > 0 and avg_fill_price <= 0:
+                avg_fill_price = latest_price
+
+            submitted_notional = float(count) * float(submitted_price)
 
             return {
                 "success": result.get("order_id") is not None,
@@ -325,6 +392,9 @@ class TradeExecutor:
                 "status": status,
                 "filled_quantity": filled_quantity,
                 "avg_fill_price": avg_fill_price,
+                "submitted_price": submitted_price,
+                "submitted_quantity": float(count),
+                "submitted_notional": submitted_notional,
                 "raw": raw
             }
 

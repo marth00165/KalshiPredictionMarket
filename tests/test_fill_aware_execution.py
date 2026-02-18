@@ -288,3 +288,211 @@ async def test_fill_aware_lifecycle_partial_fill(mock_config, mock_signal):
     assert bot.position_manager.get_position_count() == 2 # 1st partial + 2nd partial (total 200 contracts)
     # Remaining 150 contracts should have been deducted (150 * 0.5 = 75)
     assert bot.bankroll_manager.get_balance() == initial_balance - 75.0
+
+
+@pytest.mark.asyncio
+async def test_executor_filled_status_without_fill_count_falls_back_to_submitted_count(mock_config, mock_signal):
+    bot = AdvancedTradingBot()
+    bot.config = mock_config
+    from app.storage.db import DatabaseManager
+    bot.db = DatabaseManager(mock_config.db_path)
+    bot.executor.db = bot.db
+    bot.executor.dry_run = False
+    await bot.initialize()
+
+    mock_kalshi = AsyncMock()
+    bot.scanner.kalshi_client = mock_kalshi
+    bot.executor.kalshi_client = mock_kalshi
+    bot.reconciliation_manager.kalshi_client = mock_kalshi
+
+    mock_kalshi.get_market_yes_price.return_value = 0.5
+    mock_kalshi.place_order.return_value = {
+        "order_id": "order-filled-no-count",
+        "status": "filled",
+        "raw_response": {
+            "order_id": "order-filled-no-count",
+            "status": "filled"
+        }
+    }
+
+    results = await bot.executor.execute_signals([mock_signal])
+    res = results[0]
+
+    assert res["status"] == "filled"
+    assert res["filled_quantity"] == pytest.approx(200.0)
+    assert res["avg_fill_price"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfills_legacy_filled_row_missing_fill_counts(mock_config):
+    bot = AdvancedTradingBot()
+    bot.config = mock_config
+    from app.storage.db import DatabaseManager
+    bot.db = DatabaseManager(mock_config.db_path)
+    bot.executor.db = bot.db
+    bot.executor.dry_run = False
+    await bot.initialize()
+
+    start_balance = bot.bankroll_manager.get_balance()
+
+    mock_kalshi = AsyncMock()
+    bot.scanner.kalshi_client = mock_kalshi
+    bot.executor.kalshi_client = mock_kalshi
+    bot.reconciliation_manager.kalshi_client = mock_kalshi
+
+    now = datetime.utcnow().isoformat() + "Z"
+    async with bot.db.connect() as db:
+        await db.execute(
+            """
+            INSERT INTO executions
+            (market_id, platform, action, quantity, price, cost, external_order_id, status,
+             executed_at_utc, created_at_utc, cycle_id, client_order_id, filled_quantity,
+             avg_fill_price, remaining_quantity)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "LEGACY-MKT-1", "kalshi", "buy_yes",
+                100.0, 0.5, 50.0, "ord-legacy-1", "filled",
+                now, now, 1, "coid-legacy-1", 0.0, 0.0, 100.0
+            )
+        )
+        await db.commit()
+
+    mock_kalshi.get_orders.return_value = [
+        {
+            "order_id": "ord-legacy-1",
+            "client_order_id": "coid-legacy-1",
+            "status": "filled"
+        }
+    ]
+
+    await bot.reconciliation_manager.reconcile_pending_executions()
+
+    assert bot.position_manager.get_position_count() == 1
+    assert bot.bankroll_manager.get_balance() == pytest.approx(start_balance - 50.0)
+
+    async with bot.db.connect() as db:
+        async with db.execute(
+            "SELECT filled_quantity, avg_fill_price, remaining_quantity FROM executions WHERE client_order_id = ?",
+            ("coid-legacy-1",)
+        ) as cursor:
+            row = await cursor.fetchone()
+
+    assert row[0] == pytest.approx(100.0)
+    assert row[1] == pytest.approx(0.5)
+    assert row[2] == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_pending_reconciliation_retries_before_failed_not_found(mock_config):
+    bot = AdvancedTradingBot()
+    bot.config = mock_config
+    from app.storage.db import DatabaseManager
+    bot.db = DatabaseManager(mock_config.db_path)
+    bot.executor.db = bot.db
+    bot.executor.dry_run = False
+    await bot.initialize()
+
+    mock_kalshi = AsyncMock()
+    mock_kalshi.get_orders.return_value = []
+    bot.scanner.kalshi_client = mock_kalshi
+    bot.executor.kalshi_client = mock_kalshi
+    bot.reconciliation_manager.kalshi_client = mock_kalshi
+
+    # Configure retries/timeouts for deterministic behavior.
+    cfg = MagicMock()
+    cfg.execution = MagicMock()
+    cfg.execution.pending_not_found_retries = 2
+    cfg.execution.pending_timeout_minutes = 60
+    cfg.execution.order_reconciliation_max_pages = 1
+    cfg.execution.order_reconciliation_page_limit = 100
+    bot.reconciliation_manager.config = cfg
+
+    now = datetime.utcnow().isoformat() + "Z"
+    async with bot.db.connect() as db:
+        await db.execute(
+            """
+            INSERT INTO executions
+            (market_id, platform, action, quantity, price, cost, external_order_id, status,
+             executed_at_utc, created_at_utc, client_order_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("PEND-1", "kalshi", "buy_yes", 100, 0.5, 50, "ord-pend-1", "pending_submit", now, now, "coid-pend-1"),
+        )
+        await db.commit()
+
+    # First miss: keep pending, increment attempts.
+    await bot.reconciliation_manager.reconcile_pending_executions()
+    async with bot.db.connect() as db:
+        async with db.execute(
+            "SELECT status, reconcile_attempts FROM executions WHERE client_order_id = ?",
+            ("coid-pend-1",),
+        ) as cursor:
+            row = await cursor.fetchone()
+    assert row[0] == "pending_submit"
+    assert int(row[1]) == 1
+
+    # Second miss: exceeds retries and becomes failed_not_found.
+    await bot.reconciliation_manager.reconcile_pending_executions()
+    async with bot.db.connect() as db:
+        async with db.execute(
+            "SELECT status, reconcile_attempts FROM executions WHERE client_order_id = ?",
+            ("coid-pend-1",),
+        ) as cursor:
+            row = await cursor.fetchone()
+    assert row[0] == "failed_not_found"
+    assert int(row[1]) == 2
+
+
+@pytest.mark.asyncio
+async def test_settlement_outcome_closes_yes_and_no_with_deterministic_payout(mock_config):
+    bot = AdvancedTradingBot()
+    bot.config = mock_config
+    from app.storage.db import DatabaseManager
+    bot.db = DatabaseManager(mock_config.db_path)
+    bot.executor.db = bot.db
+    bot.executor.dry_run = False
+    await bot.initialize()
+
+    mock_kalshi = AsyncMock()
+    bot.scanner.kalshi_client = mock_kalshi
+    bot.executor.kalshi_client = mock_kalshi
+    bot.reconciliation_manager.kalshi_client = mock_kalshi
+
+    start_balance = bot.bankroll_manager.get_balance()
+
+    # Open one YES and one NO position.
+    await bot.position_manager.add_fill(
+        market_id="SETTLE-YES",
+        platform="kalshi",
+        action="buy_yes",
+        quantity=10,
+        price=0.4,
+        external_order_id="ord-settle-yes",
+    )
+    await bot.bankroll_manager.adjust_balance(-4.0, reason="trade_execution", reference_id="ord-settle-yes")
+
+    await bot.position_manager.add_fill(
+        market_id="SETTLE-NO",
+        platform="kalshi",
+        action="buy_no",
+        quantity=10,
+        price=0.3,
+        external_order_id="ord-settle-no",
+    )
+    await bot.bankroll_manager.adjust_balance(-3.0, reason="trade_execution", reference_id="ord-settle-no")
+
+    async def _market_payload(ticker):
+        if ticker == "SETTLE-YES":
+            return {"ticker": ticker, "status": "settled", "result": "yes"}
+        if ticker == "SETTLE-NO":
+            return {"ticker": ticker, "status": "settled", "result": "no"}
+        return None
+
+    mock_kalshi.get_market.side_effect = _market_payload
+
+    await bot.reconciliation_manager.reconcile_settled_positions()
+
+    assert bot.position_manager.get_position_count() == 0
+    # Payouts: +10 from YES win and +10 from NO win, after prior debits -7.
+    assert bot.bankroll_manager.get_balance() == pytest.approx(start_balance - 7.0 + 20.0)

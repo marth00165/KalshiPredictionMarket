@@ -27,6 +27,9 @@ ALLOWED_CONFIG_TOP_LEVEL_KEYS = {
     "signal_fusion",
 }
 
+DEFAULT_DRYRUN_DB_PATH = "kalshi_dryrun.sqlite"
+DEFAULT_LIVE_DB_PATH = "kalshi_live.sqlite"
+
 
 def setup_logging(log_level):
     logging.basicConfig(
@@ -143,6 +146,33 @@ def _apply_config_updates(config_path: str, updates: list) -> list:
     return applied
 
 
+def _config_has_explicit_db_path(config_path: str) -> bool:
+    path = Path(config_path)
+    if not path.exists():
+        return False
+    try:
+        with path.open("r") as f:
+            raw = json.load(f)
+    except Exception:
+        return False
+    return isinstance(raw, dict) and isinstance(raw.get("database"), dict) and "path" in raw["database"]
+
+
+def _resolve_runtime_db_path(
+    current_path: str,
+    effective_dry_run: bool,
+    has_explicit_db_path: bool,
+) -> str:
+    """
+    Resolve runtime DB path after CLI mode overrides.
+
+    Explicit config path always takes precedence.
+    """
+    if has_explicit_db_path:
+        return current_path
+    return DEFAULT_DRYRUN_DB_PATH if effective_dry_run else DEFAULT_LIVE_DB_PATH
+
+
 def _build_safe_config_view(cfg: ConfigManager) -> dict:
     return {
         "database": {"path": cfg.db.path},
@@ -202,6 +232,21 @@ def _build_safe_config_view(cfg: ConfigManager) -> dict:
             "max_position_size": cfg.risk.max_position_size,
             "max_total_exposure_fraction": cfg.risk.max_total_exposure_fraction,
             "max_new_exposure_per_day_fraction": cfg.risk.max_new_exposure_per_day_fraction,
+            "max_orders_per_cycle": cfg.risk.max_orders_per_cycle,
+            "max_notional_per_cycle": cfg.risk.max_notional_per_cycle,
+            "daily_loss_limit_fraction": cfg.risk.daily_loss_limit_fraction,
+            "max_trades_per_market_per_day": cfg.risk.max_trades_per_market_per_day,
+            "failure_streak_cooldown_threshold": cfg.risk.failure_streak_cooldown_threshold,
+            "failure_cooldown_cycles": cfg.risk.failure_cooldown_cycles,
+        },
+        "execution": {
+            "max_price_drift": cfg.execution.max_price_drift,
+            "min_edge_at_execution": cfg.execution.min_edge_at_execution,
+            "max_submit_slippage": cfg.execution.max_submit_slippage,
+            "pending_not_found_retries": cfg.execution.pending_not_found_retries,
+            "pending_timeout_minutes": cfg.execution.pending_timeout_minutes,
+            "order_reconciliation_max_pages": cfg.execution.order_reconciliation_max_pages,
+            "order_reconciliation_page_limit": cfg.execution.order_reconciliation_page_limit,
         },
         "filters": {
             "min_volume": cfg.filters.min_volume,
@@ -811,6 +856,22 @@ async def main():
         effective_dry_run = bool(bot.config.is_dry_run)
         is_non_interactive = bool(bot.config.is_non_interactive)
 
+        # DB path safety: if the config did not explicitly set database.path, enforce mode-specific defaults
+        # after CLI mode overrides (e.g., --dry-run).
+        has_explicit_db_path = _config_has_explicit_db_path(args.config)
+        desired_db_path = _resolve_runtime_db_path(
+            current_path=bot.config.db.path,
+            effective_dry_run=effective_dry_run,
+            has_explicit_db_path=has_explicit_db_path,
+        )
+        if bot.config.db.path != desired_db_path:
+            logger.info(
+                "Adjusting DB path for runtime mode override: "
+                f"{bot.config.db.path} -> {desired_db_path}"
+            )
+            bot.config.db.path = desired_db_path
+            bot.db.db_path = desired_db_path
+
         # DB path safety check
         if not effective_dry_run and bot.config.db_path == "kalshi.sqlite" and not args.allow_live_legacy_db:
             logger.error(
@@ -865,8 +926,7 @@ async def main():
                     await asyncio.sleep(3600)
 
         elif args.mode == 'analyze':
-            logger.info("Analyze mode not fully implemented in this restructuring step.")
-            # In a real scenario, we'd call run_analyze(bot)
+            logger.info("Starting analyze mode.")
             if args.once:
                 await bot.run_trading_cycle() # Fallback to existing cycle for now
             else:
@@ -875,8 +935,7 @@ async def main():
                     await asyncio.sleep(3600)
 
         elif args.mode == 'trade':
-            logger.info("Trade mode not fully implemented in this restructuring step.")
-            # In a real scenario, we'd call run_trade(bot)
+            logger.info("Starting trade mode.")
             if args.once:
                 await bot.run_trading_cycle()
             else:

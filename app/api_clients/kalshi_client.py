@@ -406,32 +406,111 @@ class KalshiClient(BaseAPIClient):
         logger.info(f"[kalshi] Total: {len(all_markets)} markets from {len(series_tickers)} series")
         return all_markets
 
-    async def get_orders(self, ticker: Optional[str] = None, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_orders(
+        self,
+        ticker: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 200,
+        cursor: Optional[str] = None,
+        max_pages: int = 1,
+    ) -> List[Dict[str, Any]]:
         """
         Fetch orders from Kalshi portfolio.
         """
         url = f"{self.base_url}/portfolio/orders"
         headers = self._build_headers()
-        params = {}
-        if ticker:
-            params['ticker'] = ticker
-        if status:
-            params['status'] = status
-
-        async def fetch_orders():
-            if not self.session:
-                raise RuntimeError("Session not initialized")
-            async with self.session.get(url, headers=headers, params=params) as response:
-                await self._handle_response_status(response)
-                return await response.json()
+        all_orders: List[Dict[str, Any]] = []
+        seen_keys = set()
+        page = 0
+        next_cursor = cursor
 
         try:
             async with self:
-                data = await self._call_with_retry(fetch_orders, "Fetch portfolio orders")
-            return data.get('orders', [])
+                while True:
+                    page += 1
+                    params: Dict[str, Any] = {"limit": max(1, int(limit))}
+                    if ticker:
+                        params["ticker"] = ticker
+                    if status:
+                        params["status"] = status
+                    if next_cursor:
+                        params["cursor"] = next_cursor
+
+                    async def fetch_orders_page():
+                        if not self.session:
+                            raise RuntimeError("Session not initialized")
+                        async with self.session.get(url, headers=headers, params=params) as response:
+                            await self._handle_response_status(response)
+                            return await response.json()
+
+                    data = await self._call_with_retry(fetch_orders_page, "Fetch portfolio orders")
+                    page_orders = data.get("orders", []) or []
+                    for order in page_orders:
+                        key = order.get("order_id") or order.get("client_order_id") or id(order)
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        all_orders.append(order)
+
+                    cursor_from_response = data.get("cursor") or data.get("next_cursor")
+                    if not cursor_from_response or page >= max(1, int(max_pages)):
+                        break
+                    next_cursor = cursor_from_response
+
+            return all_orders
         except Exception as e:
             logger.error(f"[kalshi] Error fetching orders: {e}")
             return []
+
+    async def get_market(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a single market details payload by ticker.
+
+        Tries `/markets/{ticker}` first; falls back to `/markets?ticker=...`.
+        Returns the raw market dict or None.
+        """
+        headers = self._build_headers()
+
+        async def _fetch_direct() -> Optional[Dict[str, Any]]:
+            if not self.session:
+                raise RuntimeError("Session not initialized")
+            url = f"{self.base_url}/markets/{ticker}"
+            async with self.session.get(url, headers=headers) as response:
+                await self._handle_response_status(response)
+                data = await response.json()
+                if isinstance(data, dict):
+                    # Some responses return {"market": {...}}, some return the market directly.
+                    if isinstance(data.get("market"), dict):
+                        return data["market"]
+                    return data
+                return None
+
+        async def _fetch_list_fallback() -> Optional[Dict[str, Any]]:
+            if not self.session:
+                raise RuntimeError("Session not initialized")
+            url = f"{self.base_url}/markets"
+            params = {"ticker": ticker, "limit": 1}
+            async with self.session.get(url, headers=headers, params=params) as response:
+                await self._handle_response_status(response)
+                data = await response.json()
+                markets = data.get("markets", []) if isinstance(data, dict) else []
+                if markets:
+                    return markets[0]
+                return None
+
+        try:
+            async with self:
+                try:
+                    return await self._call_with_retry(_fetch_direct, f"Fetch market {ticker}", max_retries=1)
+                except Exception:
+                    return await self._call_with_retry(
+                        _fetch_list_fallback,
+                        f"Fetch market list fallback {ticker}",
+                        max_retries=1,
+                    )
+        except Exception as e:
+            logger.warning(f"[kalshi] Error fetching market {ticker}: {e}")
+            return None
 
     async def get_positions(self) -> List[Dict[str, Any]]:
         """

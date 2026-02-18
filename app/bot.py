@@ -4,7 +4,7 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from app.config import ConfigManager
 from app.storage.db import DatabaseManager
@@ -133,7 +133,8 @@ class AdvancedTradingBot:
         self.reconciliation_manager = ReconciliationManager(
             self.scanner.kalshi_client,
             self.position_manager,
-            db=self.db
+            db=self.db,
+            config=self.config,
         )
 
         # Run reconciliation on startup if not in dry-run
@@ -222,6 +223,97 @@ class AdvancedTradingBot:
         except Exception as e:
             logger.warning(f"Failed to update heartbeat file: {e}")
 
+    async def _compute_current_equity(self) -> float:
+        """
+        Compute current equity for risk guards.
+
+        In live mode we prefer mark-to-market equity from reconciliation manager.
+        In dry-run (or on any live-data failure), fallback to balance + local exposure.
+        """
+        current_balance = self.bankroll_manager.get_balance()
+        fallback_equity = current_balance + self.position_manager.get_total_exposure()
+
+        if self.config.is_dry_run or not self.reconciliation_manager:
+            return fallback_equity
+
+        try:
+            return await self.reconciliation_manager.compute_true_equity(current_balance)
+        except Exception as e:
+            logger.warning(f"Falling back to local equity approximation after live equity error: {e}")
+            return fallback_equity
+
+    async def _get_market_trade_count_today(self, market_id: str) -> int:
+        """
+        Count executions for market_id in current UTC day.
+
+        Includes submitted/open/filled statuses as "attempted trades" for cap enforcement.
+        """
+        statuses = (
+            "submitted",
+            "pending_submit",
+            "pending_fill",
+            "resting",
+            "open",
+            "filled",
+            "partially_filled",
+            "executed",
+            "dry_run",
+        )
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        placeholders = ",".join(["?"] * len(statuses))
+
+        query = f"""
+            SELECT COUNT(*) AS n
+            FROM executions
+            WHERE market_id = ?
+              AND status IN ({placeholders})
+              AND substr(executed_at_utc, 1, 10) = ?
+        """
+        params = (market_id, *statuses, today)
+
+        async with self.db.connect() as db:
+            async with db.execute(query, params) as cursor:
+                row = await cursor.fetchone()
+                return int(row[0] or 0) if row else 0
+
+    async def _update_execution_failure_state(self, results: List[Dict[str, Any]]) -> None:
+        """
+        Update consecutive execution failure tracking and optional cooldown state.
+        """
+        if not results:
+            return
+
+        status_map = await self.db.get_last_status()
+        current_streak = int(status_map.get("execution_failure_streak", 0) or 0)
+
+        hard_failures = [
+            r for r in results
+            if (not r.get("success")) and (not r.get("skipped"))
+        ]
+        successes = [r for r in results if r.get("success")]
+
+        if hard_failures and not successes:
+            current_streak += 1
+        elif successes:
+            current_streak = 0
+
+        await self.db.update_status("execution_failure_streak", current_streak)
+
+        threshold = int(self.config.risk.failure_streak_cooldown_threshold or 0)
+        cooldown_cycles = int(self.config.risk.failure_cooldown_cycles or 0)
+        if threshold <= 0 or cooldown_cycles <= 0:
+            return
+
+        if current_streak >= threshold:
+            cooldown_until = self.cycle_count + cooldown_cycles
+            await self.db.update_status("execution_cooldown_until_cycle", cooldown_until)
+            msg = (
+                f"🛑 Execution cooldown triggered: streak={current_streak} >= {threshold}. "
+                f"New orders paused until cycle {cooldown_until}."
+            )
+            logger.warning(msg)
+            await self.notifier.send_notification(msg, level="CRITICAL")
+
     async def _run_risk_guards(self, signals: List[TradeSignal]) -> List[TradeSignal]:
         """
         Apply hard risk rails before execution.
@@ -237,10 +329,21 @@ class AdvancedTradingBot:
             await self.notifier.send_notification(msg, level="CRITICAL")
             return []
 
-        # 2. Daily Loss Limit
-        current_balance = self.bankroll_manager.get_balance()
-        current_exposure = self.position_manager.get_total_exposure()
-        current_equity = current_balance + current_exposure
+        # 2. Cooldown after consecutive failures
+        threshold = int(self.config.risk.failure_streak_cooldown_threshold or 0)
+        cooldown_cycles = int(self.config.risk.failure_cooldown_cycles or 0)
+        if threshold > 0 and cooldown_cycles > 0:
+            status_map = await self.db.get_last_status()
+            cooldown_until = int(status_map.get("execution_cooldown_until_cycle", 0) or 0)
+            if self.cycle_count < cooldown_until:
+                logger.warning(
+                    f"🧊 Execution cooldown active until cycle {cooldown_until}; "
+                    f"current cycle={self.cycle_count}. Skipping execution."
+                )
+                return []
+
+        # 3. Daily Loss Limit (true equity in live mode)
+        current_equity = await self._compute_current_equity()
 
         starting_equity = await self.bankroll_manager.get_daily_starting_balance()
 
@@ -257,12 +360,14 @@ class AdvancedTradingBot:
             await self.notifier.send_notification(msg, level="CRITICAL")
             return []
 
-        # 3. Per-cycle caps
+        # 4. Per-cycle caps + per-market/day cap
         max_orders = self.config.risk.max_orders_per_cycle
         max_notional = self.config.risk.max_notional_per_cycle
+        max_market_trades = int(self.config.risk.max_trades_per_market_per_day or 0)
 
         allowed_signals = []
         cumulative_notional = 0.0
+        per_market_counts: Dict[str, int] = {}
 
         for s in signals:
             if len(allowed_signals) >= max_orders:
@@ -271,6 +376,17 @@ class AdvancedTradingBot:
             if cumulative_notional + s.position_size > max_notional:
                 logger.info(f"⏭️ Skipping signal {s.market.market_id}: max_notional_per_cycle reached ({max_notional})")
                 continue
+            if max_market_trades > 0:
+                existing = per_market_counts.get(s.market.market_id)
+                if existing is None:
+                    existing = await self._get_market_trade_count_today(s.market.market_id)
+                if existing >= max_market_trades:
+                    logger.info(
+                        f"⏭️ Skipping signal {s.market.market_id}: "
+                        f"max_trades_per_market_per_day reached ({max_market_trades})"
+                    )
+                    continue
+                per_market_counts[s.market.market_id] = existing + 1
 
             allowed_signals.append(s)
             cumulative_notional += s.position_size
@@ -1384,6 +1500,9 @@ class AdvancedTradingBot:
                                 logger.info(f"⏳ Order {res.get('order_id')} accepted but not yet filled (status={status}). Will reconcile later.")
                             elif status == "pending_submit":
                                 logger.warning(f"⚠️ Order for {s.market.market_id} stuck in pending_submit.")
+
+                        # Update failure/cooldown tracking from execution outcomes.
+                        await self._update_execution_failure_state(results)
 
                     except ExecutionError as e:
                         logger.error(f"Execution error: {e}")

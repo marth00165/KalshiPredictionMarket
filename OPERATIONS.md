@@ -69,3 +69,71 @@ If the bot cannot create the lock file in `/var/run/`, ensure the user running t
 ```bash
 python -m app --lock-file ./custom.lock
 ```
+
+## Autonomous Live Checklist
+
+Before enabling real money unattended runs:
+
+1. Confirm `advanced_config.json` has:
+- `trading.dry_run=false`
+- `trading.autonomous_mode=true`
+- `trading.non_interactive=true`
+- explicit scope (`series_tickers` or allowed market/event IDs)
+2. Validate config:
+```bash
+python -m app --verify-config --mode trade
+```
+3. Run a one-cycle smoke test:
+```bash
+python -m app --mode trade --once --skip-setup-wizard --non-interactive
+```
+4. Confirm heartbeat updates at `reports/heartbeat.json`.
+5. Test kill switch:
+```bash
+export BOT_DISABLE_TRADING=1
+python -m app --mode trade --once --skip-setup-wizard --non-interactive
+unset BOT_DISABLE_TRADING
+```
+
+## systemd Service (Recommended on VPS)
+
+Service template: `deploy/systemd/kalshi-bot.service`.
+
+Install/update service:
+```bash
+sudo cp deploy/systemd/kalshi-bot.service /etc/systemd/system/kalshi-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable kalshi-bot
+sudo systemctl restart kalshi-bot
+```
+
+One-command operations:
+```bash
+./deploy/systemd/manage.sh start
+./deploy/systemd/manage.sh stop
+./deploy/systemd/manage.sh status
+./deploy/systemd/manage.sh logs
+```
+
+## Log Retention
+
+Use journald retention and/or logrotate:
+
+1. journald (example):
+```ini
+# /etc/systemd/journald.conf
+SystemMaxUse=500M
+MaxRetentionSec=14day
+```
+2. Reload journald:
+```bash
+sudo systemctl restart systemd-journald
+```
+
+## Health Watchdog
+
+The bot writes `reports/heartbeat.json` each cycle. A simple watchdog should alert when:
+
+- heartbeat file is stale (no update within expected cycle interval + buffer),
+- status is not `active`,
+- bankroll drops below your minimum threshold.
