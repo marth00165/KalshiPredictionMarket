@@ -179,6 +179,8 @@ def _build_safe_config_view(cfg: ConfigManager) -> dict:
         "analysis": {
             "provider": cfg.analysis.provider,
             "allow_runtime_override": cfg.analysis.allow_runtime_override,
+            "context_json_path": cfg.analysis.context_json_path,
+            "context_max_chars": cfg.analysis.context_max_chars,
         },
         "api": {
             "batch_size": cfg.api.batch_size,
@@ -388,7 +390,11 @@ def _run_edit_mode(raw_config: dict, mode: str, cli_dry_run: bool) -> None:
     print("Credentials are loaded from .env and are not prompted here.\n")
 
     base_fields = [
-        ("analysis.provider", "Analysis provider (claude/openai)", lambda s: _parse_choice(s, {"claude", "openai"})),
+        (
+            "analysis.provider",
+            "Analysis provider (claude/openai)",
+            lambda s: _parse_choice(s, {"claude", "openai"}),
+        ),
         ("platforms.kalshi.enabled", "Enable Kalshi (true/false)", _parse_bool),
         ("platforms.polymarket.enabled", "Enable Polymarket (true/false)", _parse_bool),
         ("trading.dry_run", "Dry run mode (true/false)", _parse_bool),

@@ -449,6 +449,36 @@ class Strategy:
                 action = 'buy_no'
                 market_price = market.no_price
                 probability_for_kelly = 1 - estimate.effective_probability
+
+            # Guardrail: avoid fading heavy favorites with buy_no unless
+            # edge/confidence are materially stronger than baseline thresholds.
+            if action == 'buy_no':
+                heavy_yes_threshold = float(
+                    getattr(self.config.strategy, "heavy_favorite_yes_price_threshold", 0.80)
+                )
+                strict_edge = float(
+                    getattr(self.config.strategy, "heavy_favorite_buy_no_min_edge", 0.15)
+                )
+                strict_confidence = float(
+                    getattr(self.config.strategy, "heavy_favorite_buy_no_min_confidence", 0.85)
+                )
+
+                if market.yes_price >= heavy_yes_threshold:
+                    abs_edge = abs(float(estimate.effective_edge))
+                    confidence = float(estimate.effective_confidence)
+                    if abs_edge < strict_edge or confidence < strict_confidence:
+                        logger.info(
+                            "Skipping signal for %s (heavy_favorite_buy_no_guard: "
+                            "yes_price=%.3f edge=%.3f confidence=%.3f requires "
+                            "edge>=%.3f confidence>=%.3f)",
+                            market_key,
+                            market.yes_price,
+                            abs_edge,
+                            confidence,
+                            strict_edge,
+                            strict_confidence,
+                        )
+                        continue
             
             # Calculate Kelly fraction
             kelly_frac = self.kelly.calculate_kelly_fraction(

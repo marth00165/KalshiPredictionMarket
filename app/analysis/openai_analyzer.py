@@ -7,6 +7,7 @@ from typing import List, Optional
 import aiohttp
 
 from app.api_clients.base_client import BaseAPIClient, APIError
+from app.analysis.context_loader import load_context_json_block
 from app.models import MarketData, FairValueEstimate
 from app.utils import ClaudeResponseParser, ConfigManager
 
@@ -25,6 +26,7 @@ class OpenAIAnalyzer:
             output_cost_per_mtok=config.openai.output_cost_per_mtok,
         )
         self.config = config
+        self._context_json_block = load_context_json_block(config)
 
     async def analyze_market_batch(
         self,
@@ -70,6 +72,15 @@ class OpenAIAnalyzer:
             return None
 
     def _build_analysis_prompt(self, market: MarketData) -> str:
+        context_section = ""
+        if self._context_json_block:
+            context_section = f"""
+
+ADDITIONAL USER CONTEXT (local JSON file):
+{self._context_json_block}
+
+Use this context as supplemental evidence. If it conflicts with market data or is stale, explain that in reasoning."""
+
         return f"""Analyze this prediction market and estimate the TRUE probability of the outcome.
 
 MARKET DETAILS:
@@ -79,6 +90,7 @@ Current Market Price: {market.yes_price:.1%} for YES
 Volume: ${market.volume:,.0f}
 Category: {market.category}
 Closes: {market.end_date}
+{context_section}
 
 YOUR TASK:
 1. Research what is known about this event

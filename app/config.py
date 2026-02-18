@@ -49,11 +49,15 @@ class AnalysisConfig:
 
     provider: str = "claude"  # "claude" or "openai"
     allow_runtime_override: bool = True
+    context_json_path: Optional[str] = None
+    context_max_chars: int = 12000
 
     def validate(self) -> None:
         provider_normalized = (self.provider or "").strip().lower()
         if provider_normalized not in {"claude", "openai"}:
             raise ValueError(f"provider must be 'claude' or 'openai', got {self.provider!r}")
+        if self.context_max_chars < 1:
+            raise ValueError("context_max_chars must be >= 1")
         self.provider = provider_normalized
 
 
@@ -198,8 +202,11 @@ class TradingConfig:
 class StrategyConfig:
     """Configuration for trading strategy"""
     
-    min_edge: float = 0.08  # 8% edge minimum
-    min_confidence: float = 0.60  # 60% confidence minimum
+    min_edge: float = 0.10  # 10% edge minimum
+    min_confidence: float = 0.75  # 75% confidence minimum
+    heavy_favorite_yes_price_threshold: float = 0.80
+    heavy_favorite_buy_no_min_edge: float = 0.15
+    heavy_favorite_buy_no_min_confidence: float = 0.85
     
     def validate(self) -> None:
         """Validate strategy configuration"""
@@ -207,6 +214,21 @@ class StrategyConfig:
             raise ValueError(f"min_edge must be between 0 and 1, got {self.min_edge}")
         if not (0 <= self.min_confidence <= 1):
             raise ValueError(f"min_confidence must be between 0 and 1, got {self.min_confidence}")
+        if not (0 <= self.heavy_favorite_yes_price_threshold <= 1):
+            raise ValueError(
+                "heavy_favorite_yes_price_threshold must be between 0 and 1, "
+                f"got {self.heavy_favorite_yes_price_threshold}"
+            )
+        if not (0 <= self.heavy_favorite_buy_no_min_edge <= 1):
+            raise ValueError(
+                "heavy_favorite_buy_no_min_edge must be between 0 and 1, "
+                f"got {self.heavy_favorite_buy_no_min_edge}"
+            )
+        if not (0 <= self.heavy_favorite_buy_no_min_confidence <= 1):
+            raise ValueError(
+                "heavy_favorite_buy_no_min_confidence must be between 0 and 1, "
+                f"got {self.heavy_favorite_buy_no_min_confidence}"
+            )
 
 
 @dataclass
@@ -431,6 +453,8 @@ class ConfigManager:
         self.analysis = AnalysisConfig(
             provider=analysis_raw.get('provider', 'claude'),
             allow_runtime_override=analysis_raw.get('allow_runtime_override', True),
+            context_json_path=analysis_raw.get('context_json_path'),
+            context_max_chars=analysis_raw.get('context_max_chars', 12000),
         )
         try:
             self.analysis.validate()
@@ -516,8 +540,11 @@ class ConfigManager:
         # Strategy configuration
         strategy_raw = raw_config.get('strategy', {})
         self.strategy = StrategyConfig(
-            min_edge=strategy_raw.get('min_edge', 0.08),
-            min_confidence=strategy_raw.get('min_confidence', 0.60),
+            min_edge=strategy_raw.get('min_edge', 0.10),
+            min_confidence=strategy_raw.get('min_confidence', 0.75),
+            heavy_favorite_yes_price_threshold=strategy_raw.get('heavy_favorite_yes_price_threshold', 0.80),
+            heavy_favorite_buy_no_min_edge=strategy_raw.get('heavy_favorite_buy_no_min_edge', 0.15),
+            heavy_favorite_buy_no_min_confidence=strategy_raw.get('heavy_favorite_buy_no_min_confidence', 0.85),
         )
         try:
             self.strategy.validate()
@@ -627,7 +654,7 @@ class ConfigManager:
 
     @property
     def analysis_provider(self) -> str:
-        """Get analysis provider ('claude' or 'openai')"""
+        """Get analysis provider."""
         return self.analysis.provider
 
     @property
@@ -743,6 +770,8 @@ class ConfigManager:
         provider = self.analysis_provider
         logger.info("\n🧠 Analysis:")
         logger.info(f"   Provider: {provider}")
+        if self.analysis.context_json_path:
+            logger.info(f"   Context JSON: {self.analysis.context_json_path}")
         if provider == "openai":
             logger.info(f"   Model: {self.openai.model}")
             logger.info(f"   Temperature: {self.openai.temperature}")
@@ -774,6 +803,12 @@ class ConfigManager:
         logger.info(f"\n📈 Strategy:")
         logger.info(f"   Min edge: {self.min_edge_percentage:.1f}%")
         logger.info(f"   Min confidence: {self.min_confidence_percentage:.1f}%")
+        logger.info(
+            "   Heavy-favorite buy_no guard: "
+            f"yes>={self.strategy.heavy_favorite_yes_price_threshold:.1%} "
+            f"requires edge>={self.strategy.heavy_favorite_buy_no_min_edge:.1%} "
+            f"and confidence>={self.strategy.heavy_favorite_buy_no_min_confidence:.1%}"
+        )
         
         logger.info(f"\n⚠️  Risk Management:")
         logger.info(f"   Max Kelly fraction: {self.risk.max_kelly_fraction:.1%}")
@@ -846,6 +881,9 @@ class ConfigManager:
             'strategy': {
                 'min_edge': self.strategy.min_edge,
                 'min_confidence': self.strategy.min_confidence,
+                'heavy_favorite_yes_price_threshold': self.strategy.heavy_favorite_yes_price_threshold,
+                'heavy_favorite_buy_no_min_edge': self.strategy.heavy_favorite_buy_no_min_edge,
+                'heavy_favorite_buy_no_min_confidence': self.strategy.heavy_favorite_buy_no_min_confidence,
             },
             'risk': {
                 'max_kelly_fraction': self.risk.max_kelly_fraction,
@@ -876,5 +914,10 @@ class ConfigManager:
             'signal_fusion': {
                 'enabled': self.signal_fusion.enabled,
                 'mode': self.signal_fusion.mode,
+            },
+            'analysis': {
+                'provider': self.analysis.provider,
+                'context_json_path': self.analysis.context_json_path,
+                'context_max_chars': self.analysis.context_max_chars,
             },
         }

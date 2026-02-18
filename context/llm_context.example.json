@@ -1,0 +1,8 @@
+{
+  "strategy_notes": "Focus only on markets I understand well.",
+  "risk_notes": "Prefer higher-liquidity markets and avoid thin books.",
+  "domain_preferences": {
+    "sports": "NBA winner markets only"
+  }
+}
+

@@ -219,6 +219,81 @@ def test_strategy_exposure_reduces_position_size(mock_config):
     assert high_exposure_signals[0].position_size == 10.0
 
 
+def test_strategy_heavy_favorite_buy_no_guard_blocks_low_confidence(mock_config):
+    strategy = Strategy(mock_config)
+    mock_config.strategy.heavy_favorite_yes_price_threshold = 0.80
+    mock_config.strategy.heavy_favorite_buy_no_min_edge = 0.15
+    mock_config.strategy.heavy_favorite_buy_no_min_confidence = 0.85
+    mock_config.risk.max_kelly_fraction = 1.0
+    mock_config.risk.max_position_size = 10_000
+
+    market = MarketData(
+        market_id="m_heavy",
+        platform="k",
+        title="Heavy favorite",
+        description="D",
+        category="C",
+        end_date="Z",
+        yes_price=0.88,
+        no_price=0.12,
+        volume=1000,
+        liquidity=1000,
+    )
+    estimate = FairValueEstimate(
+        market_id="m_heavy",
+        estimated_probability=0.75,  # buy_no signal
+        confidence_level=0.80,       # below strict 0.85 threshold
+        reasoning="R",
+        edge=-0.13,                  # below strict 0.15 abs edge threshold
+    )
+
+    with pytest.raises(NoOpportunitiesError):
+        strategy.generate_trade_signals(
+            [(market, estimate)],
+            current_bankroll=1000,
+            current_open_market_keys=set(),
+            current_open_event_keys=set(),
+        )
+
+
+def test_strategy_heavy_favorite_buy_no_guard_allows_high_edge_high_confidence(mock_config):
+    strategy = Strategy(mock_config)
+    mock_config.strategy.heavy_favorite_yes_price_threshold = 0.80
+    mock_config.strategy.heavy_favorite_buy_no_min_edge = 0.15
+    mock_config.strategy.heavy_favorite_buy_no_min_confidence = 0.85
+    mock_config.risk.max_kelly_fraction = 1.0
+    mock_config.risk.max_position_size = 10_000
+
+    market = MarketData(
+        market_id="m_heavy_ok",
+        platform="k",
+        title="Heavy favorite okay",
+        description="D",
+        category="C",
+        end_date="Z",
+        yes_price=0.90,
+        no_price=0.10,
+        volume=1000,
+        liquidity=1000,
+    )
+    estimate = FairValueEstimate(
+        market_id="m_heavy_ok",
+        estimated_probability=0.70,  # buy_no signal
+        confidence_level=0.90,       # above strict threshold
+        reasoning="R",
+        edge=-0.20,                  # above strict abs edge threshold
+    )
+
+    signals = strategy.generate_trade_signals(
+        [(market, estimate)],
+        current_bankroll=1000,
+        current_open_market_keys=set(),
+        current_open_event_keys=set(),
+    )
+    assert len(signals) == 1
+    assert signals[0].action == "buy_no"
+
+
 def test_strategy_exposure_caps_total_allocated_size(mock_config):
     strategy = Strategy(mock_config)
     mock_config.risk.max_kelly_fraction = 1.0

@@ -475,7 +475,6 @@ class KalshiClient(BaseAPIClient):
             List of standardized market data dicts
         """
         all_markets = []
-        headers = self._build_kalshi_headers("GET", url, authenticated=False)
         
         async with self:
             for series_ticker in series_tickers:
@@ -498,6 +497,7 @@ class KalshiClient(BaseAPIClient):
                         async def fetch_page():
                             if not self.session:
                                 raise RuntimeError("Session not initialized")
+                            headers = self._build_kalshi_headers("GET", url, authenticated=False)
                             async with self.session.get(url, headers=headers, params=params) as response:
                                 await self._handle_response_status(response)
                                 return await response.json()

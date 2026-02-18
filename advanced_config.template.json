@@ -1,7 +1,9 @@
 {
   "analysis": {
     "provider": "claude",
-    "allow_runtime_override": true
+    "allow_runtime_override": true,
+    "context_json_path": "context/llm_context.json",
+    "context_max_chars": 12000
   },
   "api": {
     "batch_size": 5,
@@ -37,8 +39,11 @@
     "dry_run": true
   },
   "strategy": {
-    "min_edge": 0.08,
-    "min_confidence": 0.60
+    "min_edge": 0.10,
+    "min_confidence": 0.75,
+    "heavy_favorite_yes_price_threshold": 0.80,
+    "heavy_favorite_buy_no_min_edge": 0.15,
+    "heavy_favorite_buy_no_min_confidence": 0.85
   },
   "risk": {
     "max_kelly_fraction": 0.25,
