@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Dict, Optional
 
 from app.analytics import EloEngine, get_win_probability as _get_win_probability, load_ratings as _load_ratings
 
+logger = logging.getLogger(__name__)
+
 MIN_ELO_DELTA = -75
 MAX_ELO_DELTA = 75
 DEFAULT_HOME_COURT_BONUS = 100.0
+MODEL_DIVERGENCE_WARNING_THRESHOLD = 0.25
 
 
 def validate_llm_elo_delta(delta: object) -> int:
@@ -97,6 +101,50 @@ def calculate_adjusted_yes_probability(
         "yes_effective_elo": yes_effective,
         "applied_elo_delta": float(applied_delta),
     }
+
+
+def log_model_divergence_warning(
+    *,
+    team: str,
+    opponent: str,
+    probability_final: float,
+    market_probability: float,
+    edge: Optional[float] = None,
+    threshold: float = MODEL_DIVERGENCE_WARNING_THRESHOLD,
+) -> bool:
+    """
+    Emit warning when model probability diverges materially from market probability.
+
+    Returns:
+        True if warning was emitted, False otherwise.
+    """
+    try:
+        p_final = float(probability_final)
+        p_market = float(market_probability)
+        div_threshold = abs(float(threshold))
+    except Exception:
+        return False
+
+    if div_threshold <= 0:
+        return False
+
+    abs_diff = abs(p_final - p_market)
+    if abs_diff < div_threshold:
+        return False
+
+    implied_edge = float(edge) if edge is not None else (p_final - p_market)
+    logger.warning(
+        "MODEL_DIVERGENCE_WARNING | team=%s | opponent=%s | probability_final=%.4f | "
+        "market_probability=%.4f | edge=%+.4f | abs_diff=%.4f | threshold=%.4f",
+        str(team or ""),
+        str(opponent or ""),
+        p_final,
+        p_market,
+        implied_edge,
+        abs_diff,
+        div_threshold,
+    )
+    return True
 
 
 def load_ratings(

@@ -15,6 +15,7 @@ from app.api_clients.scanner import MarketScanner
 from app.analysis.claude_analyzer import ClaudeAnalyzer
 from app.analysis import OpenAIAnalyzer
 from app.trading import PositionManager, Strategy, TradeExecutor
+from app.trading.engine import log_model_divergence_warning
 from app.trading.bankroll_manager import BankrollManager
 from app.trading.reconciliation import ReconciliationManager
 from app.signals import SignalFusionService
@@ -705,6 +706,79 @@ class AdvancedTradingBot:
         return raw[: max_len - 3] + "..."
 
     @staticmethod
+    def _extract_elo_decision_fields(signal: TradeSignal, market_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Build normalized structured decision fields for logging.
+        """
+        analysis = market_row.get("analysis") if isinstance(market_row, dict) else {}
+        if not isinstance(analysis, dict):
+            analysis = {}
+        elo_meta = analysis.get("elo_adjustment")
+        if not isinstance(elo_meta, dict):
+            elo_meta = {}
+
+        team = str(elo_meta.get("yes_team") or "").strip() or (
+            signal.market.yes_option if signal.action in ("buy_yes", "sell_no") else signal.market.no_option
+        ) or "unknown"
+
+        home_team = str(elo_meta.get("home_team") or "").strip()
+        away_team = str(elo_meta.get("away_team") or "").strip()
+        if team and home_team and away_team:
+            opponent = away_team if team == home_team else home_team
+        else:
+            opponent = "unknown"
+
+        probability_base = elo_meta.get("base_probability")
+        probability_final = elo_meta.get("final_probability", signal.fair_value)
+        market_probability = elo_meta.get("market_probability", signal.market_price)
+        edge = elo_meta.get("edge", signal.edge)
+
+        return {
+            "team": team,
+            "opponent": opponent,
+            "elo_base": elo_meta.get("yes_base_elo", elo_meta.get("home_elo") if team == home_team else elo_meta.get("away_elo")),
+            "elo_delta": elo_meta.get("applied_elo_delta", 0.0),
+            "elo_adjusted": elo_meta.get("yes_adjusted_elo"),
+            "probability_base": probability_base,
+            "probability_final": probability_final,
+            "market_probability": market_probability,
+            "edge": edge,
+        }
+
+    def _log_structured_trade_decision(self, signal: TradeSignal, market_row: Optional[Dict[str, Any]]) -> None:
+        """
+        Structured pre-execution decision log for auditing and debugging.
+        """
+        fields = self._extract_elo_decision_fields(signal, market_row)
+        payload = {
+            "market_id": signal.market.market_id,
+            "team": fields["team"],
+            "opponent": fields["opponent"],
+            "elo_base": fields["elo_base"],
+            "elo_delta": fields["elo_delta"],
+            "elo_adjusted": fields["elo_adjusted"],
+            "probability_base": fields["probability_base"],
+            "probability_final": fields["probability_final"],
+            "market_probability": fields["market_probability"],
+            "edge": fields["edge"],
+            "decision": "execute",
+            "proposed_bet_size": float(signal.position_size),
+        }
+        logger.info("TRADE_DECISION | %s", json.dumps(payload, sort_keys=True, default=str))
+
+        try:
+            log_model_divergence_warning(
+                team=str(fields["team"]),
+                opponent=str(fields["opponent"]),
+                probability_final=float(fields["probability_final"]),
+                market_probability=float(fields["market_probability"]),
+                edge=float(fields["edge"]),
+            )
+        except Exception:
+            # Divergence warning is informational and must never break execution.
+            logger.debug("Failed to evaluate divergence warning for %s", signal.market.market_id)
+
+    @staticmethod
     def _format_text_table(headers: List[str], rows: List[List[str]]) -> str:
         """Render a simple ASCII table for terminal output."""
         if not headers:
@@ -1108,6 +1182,7 @@ class AdvancedTradingBot:
                         "feature_provider": est.feature_provider,
                         "feature_reason": (est.fusion_metadata or {}).get("feature", {}).get("reason"),
                         "feature_rules": (est.fusion_metadata or {}).get("applied_rules", []),
+                        "elo_adjustment": (est.fusion_metadata or {}).get("elo_adjustment"),
                     }
                     if est.has_significant_edge(min_edge, min_confidence):
                         report["counts"]["opportunities"] += 1
@@ -1395,6 +1470,7 @@ class AdvancedTradingBot:
                             "reasoning": est.reasoning,
                             "key_factors": est.key_factors,
                             "data_sources": est.data_sources,
+                            "elo_adjustment": (est.fusion_metadata or {}).get("elo_adjustment"),
                         }
 
                 # Stop early if we hit the configured API spend limit.
@@ -1434,6 +1510,7 @@ class AdvancedTradingBot:
                             "feature_recommendation": est.feature_recommendation,
                             "feature_provider": est.feature_provider,
                             "feature_reason": (est.fusion_metadata or {}).get("feature", {}).get("reason"),
+                            "elo_adjustment": (est.fusion_metadata or {}).get("elo_adjustment"),
                         }
 
             # Snapshot cost stats if available
@@ -1757,6 +1834,13 @@ class AdvancedTradingBot:
                     if not execution_ready_signals:
                         logger.info("No signals remaining after final scope guard")
                         return
+
+                    # Structured decision logs immediately before execution.
+                    for s in execution_ready_signals:
+                        self._log_structured_trade_decision(
+                            s,
+                            market_rows_by_id.get(s.market.market_id),
+                        )
 
                     # Execute trades
                     try:

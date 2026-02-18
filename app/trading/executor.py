@@ -3,7 +3,7 @@
 import logging
 import uuid
 import hashlib
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from datetime import datetime
 
 from app.models import TradeSignal
@@ -39,6 +39,143 @@ class TradeExecutor:
         self.kalshi_client = kalshi_client
         self.dry_run = config.is_dry_run
         self.executed_trades = []
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    async def _load_exposure_state(self) -> Optional[Dict[str, float]]:
+        """
+        Load exposure inputs from DB for execution-time cap checks.
+
+        Returns None if state cannot be reliably computed, in which case
+        execution proceeds (fail-open safety).
+        """
+        try:
+            today_utc = datetime.utcnow().strftime("%Y-%m-%d")
+            success_statuses = (
+                "executed",
+                "submitted",
+                "dry_run",
+                "filled",
+                "partially_filled",
+                "pending_fill",
+                "open",
+                "resting",
+            )
+
+            async with self.db.connect() as db:
+                # Current bankroll (latest persisted balance); fallback to configured initial bankroll.
+                async with db.execute(
+                    "SELECT balance FROM bankroll_history ORDER BY id DESC LIMIT 1"
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    fallback_bankroll = self._safe_float(
+                        getattr(getattr(self.config, "trading", object()), "initial_bankroll", 0.0),
+                        default=0.0,
+                    )
+                    bankroll = self._safe_float(row[0] if row else fallback_bankroll, default=fallback_bankroll)
+
+                # Current open exposure.
+                async with db.execute(
+                    "SELECT COALESCE(SUM(cost), 0.0) FROM positions WHERE status = 'open'"
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    current_exposure = self._safe_float(row[0] if row else 0.0, default=0.0)
+
+                # Exposure newly deployed today (UTC) from successful executions.
+                placeholders = ",".join(["?"] * len(success_statuses))
+                query = (
+                    "SELECT COALESCE(SUM(cost), 0.0) FROM executions "
+                    f"WHERE status IN ({placeholders}) AND substr(executed_at_utc, 1, 10) = ?"
+                )
+                async with db.execute(query, (*success_statuses, today_utc)) as cursor:
+                    row = await cursor.fetchone()
+                    opened_today = self._safe_float(row[0] if row else 0.0, default=0.0)
+
+            capital_base = max(0.0, bankroll + current_exposure)
+            if capital_base <= 0.0:
+                # Cannot enforce percentage caps without a positive capital base.
+                logger.warning(
+                    "Exposure cap check unavailable (non-positive capital base). "
+                    "Proceeding without execution-time exposure block."
+                )
+                return None
+
+            return {
+                "bankroll": bankroll,
+                "current_exposure": current_exposure,
+                "opened_today": opened_today,
+                "capital_base": capital_base,
+                "reserved_new_exposure": 0.0,
+            }
+        except Exception as e:
+            logger.warning(
+                "Failed loading execution-time exposure state (%s). "
+                "Proceeding without execution-time exposure block.",
+                e,
+            )
+            return None
+
+    def _check_exposure_limits(
+        self,
+        signal: TradeSignal,
+        exposure_state: Dict[str, float],
+    ) -> Tuple[bool, str]:
+        """
+        Return (is_allowed, reason_code).
+        """
+        max_total_fraction = self._safe_float(
+            getattr(getattr(self.config, "risk", object()), "max_total_exposure_fraction", 1.0),
+            default=1.0,
+        )
+        max_daily_fraction = self._safe_float(
+            getattr(getattr(self.config, "risk", object()), "max_new_exposure_per_day_fraction", 1.0),
+            default=1.0,
+        )
+        max_total_fraction = max(0.0, min(1.0, max_total_fraction))
+        max_daily_fraction = max(0.0, min(1.0, max_daily_fraction))
+
+        capital_base = exposure_state["capital_base"]
+        current_exposure = exposure_state["current_exposure"]
+        opened_today = exposure_state["opened_today"]
+        reserved = exposure_state["reserved_new_exposure"]
+        proposed = max(0.0, float(signal.position_size))
+
+        max_total_exposure = capital_base * max_total_fraction
+        max_new_exposure_today = capital_base * max_daily_fraction
+
+        projected_total_exposure = current_exposure + reserved + proposed
+        projected_opened_today = opened_today + reserved + proposed
+
+        if projected_opened_today > max_new_exposure_today + 1e-9:
+            logger.warning(
+                "DAILY_EXPOSURE_LIMIT_REACHED | market_id=%s | proposed_notional=%.2f | "
+                "opened_today=%.2f | projected_opened_today=%.2f | max_new_exposure_today=%.2f",
+                signal.market.market_id,
+                proposed,
+                opened_today + reserved,
+                projected_opened_today,
+                max_new_exposure_today,
+            )
+            return False, "daily_exposure_limit"
+
+        if projected_total_exposure > max_total_exposure + 1e-9:
+            logger.warning(
+                "TOTAL_EXPOSURE_LIMIT_REACHED | market_id=%s | proposed_notional=%.2f | "
+                "current_exposure=%.2f | projected_total_exposure=%.2f | max_total_exposure=%.2f",
+                signal.market.market_id,
+                proposed,
+                current_exposure + reserved,
+                projected_total_exposure,
+                max_total_exposure,
+            )
+            return False, "total_exposure_limit"
+
+        return True, ""
 
     @staticmethod
     def _is_terminal_idempotent_status(status: Optional[str]) -> bool:
@@ -79,10 +216,18 @@ class TradeExecutor:
         results = []
         error_context = ErrorContext("Batch execution", critical=False)
         
+        exposure_state = await self._load_exposure_state()
+
         for signal in signals:
             try:
-                result = await self.execute_signal(signal, cycle_id=cycle_id)
+                result = await self.execute_signal(signal, cycle_id=cycle_id, exposure_state=exposure_state)
                 results.append(result)
+                if exposure_state is not None and result.get("success"):
+                    executed_notional = self._safe_float(
+                        result.get("submitted_notional", signal.position_size),
+                        default=self._safe_float(signal.position_size, default=0.0),
+                    )
+                    exposure_state["reserved_new_exposure"] += max(0.0, executed_notional)
             except Exception as e:
                 error_context.add_error(e)
                 logger.error(f"Error executing signal for {signal.market.market_id}: {e}")
@@ -93,7 +238,12 @@ class TradeExecutor:
         
         return results
     
-    async def execute_signal(self, signal: TradeSignal, cycle_id: int = 0) -> Dict[str, Any]:
+    async def execute_signal(
+        self,
+        signal: TradeSignal,
+        cycle_id: int = 0,
+        exposure_state: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
         """
         Execute a single trade signal
         
@@ -130,6 +280,20 @@ class TradeExecutor:
                             "status": status,
                             "idempotent": True
                         }
+
+        if exposure_state is not None:
+            allowed, reason_code = self._check_exposure_limits(signal, exposure_state)
+            if not allowed:
+                status_map = {
+                    "daily_exposure_limit": "skipped_daily_exposure",
+                    "total_exposure_limit": "skipped_total_exposure",
+                }
+                return {
+                    "success": False,
+                    "skipped": True,
+                    "status": status_map.get(reason_code, "skipped_exposure"),
+                    "error": reason_code.upper(),
+                }
 
         if self.dry_run:
             # Simulate success
