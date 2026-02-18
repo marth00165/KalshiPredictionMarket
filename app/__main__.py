@@ -286,12 +286,6 @@ def _prompt_setting(
             print(f"Invalid value: {e}")
 
 
-def _env_or_config_set(raw_config: dict, env_var: str, config_path: str) -> bool:
-    return _is_effectively_set(os.getenv(env_var)) or _is_effectively_set(
-        _get_nested(raw_config, config_path, None)
-    )
-
-
 def _write_config_file(config_path: str, raw_config: dict) -> None:
     path = Path(config_path)
     with path.open("w") as f:
@@ -299,34 +293,41 @@ def _write_config_file(config_path: str, raw_config: dict) -> None:
         f.write("\n")
 
 
-def _missing_required_settings(cfg: ConfigManager, mode: str, cli_dry_run: bool) -> list[str]:
+def _missing_required_env_vars(cfg: ConfigManager, mode: str, cli_dry_run: bool) -> list[str]:
     missing: list[str] = []
     effective_dry_run = bool(cli_dry_run or cfg.is_dry_run)
 
     if mode in {"collect", "trade"}:
-        if cfg.kalshi_enabled and not cfg.platforms.kalshi.api_key:
-            missing.append("platforms.kalshi.api_key")
-        if cfg.polymarket_enabled and not cfg.platforms.polymarket.api_key:
-            missing.append("platforms.polymarket.api_key")
+        if cfg.kalshi_enabled and not _is_effectively_set(os.getenv("KALSHI_API_KEY")):
+            missing.append("KALSHI_API_KEY")
+        if cfg.polymarket_enabled and not _is_effectively_set(os.getenv("POLYMARKET_API_KEY")):
+            missing.append("POLYMARKET_API_KEY")
 
     if mode in {"analyze", "trade"}:
         provider = cfg.analysis_provider
-        if provider == "claude" and not cfg.api.claude_api_key:
-            missing.append("api.claude_api_key")
-        if provider == "openai" and not cfg.api.openai_api_key:
-            missing.append("api.openai_api_key")
+        if provider == "claude" and not _is_effectively_set(os.getenv("ANTHROPIC_API_KEY")):
+            missing.append("ANTHROPIC_API_KEY")
+        if provider == "openai" and not _is_effectively_set(os.getenv("OPENAI_API_KEY")):
+            missing.append("OPENAI_API_KEY")
 
     if mode == "trade" and not effective_dry_run:
-        if cfg.kalshi_enabled and not (cfg.platforms.kalshi.private_key or cfg.platforms.kalshi.private_key_file):
-            missing.append("platforms.kalshi.private_key_file")
-        if cfg.polymarket_enabled and not (cfg.platforms.polymarket.private_key or cfg.platforms.polymarket.private_key_file):
-            missing.append("platforms.polymarket.private_key_file")
+        if cfg.kalshi_enabled and not (
+            _is_effectively_set(os.getenv("KALSHI_PRIVATE_KEY"))
+            or _is_effectively_set(cfg.platforms.kalshi.private_key_file)
+        ):
+            missing.append("KALSHI_PRIVATE_KEY (or platforms.kalshi.private_key_file)")
+        if cfg.polymarket_enabled and not (
+            _is_effectively_set(os.getenv("POLYMARKET_PRIVATE_KEY"))
+            or _is_effectively_set(cfg.platforms.polymarket.private_key_file)
+        ):
+            missing.append("POLYMARKET_PRIVATE_KEY (or platforms.polymarket.private_key_file)")
 
     return missing
 
 
 def _run_edit_mode(raw_config: dict, mode: str, cli_dry_run: bool) -> None:
     print("\nEntering config edit mode. Press Enter to keep current value.\n")
+    print("Credentials are loaded from .env and are not prompted here.\n")
 
     base_fields = [
         ("analysis.provider", "Analysis provider (claude/openai)", lambda s: _parse_choice(s, {"claude", "openai"})),
@@ -357,31 +358,7 @@ def _run_edit_mode(raw_config: dict, mode: str, cli_dry_run: bool) -> None:
     polymarket_enabled = bool(_get_nested(raw_config, "platforms.polymarket.enabled", False))
     effective_dry_run = bool(cli_dry_run or _get_nested(raw_config, "trading.dry_run", True))
 
-    # Credentials/settings required for selected mode/provider/platforms.
-    if mode in {"collect", "trade"} and kalshi_enabled:
-        required = not _env_or_config_set(raw_config, "KALSHI_API_KEY", "platforms.kalshi.api_key")
-        value = _prompt_setting(raw_config, "platforms.kalshi.api_key", "Kalshi API key", _parse_nonempty, required=required)
-        if value is not None:
-            _set_nested(raw_config, "platforms.kalshi.api_key", value)
-
-    if mode in {"collect", "trade"} and polymarket_enabled:
-        required = not _env_or_config_set(raw_config, "POLYMARKET_API_KEY", "platforms.polymarket.api_key")
-        value = _prompt_setting(raw_config, "platforms.polymarket.api_key", "Polymarket API key", _parse_nonempty, required=required)
-        if value is not None:
-            _set_nested(raw_config, "platforms.polymarket.api_key", value)
-
-    if mode in {"analyze", "trade"} and provider == "claude":
-        required = not _env_or_config_set(raw_config, "ANTHROPIC_API_KEY", "api.claude_api_key")
-        value = _prompt_setting(raw_config, "api.claude_api_key", "Anthropic API key", _parse_nonempty, required=required)
-        if value is not None:
-            _set_nested(raw_config, "api.claude_api_key", value)
-
-    if mode in {"analyze", "trade"} and provider == "openai":
-        required = not _env_or_config_set(raw_config, "OPENAI_API_KEY", "api.openai_api_key")
-        value = _prompt_setting(raw_config, "api.openai_api_key", "OpenAI API key", _parse_nonempty, required=required)
-        if value is not None:
-            _set_nested(raw_config, "api.openai_api_key", value)
-
+    # Optional key-file paths for live mode; actual key material should come from env vars.
     if mode == "trade" and not effective_dry_run and kalshi_enabled:
         has_env_private = bool(os.getenv("KALSHI_PRIVATE_KEY"))
         required = not (has_env_private or bool(_get_nested(raw_config, "platforms.kalshi.private_key_file", None)))
@@ -425,22 +402,25 @@ def _maybe_run_startup_setup_wizard(args, logger) -> None:
     else:
         raw_config = {}
 
-    missing = []
+    missing_env = []
     try:
         cfg = ConfigManager(args.config)
-        missing = _missing_required_settings(cfg, args.mode, cli_dry_run=args.dry_run)
+        missing_env = _missing_required_env_vars(cfg, args.mode, cli_dry_run=args.dry_run)
     except Exception as e:
         cfg_error = cfg_error or str(e)
 
-    force_edit = bool(cfg_error or missing)
+    if missing_env:
+        print("\nMissing required credentials in environment (.env):")
+        for item in missing_env:
+            print(f"  - {item}")
+        print("\nAdd these to .env, then restart the bot.")
+        raise SystemExit(1)
+
+    force_edit = bool(cfg_error)
     if force_edit:
         print("\nConfig setup is required before continuing.")
         if cfg_error:
             print(f"- Current config is invalid: {cfg_error}")
-        if missing:
-            print("- Missing required settings:")
-            for item in missing:
-                print(f"  - {item}")
         choice = input("Start edit mode now? [Y/n]: ").strip().lower()
         if choice in {"n", "no"}:
             raise SystemExit(1)
@@ -469,6 +449,27 @@ def _maybe_run_startup_setup_wizard(args, logger) -> None:
                 raise SystemExit(1)
 
 
+def _prompt_enable_market_picker_after_setup(args, effective_dry_run: bool) -> bool:
+    """
+    Ask whether to enable interactive market picking for this run.
+
+    This prompt appears only for interactive dry-run analyze/trade sessions.
+    """
+    if args.mode not in {"analyze", "trade"}:
+        return False
+    if not effective_dry_run:
+        return False
+    if args.backup or args.discover_series:
+        return False
+    if not sys.stdin.isatty():
+        return False
+
+    choice = input(
+        "\nAfter setup, choose markets from a list before analysis? [Y/n]: "
+    ).strip().lower()
+    return choice not in {"n", "no"}
+
+
 async def main():
     parser = argparse.ArgumentParser(description="AI Trading Bot CLI")
     parser.add_argument('--config', type=str, default='advanced_config.json', help='Path to config file')
@@ -479,6 +480,8 @@ async def main():
     parser.add_argument('--lock-file', type=str, help='Custom path to lock file')
     parser.add_argument('--skip-setup-wizard', action='store_true',
                         help='Skip interactive startup setup wizard')
+    parser.add_argument('--pick-markets', action='store_true',
+                        help='In dry-run trade/analyze modes, interactively choose filtered markets before analysis')
 
     # Discovery/Utility arguments
     parser.add_argument('--backup', action='store_true', help='Create a backup of the database')
@@ -559,6 +562,18 @@ async def main():
         if args.dry_run:
             bot.config.trading.dry_run = True
             logger.info("Dry-run mode enabled via CLI")
+
+        effective_dry_run = bool(args.dry_run or bot.config.is_dry_run)
+
+        if args.pick_markets:
+            if effective_dry_run:
+                bot.interactive_market_pick = True
+                logger.info("Interactive market picker enabled")
+            else:
+                logger.warning("--pick-markets ignored because bot is not in dry-run mode")
+        elif _prompt_enable_market_picker_after_setup(args, effective_dry_run):
+            bot.interactive_market_pick = True
+            logger.info("Interactive market picker enabled for this run")
 
         if args.backup:
             logger.info("Creating database backup...")

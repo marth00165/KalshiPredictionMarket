@@ -609,13 +609,26 @@ class ConfigManager:
         logger.info("\n" + "=" * 80)
         logger.info("📋 CONFIGURATION SUMMARY")
         logger.info("=" * 80)
-        
-        logger.info(f"\n🤖 Claude AI:")
-        logger.info(f"   Model: {self.claude.model}")
-        logger.info(f"   Temperature: {self.claude.temperature}")
-        logger.info(f"   Max tokens: {self.claude.max_tokens}")
-        logger.info(f"   Pricing: ${self.claude.input_cost_per_mtok}/Mtok (input), "
-                    f"${self.claude.output_cost_per_mtok}/Mtok (output)")
+
+        provider = self.analysis_provider
+        logger.info("\n🧠 Analysis:")
+        logger.info(f"   Provider: {provider}")
+        if provider == "openai":
+            logger.info(f"   Model: {self.openai.model}")
+            logger.info(f"   Temperature: {self.openai.temperature}")
+            logger.info(f"   Max tokens: {self.openai.max_tokens}")
+            logger.info(
+                f"   Pricing: ${self.openai.input_cost_per_mtok}/Mtok (input), "
+                f"${self.openai.output_cost_per_mtok}/Mtok (output)"
+            )
+        else:
+            logger.info(f"   Model: {self.claude.model}")
+            logger.info(f"   Temperature: {self.claude.temperature}")
+            logger.info(f"   Max tokens: {self.claude.max_tokens}")
+            logger.info(
+                f"   Pricing: ${self.claude.input_cost_per_mtok}/Mtok (input), "
+                f"${self.claude.output_cost_per_mtok}/Mtok (output)"
+            )
         
         logger.info(f"\n🏢 Platforms:")
         logger.info(f"   Polymarket: {'✅ Enabled' if self.polymarket_enabled else '❌ Disabled'} "

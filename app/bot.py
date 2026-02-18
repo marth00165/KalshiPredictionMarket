@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import sys
 import time
 from datetime import datetime
 from typing import List, Optional
@@ -84,6 +85,7 @@ class AdvancedTradingBot:
         # Cycle counter
         self.cycle_count = 0
         self._initialized = False
+        self.interactive_market_pick = False
 
     async def initialize(self):
         """Initialize database and managers."""
@@ -134,6 +136,181 @@ class AdvancedTradingBot:
 
         self.config.analysis.provider = provider_norm
         self._analyzer = self._create_analyzer(provider_norm)
+
+    @staticmethod
+    def _truncate(text: object, max_len: int) -> str:
+        raw = str(text) if text is not None else ""
+        if max_len <= 0:
+            return ""
+        if len(raw) <= max_len:
+            return raw
+        if max_len <= 3:
+            return raw[:max_len]
+        return raw[: max_len - 3] + "..."
+
+    @staticmethod
+    def _format_text_table(headers: List[str], rows: List[List[str]]) -> str:
+        """Render a simple ASCII table for terminal output."""
+        if not headers:
+            return ""
+
+        normalized_rows = []
+        widths = [len(str(h)) for h in headers]
+        for row in rows:
+            normalized = [str(cell) for cell in row]
+            if len(normalized) < len(headers):
+                normalized.extend([""] * (len(headers) - len(normalized)))
+            normalized_rows.append(normalized[:len(headers)])
+            for idx, cell in enumerate(normalized[:len(headers)]):
+                widths[idx] = max(widths[idx], len(cell))
+
+        sep = "+-" + "-+-".join("-" * w for w in widths) + "-+"
+        header_line = "| " + " | ".join(
+            str(headers[i]).ljust(widths[i]) for i in range(len(headers))
+        ) + " |"
+
+        lines = [sep, header_line, sep]
+        for row in normalized_rows:
+            lines.append(
+                "| " + " | ".join(row[i].ljust(widths[i]) for i in range(len(headers))) + " |"
+            )
+        lines.append(sep)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_index_selection(raw: str, max_index: int) -> List[int]:
+        selected = set()
+        tokens = [token.strip() for token in raw.split(",") if token.strip()]
+        if not tokens:
+            raise ValueError("selection cannot be empty")
+
+        for token in tokens:
+            if "-" in token:
+                left, right = token.split("-", 1)
+                start = int(left)
+                end = int(right)
+                if start > end:
+                    raise ValueError(f"invalid range '{token}'")
+                if start < 1 or end > max_index:
+                    raise ValueError(f"range '{token}' is out of bounds 1-{max_index}")
+                for idx in range(start, end + 1):
+                    selected.add(idx)
+                continue
+
+            idx = int(token)
+            if idx < 1 or idx > max_index:
+                raise ValueError(f"index '{idx}' is out of bounds 1-{max_index}")
+            selected.add(idx)
+
+        return sorted(selected)
+
+    def _prompt_market_selection(self, markets: List[MarketData]) -> List[MarketData]:
+        if not markets:
+            return markets
+        if not self.interactive_market_pick:
+            return markets
+        if not self.config.is_dry_run:
+            logger.info("Interactive market picker is only enabled in dry-run mode; using all markets.")
+            return markets
+        if not sys.stdin.isatty():
+            logger.info("Interactive market picker requested, but no TTY is attached; using all markets.")
+            return markets
+
+        headers = ["#", "Market", "Question", "Selection", "YES", "Volume"]
+        rows = []
+        for idx, market in enumerate(markets, start=1):
+            rows.append([
+                str(idx),
+                self._truncate(market.market_id, 34),
+                self._truncate(market.title, 52),
+                self._truncate(market.yes_option or "-", 16),
+                f"{market.yes_price:.3f}",
+                f"{market.volume:,.0f}",
+            ])
+
+        print("\nDRY RUN: Choose markets to analyze")
+        print(self._format_text_table(headers, rows))
+        print("Enter 'all', 'none', or comma/range list like: 1,3,5-8")
+
+        while True:
+            raw = input("Selection [all]: ").strip().lower()
+            if raw in {"", "all", "a"}:
+                logger.info(f"Selected all {len(markets)} filtered markets for analysis")
+                return markets
+            if raw in {"none", "n"}:
+                logger.info("No markets selected for analysis")
+                return []
+            try:
+                indices = self._parse_index_selection(raw, len(markets))
+                selected = [markets[i - 1] for i in indices]
+                logger.info(f"Selected {len(selected)}/{len(markets)} filtered markets for analysis")
+                return selected
+            except ValueError as e:
+                print(f"Invalid selection: {e}")
+            except Exception:
+                print("Invalid selection format. Example: 1,3,5-8")
+
+    def _print_dry_run_analysis_table(self, report: dict) -> None:
+        if not self.config.is_dry_run:
+            return
+
+        market_rows = report.get("markets") or []
+        analysis_rows = []
+
+        for market in market_rows:
+            analysis = market.get("analysis")
+            if not isinstance(analysis, dict):
+                continue
+
+            signal = market.get("signal") or {}
+            fair = analysis.get("effective_probability", analysis.get("estimated_probability"))
+            edge = analysis.get("effective_edge", analysis.get("edge"))
+            conf = analysis.get("effective_confidence", analysis.get("confidence"))
+            yes_price = (market.get("prices") or {}).get("yes")
+            size = signal.get("position_size")
+
+            analysis_rows.append({
+                "market_id": market.get("market_id", ""),
+                "question": market.get("title", ""),
+                "selection": market.get("yes_option") or "-",
+                "yes_price": yes_price,
+                "fair": fair,
+                "edge": edge,
+                "conf": conf,
+                "signal": signal.get("action", "-"),
+                "size": size,
+            })
+
+        if not analysis_rows:
+            return
+
+        analysis_rows.sort(
+            key=lambda row: float(row["edge"]) if isinstance(row["edge"], (int, float)) else float("-inf"),
+            reverse=True,
+        )
+
+        headers = ["Market", "Question", "Selection", "YES", "Fair", "Edge", "Conf", "Signal", "Size"]
+        rows = []
+        for row in analysis_rows:
+            yes_val = row["yes_price"]
+            fair_val = row["fair"]
+            edge_val = row["edge"]
+            conf_val = row["conf"]
+            size_val = row["size"]
+            rows.append([
+                self._truncate(row["market_id"], 34),
+                self._truncate(row["question"], 46),
+                self._truncate(row["selection"], 14),
+                f"{yes_val:.3f}" if isinstance(yes_val, (int, float)) else "-",
+                f"{fair_val:.3f}" if isinstance(fair_val, (int, float)) else "-",
+                f"{edge_val:+.3f}" if isinstance(edge_val, (int, float)) else "-",
+                f"{conf_val:.3f}" if isinstance(conf_val, (int, float)) else "-",
+                self._truncate(row["signal"], 10),
+                f"${size_val:,.2f}" if isinstance(size_val, (int, float)) else "-",
+            ])
+
+        print("\nDRY RUN ANALYSIS RESULTS")
+        print(self._format_text_table(headers, rows))
 
     async def discover_kalshi_series(self, category: Optional[str] = None) -> List[dict]:
         """
@@ -569,6 +746,12 @@ class AdvancedTradingBot:
             filtered = self.strategy.filter_markets(markets)
             logger.info(f"   {len(filtered)} markets passed filters")
             report["counts"]["passed_filters"] = len(filtered)
+
+            # Optional interactive picker for dry-run sessions.
+            filtered = self._prompt_market_selection(filtered)
+            if not filtered:
+                logger.warning("No markets selected for analysis, aborting cycle")
+                return
             
             # Step 3: Analyze with LLM (in batches)
             provider = (self.config.analysis_provider or "claude").strip().lower()
@@ -854,6 +1037,7 @@ class AdvancedTradingBot:
 
             # Step 8: Report performance
             logger.info("\n📊 Step 8: Reporting performance...")
+            self._print_dry_run_analysis_table(report)
             self._print_cycle_summary(cycle_start)
         
         except Exception as e:
