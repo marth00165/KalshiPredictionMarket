@@ -50,6 +50,10 @@ class DatabaseManager:
         self.initialized = True
         logger.info(f"✅ Database initialized at {self.db_path}")
 
+    def connect(self):
+        """Get an aiosqlite connection context manager."""
+        return aiosqlite.connect(self.db_path)
+
     async def _run_migrations(self, db: aiosqlite.Connection):
         """Run pending schema migrations."""
         # Current schema version
@@ -59,6 +63,7 @@ class DatabaseManager:
 
         # Define migrations
         # Version 1: Initial schema
+        # Version 2: Bankroll, Positions, Executions
         migrations = [
             # Version 1
             """
@@ -75,6 +80,59 @@ class DatabaseManager:
                 key TEXT PRIMARY KEY,
                 value TEXT,
                 updated_at_utc TEXT NOT NULL
+            );
+            """,
+            # Version 2
+            """
+            CREATE TABLE IF NOT EXISTS bankroll_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT NOT NULL,
+                balance REAL NOT NULL,
+                change REAL NOT NULL,
+                reason TEXT NOT NULL,
+                reference_id TEXT,
+                created_at_utc TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                cost REAL NOT NULL,
+                status TEXT NOT NULL,
+                external_order_id TEXT,
+                opened_at_utc TEXT NOT NULL,
+                closed_at_utc TEXT,
+                created_at_utc TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                action TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                price REAL NOT NULL,
+                cost REAL NOT NULL,
+                external_order_id TEXT,
+                status TEXT NOT NULL,
+                executed_at_utc TEXT NOT NULL,
+                created_at_utc TEXT NOT NULL
+            );
+            """,
+            # Version 3: Add result column to positions
+            """
+            ALTER TABLE positions ADD COLUMN result REAL DEFAULT 0.0;
+            """,
+            # Version 4: Add pnl_history table
+            """
+            CREATE TABLE IF NOT EXISTS pnl_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT NOT NULL,
+                profit REAL NOT NULL,
+                balance REAL NOT NULL,
+                created_at_utc TEXT NOT NULL
             );
             """
         ]
@@ -119,7 +177,7 @@ class DatabaseManager:
                         market.get('platform'),
                         snapshot_hour,
                         json.dumps(market),
-                        now
+                        now + "Z" if not now.endswith("Z") else now
                     ))
                     count += 1
                 except Exception as e:
@@ -136,7 +194,7 @@ class DatabaseManager:
             key: Status key
             value: Status value (will be converted to string)
         """
-        now = datetime.utcnow().isoformat()
+        now = datetime.utcnow().isoformat() + "Z"
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO status (key, value, updated_at_utc)

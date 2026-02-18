@@ -13,6 +13,8 @@ from app.api_clients.scanner import MarketScanner
 from app.analysis.claude_analyzer import ClaudeAnalyzer
 from app.analysis import OpenAIAnalyzer
 from app.trading import PositionManager, Strategy, TradeExecutor
+from app.trading.bankroll_manager import BankrollManager
+from app.trading.reconciliation import ReconciliationManager
 from app.utils import (
     get_error_reporter,
     BatchParser,
@@ -53,23 +55,54 @@ class AdvancedTradingBot:
         self.config = ConfigManager(config_file)
         self.config.log_config_summary()
         
+        # Database
+        self.db = DatabaseManager(self.config.db_path)
+
         # Initialize components
         self.scanner = MarketScanner(self.config)
         self._analyzer = None # Created lazily
         self.strategy = Strategy(self.config)
-        self.position_manager = PositionManager(
+
+        # New persistent managers
+        self.bankroll_manager = BankrollManager(
+            self.db,
             self.config.trading.initial_bankroll
         )
-        self.executor = TradeExecutor(self.config)
-        
-        # Database
-        self.db = DatabaseManager(self.config.db_path)
+        self.position_manager = PositionManager(self.db, self.bankroll_manager)
+        self.reconciliation_manager = None # Created after DB init
+
+        self.executor = TradeExecutor(
+            self.config,
+            self.db,
+            self.scanner.kalshi_client
+        )
 
         # Error reporting
         self.error_reporter = get_error_reporter()
         
         # Cycle counter
         self.cycle_count = 0
+        self._initialized = False
+
+    async def initialize(self):
+        """Initialize database and managers."""
+        if self._initialized:
+            return
+
+        await self.db.initialize()
+        await self.bankroll_manager.initialize()
+        await self.position_manager.load_positions()
+
+        self.reconciliation_manager = ReconciliationManager(
+            self.scanner.kalshi_client,
+            self.position_manager
+        )
+
+        # Run reconciliation on startup if not in dry-run
+        if not self.config.is_dry_run and self.scanner.kalshi_client:
+            await self.reconciliation_manager.reconcile()
+
+        self._initialized = True
 
     @property
     def analyzer(self):
@@ -175,8 +208,9 @@ class AdvancedTradingBot:
         Returns:
             Report dict with scan results
         """
+        await self.initialize()
         self.cycle_count += 1
-        cycle_started_at = datetime.now().isoformat()
+        cycle_started_at = datetime.now().isoformat() + "Z"
         
         logger.info("=" * 60)
         logger.info(f"🔍 SERIES SCAN (Cycle {self.cycle_count}): {series_tickers}")
@@ -336,11 +370,11 @@ class AdvancedTradingBot:
         6. Execute signals
         7. Report results and errors
         """
-        
+        await self.initialize()
         self.cycle_count += 1
 
         # Report container (written to JSON at end of cycle)
-        cycle_started_at = datetime.now().isoformat()
+        cycle_started_at = datetime.now().isoformat() + "Z"
         report: dict = {
             "cycle": self.cycle_count,
             "started_at": cycle_started_at,
@@ -577,18 +611,25 @@ class AdvancedTradingBot:
             
             # Step 5: Generate trade signals
             logger.info("\n📐 Step 5: Calculating position sizes (Kelly)...")
-            try:
-                signals = self.strategy.generate_trade_signals(
-                    opportunities=opportunities,
-                    current_bankroll=self.position_manager.current_bankroll,
-                    current_exposure=self.position_manager.get_total_exposure()
-                )
-            except (InsufficientCapitalError, NoOpportunitiesError) as e:
-                logger.warning(f"Strategy error: {e}")
-                self.error_reporter.add_error_to_report(
-                    cycle_report, e, "signal generation"
-                )
+
+            # Check bankroll before generating signals
+            current_bankroll = self.bankroll_manager.get_balance()
+            if current_bankroll <= 0:
+                logger.error("🛑 BANKROLL EXHAUSTED (<= 0). Trading execution disabled.")
                 signals = []
+            else:
+                try:
+                    signals = self.strategy.generate_trade_signals(
+                        opportunities=opportunities,
+                        current_bankroll=current_bankroll,
+                        current_exposure=self.position_manager.get_total_exposure()
+                    )
+                except (InsufficientCapitalError, NoOpportunitiesError) as e:
+                    logger.warning(f"Strategy error: {e}")
+                    self.error_reporter.add_error_to_report(
+                        cycle_report, e, "signal generation"
+                    )
+                    signals = []
 
             report["counts"]["signals"] = len(signals)
 
@@ -613,31 +654,33 @@ class AdvancedTradingBot:
             
             # Step 6: Execute trades
             logger.info("\n⚡ Step 6: Executing trades...")
-            if signals:
-                # Add positions to manager
-                for signal in signals:
-                    try:
-                        self.position_manager.add_position(signal)
-                    except Exception as e:
-                        logger.error(f"Error adding position: {e}")
-                        self.error_reporter.add_error_to_report(
-                            cycle_report, e, "position management"
-                        )
-                
+            if signals and current_bankroll > 0:
                 # Execute trades
                 try:
-                    execution_results = await self.executor.execute_signals(signals)
-                    successful = sum(execution_results)
+                    results = await self.executor.execute_signals(signals)
+                    successful = sum(1 for r in results if r.get("success"))
                     logger.info(f"Executed {successful}/{len(signals)} trades")
                     report["counts"]["executed"] = int(successful)
 
-                    for s, ok in zip(signals, execution_results):
+                    for s, res in zip(signals, results):
                         row = market_rows_by_id.get(s.market.market_id)
                         if row is not None:
                             row["execution"] = {
-                                "success": bool(ok),
+                                "success": res.get("success"),
+                                "order_id": res.get("order_id"),
                                 "dry_run": self.config.is_dry_run,
                             }
+
+                        if res.get("success"):
+                            # Update local positions
+                            await self.position_manager.add_position(s, external_order_id=res.get("order_id"))
+                            # Update bankroll
+                            await self.bankroll_manager.adjust_balance(
+                                -s.position_size,
+                                reason="trade_execution",
+                                reference_id=res.get("order_id")
+                            )
+
                 except ExecutionError as e:
                     logger.error(f"Execution error: {e}")
                     self.error_reporter.add_error_to_report(
@@ -651,8 +694,22 @@ class AdvancedTradingBot:
             else:
                 logger.info("No signals to execute")
             
-            # Step 7: Report performance
-            logger.info("\n📊 Step 7: Reporting performance...")
+            # Step 7: Deduct API costs
+            logger.info("\n💸 Step 7: Deducting API costs...")
+            try:
+                stats = self.analyzer.get_api_stats()
+                total_cost = float(stats.get('total_cost', 0.0))
+                if total_cost > 0:
+                    await self.bankroll_manager.adjust_balance(
+                        -total_cost,
+                        reason="api_cost",
+                        reference_id=f"cycle_{self.cycle_count}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to deduct API costs: {e}")
+
+            # Step 8: Report performance
+            logger.info("\n📊 Step 8: Reporting performance...")
             self._print_cycle_summary(cycle_start)
         
         except Exception as e:
@@ -669,7 +726,7 @@ class AdvancedTradingBot:
         
         finally:
             # Finish and write JSON report
-            report["finished_at"] = datetime.now().isoformat()
+            report["finished_at"] = datetime.now().isoformat() + "Z"
             try:
                 reports_dir = Path(__file__).resolve().parent.parent / "reports"
                 reports_dir.mkdir(parents=True, exist_ok=True)
@@ -693,16 +750,15 @@ class AdvancedTradingBot:
         
         cycle_time = time.time() - cycle_start
         stats = self.position_manager.get_stats()
+        bankroll = self.bankroll_manager.get_balance()
         
         logger.info("\n" + "=" * 80)
         logger.info("📊 CYCLE SUMMARY")
         logger.info("=" * 80)
         logger.info(f"Duration: {cycle_time:.1f}s")
-        logger.info(f"Current Bankroll: ${stats['current_bankroll']:,.2f} "
-                    f"({stats['return_percent']:+.2f}%)")
+        logger.info(f"Current Bankroll: ${bankroll:,.2f}")
         logger.info(f"Open Positions: {stats['open_positions']}")
         logger.info(f"Total Exposure: ${stats['total_exposure']:,.2f}")
-        logger.info(f"Available Capital: ${stats['available_capital']:,.2f}")
         
         if stats['total_trades'] > 0:
             logger.info(f"Trade Stats: {stats['total_trades']} trades "

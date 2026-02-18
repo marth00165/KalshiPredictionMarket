@@ -18,8 +18,8 @@ async def run_collect(bot: AdvancedTradingBot, series_tickers: Optional[List[str
     logger.info("🚀 Starting collection mode...")
 
     try:
-        # Initialize database
-        await bot.db.initialize()
+        # Initialize bot (DB, etc.)
+        await bot.initialize()
 
         if series_tickers:
             logger.info(f"Scanning specific series: {series_tickers}")
@@ -39,7 +39,7 @@ async def run_collect(bot: AdvancedTradingBot, series_tickers: Optional[List[str
         duration = time.time() - start_time
 
         # Update heartbeat status
-        await bot.db.update_status("last_success_at_utc", datetime.utcnow().isoformat())
+        await bot.db.update_status("last_success_at_utc", datetime.utcnow().isoformat() + "Z")
         await bot.db.update_status("last_mode", "collect")
         await bot.db.update_status("last_collect_count", len(markets))
         await bot.db.update_status("last_duration_s", f"{duration:.2f}")
@@ -51,7 +51,7 @@ async def run_collect(bot: AdvancedTradingBot, series_tickers: Optional[List[str
 
     except Exception as e:
         logger.error(f"❌ Collection mode failed: {e}")
-        await bot.db.update_status("last_error_at_utc", datetime.utcnow().isoformat())
+        await bot.db.update_status("last_error_at_utc", datetime.utcnow().isoformat() + "Z")
         await bot.db.update_status("last_error_message", str(e))
         raise
 

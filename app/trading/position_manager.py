@@ -1,11 +1,14 @@
 """Position manager for tracking trades, bankroll, and performance"""
 
 import logging
+import json
+import aiosqlite
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 from app.models import TradeSignal
+from app.storage.db import DatabaseManager
 from app.utils import (
     PositionNotFoundError,
     PositionAlreadyClosedError,
@@ -20,100 +23,205 @@ class Trade:
     """Record of an executed trade"""
     
     market_id: str
+    platform: str
+    side: str  # 'yes' or 'no'
     action: str  # 'buy_yes', 'buy_no', 'sell_yes', 'sell_no'
-    position_size: float  # Amount invested
+    quantity: float
+    position_size: float  # Amount invested (cost)
     entry_price: float  # Price at entry
-    timestamp: datetime = field(default_factory=datetime.now)
+    timestamp: datetime = field(default_factory=datetime.utcnow)
     result: float = 0.0  # Profit/loss in dollars (calculated on close)
-    closed: bool = False
+    status: str = "open"  # 'open', 'closed', 'recovered'
+    external_order_id: Optional[str] = None
     
+    @property
+    def closed(self) -> bool:
+        return self.status == "closed"
+
     def __str__(self) -> str:
         """Human-readable representation"""
-        status = "CLOSED" if self.closed else "OPEN"
         result_str = f" | Result: ${self.result:+,.2f}" if self.closed else ""
         return (
-            f"{status}: {self.action} {self.market_id} "
-            f"${self.position_size:,.2f} @ {self.entry_price:.2%}{result_str}"
+            f"{self.status.upper()}: {self.action} {self.market_id} "
+            f"qty={self.quantity} cost=${self.position_size:,.2f} @ {self.entry_price:.2%}{result_str}"
         )
 
 
+from .bankroll_manager import BankrollManager
+
 class PositionManager:
     """
-    Manages open positions, trade history, and bankroll
-    
-    Tracks:
-    - Current open positions
-    - Closed trades and results
-    - Bankroll changes
-    - Performance metrics (win rate, total profit, etc.)
+    Manages open positions and trade history with SQLite persistence.
     """
     
-    def __init__(self, initial_bankroll: float):
+    def __init__(self, db: DatabaseManager, bankroll_manager: Optional[BankrollManager] = None):
         """
         Initialize position manager
         
         Args:
-            initial_bankroll: Starting capital in dollars
+            db: DatabaseManager instance
+            bankroll_manager: Optional BankrollManager for replenishment
         """
-        self.initial_bankroll = initial_bankroll
-        self.current_bankroll = initial_bankroll
-        
+        self.db = db
+        self.bankroll_manager = bankroll_manager
         self.open_positions: List[Trade] = []
         self.trade_history: List[Trade] = []
         
-        # Performance tracking
+        # Performance tracking (will be updated when history is loaded)
         self.total_trades = 0
         self.winning_trades = 0
         self.losing_trades = 0
         self.total_profit = 0.0
         self.total_loss = 0.0
     
+    async def load_positions(self):
+        """Load open positions and trade history from database."""
+        self.open_positions = []
+        self.trade_history = []
+
+        # Reset stats before loading
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.total_profit = 0.0
+        self.total_loss = 0.0
+
+        async with self.db.connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM positions") as cursor:
+                async for row in cursor:
+                    trade = Trade(
+                        market_id=row['market_id'],
+                        platform=row['platform'],
+                        side=row['side'],
+                        action=f"buy_{row['side']}", # Approximation
+                        quantity=row['quantity'],
+                        position_size=row['cost'],
+                        entry_price=row['entry_price'],
+                        timestamp=datetime.fromisoformat(row['opened_at_utc']),
+                        status=row['status'],
+                        external_order_id=row['external_order_id']
+                    )
+
+                    if row['closed_at_utc']:
+                        trade.result = row['result'] or 0.0
+                        self.trade_history.append(trade)
+
+                        # Update stats
+                        self.total_trades += 1
+                        if trade.result > 0:
+                            self.winning_trades += 1
+                            self.total_profit += trade.result
+                        else:
+                            self.losing_trades += 1
+                            self.total_loss += abs(trade.result)
+                    else:
+                        self.open_positions.append(trade)
+
+        logger.info(f"📂 Loaded {len(self.open_positions)} open positions and {len(self.trade_history)} historical trades from database.")
+
     # ========================================================================
     # POSITION MANAGEMENT
     # ========================================================================
     
-    def add_position(self, signal: TradeSignal) -> Trade:
+    async def add_position(self, signal: TradeSignal, external_order_id: Optional[str] = None) -> Trade:
         """
-        Open a new position from a trade signal
+        Open a new position from a trade signal and persist to DB
         
         Args:
             signal: TradeSignal with market and sizing information
+            external_order_id: ID from the trading platform
         
         Returns:
             Trade object representing the opened position
-        
-        Raises:
-            InsufficientBankrollError: If position size exceeds available bankroll
         """
-        
-        # Validate sufficient bankroll
-        if signal.position_size > self.current_bankroll:
-            raise InsufficientBankrollError(
-                position_size=signal.position_size,
-                bankroll=self.current_bankroll
-            )
         
         # Determine entry price based on action
         if signal.action in ('buy_yes', 'sell_no'):
             entry_price = signal.market.yes_price
+            side = 'yes'
         else:  # buy_no or sell_yes
             entry_price = signal.market.no_price
+            side = 'no'
         
+        # Kalshi count is usually position_size / price
+        # But signals already have position_size (dollars)
+        quantity = signal.position_size / max(0.01, entry_price)
+
         trade = Trade(
             market_id=signal.market.market_id,
+            platform=signal.market.platform,
+            side=side,
             action=signal.action,
+            quantity=quantity,
             position_size=signal.position_size,
             entry_price=entry_price,
+            external_order_id=external_order_id,
+            status="open"
         )
         
-        # Update bankroll
-        self.current_bankroll -= signal.position_size
         self.open_positions.append(trade)
         
+        # Persist to DB
+        now = datetime.utcnow().isoformat() + "Z"
+        # Ensure trade.timestamp is also formatted with Z
+        timestamp_str = trade.timestamp.isoformat()
+        if not timestamp_str.endswith("Z"):
+            timestamp_str += "Z"
+
+        async with self.db.connect() as db:
+            await db.execute("""
+                INSERT INTO positions
+                (market_id, platform, side, entry_price, quantity, cost, status, external_order_id, opened_at_utc, created_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade.market_id, trade.platform, trade.side, trade.entry_price,
+                trade.quantity, trade.position_size, trade.status,
+                trade.external_order_id, timestamp_str, now
+            ))
+            await db.commit()
+
         logger.info(f"✅ Added position: {trade}")
         return trade
     
-    def close_position(self, market_id: str, exit_price: float) -> Trade:
+    async def add_recovered_position(self, pos_data: Dict[str, Any]) -> Trade:
+        """
+        Add a position discovered during reconciliation.
+        """
+        trade = Trade(
+            market_id=pos_data['market_id'],
+            platform=pos_data['platform'],
+            side=pos_data['side'],
+            action=f"buy_{pos_data['side']}",
+            quantity=pos_data['quantity'],
+            position_size=pos_data['quantity'] * pos_data['entry_price'],
+            entry_price=pos_data['entry_price'],
+            status="recovered"
+        )
+
+        self.open_positions.append(trade)
+
+        now = datetime.utcnow().isoformat() + "Z"
+        timestamp_str = trade.timestamp.isoformat()
+        if not timestamp_str.endswith("Z"):
+            timestamp_str += "Z"
+
+        async with self.db.connect() as db:
+            await db.execute("""
+                INSERT INTO positions
+                (market_id, platform, side, entry_price, quantity, cost, status, opened_at_utc, created_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                trade.market_id, trade.platform, trade.side, trade.entry_price,
+                trade.quantity, trade.position_size, trade.status,
+                timestamp_str, now
+            ))
+            await db.commit()
+
+        logger.info(f"🔄 Recovered position: {trade}")
+        return trade
+
+    async def close_position(self, market_id: str, exit_price: float) -> Trade:
         """
         Close an open position and record the result
         
@@ -132,7 +240,7 @@ class PositionManager:
         position = None
         for p in self.open_positions:
             if p.market_id == market_id:
-                if p.closed:
+                if p.status == "closed":
                     raise PositionAlreadyClosedError(market_id)
                 position = p
                 break
@@ -141,19 +249,14 @@ class PositionManager:
             raise PositionNotFoundError(market_id)
         
         # Calculate profit/loss
-        if position.action in ('buy_yes', 'sell_no'):
-            # Long position on YES
-            pnl = (exit_price - position.entry_price) * position.position_size
-        else:
-            # Long position on NO (short YES)
-            pnl = (position.entry_price - exit_price) * position.position_size
+        # Assumption: exit_price is the price of the side held (YES or NO)
+        pnl = (exit_price - position.entry_price) * position.quantity
         
         # Update position
         position.result = pnl
-        position.closed = True
+        position.status = "closed"
         
-        # Update bankroll and stats
-        self.current_bankroll += position.position_size + pnl
+        # Update stats
         self.total_profit += max(0, pnl)
         self.total_loss += abs(min(0, pnl))
         
@@ -168,6 +271,32 @@ class PositionManager:
         else:
             self.losing_trades += 1
         
+        # Persist to DB
+        now = datetime.utcnow().isoformat() + "Z"
+        async with self.db.connect() as db:
+            await db.execute("""
+                UPDATE positions
+                SET status = ?, closed_at_utc = ?, result = ?
+                WHERE market_id = ? AND status != 'closed'
+            """, (position.status, now, position.result, market_id))
+            await db.commit()
+
+        # Replenish bankroll: return cost + PnL (which is quantity * exit_price)
+        if self.bankroll_manager:
+            replenishment = position.position_size + pnl
+            await self.bankroll_manager.adjust_balance(
+                replenishment,
+                reason="position_closed",
+                reference_id=market_id
+            )
+            # Record in pnl_history
+            async with self.db.connect() as db:
+                await db.execute("""
+                    INSERT INTO pnl_history (timestamp_utc, profit, balance, created_at_utc)
+                    VALUES (?, ?, ?, ?)
+                """, (now, pnl, self.bankroll_manager.get_balance(), now))
+                await db.commit()
+
         logger.info(f"✅ Closed position: {position}")
         return position
     
@@ -202,10 +331,6 @@ class PositionManager:
         """Calculate total dollars currently at risk in open positions"""
         return sum(p.position_size for p in self.get_open_positions())
     
-    def get_available_capital(self) -> float:
-        """Get available capital not committed to positions"""
-        return self.current_bankroll
-    
     def get_position_count(self) -> int:
         """Get count of open positions"""
         return len(self.get_open_positions())
@@ -226,20 +351,9 @@ class PositionManager:
             return 0.0
         return self.total_profit / self.total_trades
     
-    def get_return_on_capital(self) -> float:
-        """Calculate return on initial capital as percentage"""
-        profit = self.current_bankroll - self.initial_bankroll
-        if self.initial_bankroll == 0:
-            return 0.0
-        return profit / self.initial_bankroll
-    
     def get_stats(self) -> Dict[str, Any]:
         """Get comprehensive performance statistics"""
         return {
-            'initial_bankroll': self.initial_bankroll,
-            'current_bankroll': self.current_bankroll,
-            'profit': self.current_bankroll - self.initial_bankroll,
-            'return_percent': self.get_return_on_capital() * 100,
             'total_trades': self.total_trades,
             'winning_trades': self.winning_trades,
             'losing_trades': self.losing_trades,
@@ -249,7 +363,6 @@ class PositionManager:
             'avg_profit_per_trade': self.get_avg_profit_per_trade(),
             'open_positions': len(self.get_open_positions()),
             'total_exposure': self.get_total_exposure(),
-            'available_capital': self.get_available_capital(),
         }
     
     def log_stats(self) -> None:
@@ -259,14 +372,11 @@ class PositionManager:
         logger.info("\n" + "=" * 80)
         logger.info("💼 POSITION MANAGER STATS")
         logger.info("=" * 80)
-        logger.info(f"Bankroll: ${stats['initial_bankroll']:,.2f} → ${stats['current_bankroll']:,.2f} "
-                    f"({stats['return_percent']:+.2f}%)")
         logger.info(f"Trades: {stats['total_trades']} "
                     f"({stats['winning_trades']}W / {stats['losing_trades']}L) "
                     f"| Win Rate: {stats['win_rate_percent']:.1f}%")
         logger.info(f"Profit/Loss: ${stats['total_profit']:,.2f} profit, "
                     f"${stats['total_loss']:,.2f} loss")
         logger.info(f"Open Positions: {stats['open_positions']} | "
-                    f"Exposure: ${stats['total_exposure']:,.2f} | "
-                    f"Available: ${stats['available_capital']:,.2f}")
+                    f"Exposure: ${stats['total_exposure']:,.2f}")
         logger.info("=" * 80)
