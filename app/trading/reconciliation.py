@@ -53,45 +53,107 @@ class ReconciliationManager:
 
     async def reconcile_pending_executions(self):
         """
-        Check for any executions stuck in 'pending_submit' and resolve them.
+        Check for any executions that are not in terminal states and resolve them.
         """
         if not self.db:
             return
 
+        # Statuses that are non-terminal and need checking
+        check_statuses = (
+            'pending_submit', 'submitted', 'pending_fill',
+            'resting', 'open', 'partially_filled'
+        )
+
         async with self.db.connect() as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute(
-                "SELECT id, market_id, client_order_id FROM executions WHERE status = 'pending_submit' AND platform = 'kalshi'"
-            ) as cursor:
+            query = f"SELECT * FROM executions WHERE status IN ({','.join(['?']*len(check_statuses))}) AND platform = 'kalshi'"
+            async with db.execute(query, check_statuses) as cursor:
                 pending = await cursor.fetchall()
 
         if not pending:
             return
 
-        logger.info(f"🔄 Found {len(pending)} pending executions to reconcile.")
+        logger.info(f"🔄 Found {len(pending)} pending/non-terminal executions to reconcile.")
 
+        # Fetch recent orders from Kalshi
         recent_orders = await self.kalshi_client.get_orders()
         orders_by_client_id = {o.get('client_order_id'): o for o in recent_orders if o.get('client_order_id')}
+        orders_by_external_id = {o.get('order_id'): o for o in recent_orders if o.get('order_id')}
 
         async with self.db.connect() as db:
             for row in pending:
                 coid = row['client_order_id']
-                if not coid:
-                    continue
+                eoid = row['external_order_id']
 
-                if coid in orders_by_client_id:
+                order = None
+                if coid and coid in orders_by_client_id:
                     order = orders_by_client_id[coid]
-                    logger.info(f"✅ Found pending order {coid} on exchange. Status: {order.get('status')}")
-                    await db.execute(
-                        "UPDATE executions SET status = ?, external_order_id = ? WHERE id = ?",
-                        (order.get('status', 'executed'), order.get('order_id'), row['id'])
-                    )
+                elif eoid and eoid in orders_by_external_id:
+                    order = orders_by_external_id[eoid]
+
+                if order:
+                    status = order.get('status', 'unknown')
+                    new_filled = float(order.get('filled_count', 0))
+                    old_filled = float(row['filled_quantity'] or 0.0)
+                    old_avg_price = float(row['avg_fill_price'] or 0.0)
+                    delta_filled = new_filled - old_filled
+
+                    # Total contracts requested (from original execution record)
+                    total_count = float(row['quantity'] or 0.0)
+                    remaining_quantity = max(0.0, total_count - new_filled)
+
+                    # Update execution record
+                    avg_fill_price = float(order.get('avg_fill_price', 0)) / 100.0 if order.get('avg_fill_price') else 0.0
+
+                    logger.info(f"✅ Found order {coid or eoid} on exchange. Status: {status}, New Fill: {delta_filled}")
+
+                    await db.execute("""
+                        UPDATE executions SET
+                            status = ?,
+                            external_order_id = ?,
+                            filled_quantity = ?,
+                            avg_fill_price = ?,
+                            remaining_quantity = ?
+                        WHERE id = ?
+                    """, (status, order.get('order_id'), new_filled, avg_fill_price, remaining_quantity, row['id']))
+
+                    # If new fills detected, update PositionManager and BankrollManager
+                    if delta_filled > 0:
+                        # For bankroll, we must use the correct incremental cost basis:
+                        # (new_total * new_avg) - (old_total * old_avg)
+                        new_total_cost = new_filled * avg_fill_price
+                        old_total_cost = old_filled * old_avg_price
+                        incremental_cost = new_total_cost - old_total_cost
+
+                        # When adding to PositionManager, we add the delta quantity.
+                        # To keep cost basis consistent, the "price" for this delta fill
+                        # should be the incremental cost divided by the delta quantity.
+                        effective_incremental_price = incremental_cost / delta_filled if delta_filled > 0 else avg_fill_price
+
+                        await self.position_manager.add_fill(
+                            market_id=row['market_id'],
+                            platform=row['platform'],
+                            action=row['action'],
+                            quantity=delta_filled,
+                            price=effective_incremental_price,
+                            external_order_id=order.get('order_id')
+                        )
+
+                        if self.position_manager.bankroll_manager:
+                            await self.position_manager.bankroll_manager.adjust_balance(
+                                -incremental_cost,
+                                reason="trade_execution_reconciled",
+                                reference_id=order.get('order_id')
+                            )
                 else:
-                    logger.warning(f"❌ Pending order {coid} NOT found on exchange. Marking as failed.")
-                    await db.execute(
-                        "UPDATE executions SET status = 'failed_not_found' WHERE id = ?",
-                        (row['id'],)
-                    )
+                    # If not found in recent orders, it might be older or failed to submit
+                    # For now, if it's 'pending_submit', we mark it failed after reconciliation if not found.
+                    if row['status'] == 'pending_submit':
+                        logger.warning(f"❌ Pending order {coid} NOT found on exchange. Marking as failed.")
+                        await db.execute(
+                            "UPDATE executions SET status = 'failed_not_found' WHERE id = ?",
+                            (row['id'],)
+                        )
             await db.commit()
 
     async def reconcile(self):

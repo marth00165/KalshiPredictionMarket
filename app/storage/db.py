@@ -140,6 +140,12 @@ class DatabaseManager:
             ALTER TABLE executions ADD COLUMN client_order_id TEXT;
             ALTER TABLE executions ADD COLUMN cycle_id INTEGER;
             CREATE INDEX IF NOT EXISTS idx_executions_client_order_id ON executions(client_order_id);
+            """,
+            # Version 6: Add filled_quantity, avg_fill_price, and remaining_quantity to executions
+            """
+            ALTER TABLE executions ADD COLUMN filled_quantity REAL DEFAULT 0.0;
+            ALTER TABLE executions ADD COLUMN avg_fill_price REAL DEFAULT 0.0;
+            ALTER TABLE executions ADD COLUMN remaining_quantity REAL DEFAULT 0.0;
             """
         ]
 

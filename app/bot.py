@@ -1348,22 +1348,42 @@ class AdvancedTradingBot:
 
                         for s, res in zip(execution_ready_signals, results):
                             row = market_rows_by_id.get(s.market.market_id)
+                            status = res.get("status")
+                            filled_qty = res.get("filled_quantity", 0.0)
+                            avg_price = res.get("avg_fill_price", 0.0)
+
                             if row is not None:
                                 row["execution"] = {
                                     "success": res.get("success"),
                                     "order_id": res.get("order_id"),
+                                    "status": status,
+                                    "filled_quantity": filled_qty,
+                                    "avg_fill_price": avg_price,
                                     "dry_run": self.config.is_dry_run,
                                 }
 
-                            if res.get("success"):
+                            # Only update local state if we have a confirmed fill or it's a dry run
+                            # dry_run status is used for simulation success
+                            if status in ("filled", "partially_filled", "dry_run") and filled_qty > 0:
+                                logger.info(f"📈 Order {res.get('order_id')} had immediate fill: {filled_qty} contracts")
                                 # Update local positions
-                                await self.position_manager.add_position(s, external_order_id=res.get("order_id"))
+                                await self.position_manager.add_position(
+                                    s,
+                                    external_order_id=res.get("order_id"),
+                                    quantity=filled_qty,
+                                    price=avg_price
+                                )
                                 # Update bankroll
+                                cost = filled_qty * avg_price
                                 await self.bankroll_manager.adjust_balance(
-                                    -s.position_size,
+                                    -cost,
                                     reason="trade_execution",
                                     reference_id=res.get("order_id")
                                 )
+                            elif status in ("submitted", "pending_fill", "resting", "open"):
+                                logger.info(f"⏳ Order {res.get('order_id')} accepted but not yet filled (status={status}). Will reconcile later.")
+                            elif status == "pending_submit":
+                                logger.warning(f"⚠️ Order for {s.market.market_id} stuck in pending_submit.")
 
                     except ExecutionError as e:
                         logger.error(f"Execution error: {e}")

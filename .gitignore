@@ -230,6 +230,6 @@ main/COPILOT_RESPONSE_FEB11_v2.md
 main/COPILOT_RESPONSE_FEB11_v3.md
 main/COPILOT_RESPONSE_FEB11.md
 main/ROADMAP_DISCUSSION.md
-kalshi.sqlite
-kalshi.sqlite-shm
-kalshi.sqlite-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
