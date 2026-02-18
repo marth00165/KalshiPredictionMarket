@@ -93,6 +93,7 @@ class AdvancedTradingBot:
         self.interactive_market_pick = False
         self.runtime_scan_series_tickers: Optional[List[str]] = None
         self.runtime_scan_scope_description: Optional[str] = None
+        self.single_run_dry_output_json = False
 
     async def initialize(self):
         """Initialize database and managers."""
@@ -331,6 +332,35 @@ class AdvancedTradingBot:
                 json.dump(payload, f, indent=2)
         except Exception as e:
             logger.warning(f"Failed to append trade journal entry: {e}")
+
+    def _write_single_run_dry_analysis_json(
+        self,
+        report: Dict[str, Any],
+        analysis_rows: List[Dict[str, Any]],
+    ) -> Optional[Path]:
+        """
+        Persist single-run dry analysis results to a JSON artifact.
+        """
+        out_dir = Path("reports") / "dry_run_analysis"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        cycle_id = int(report.get("cycle") or self.cycle_count or 0)
+        out_path = out_dir / f"cycle_{cycle_id:04d}_{timestamp}.json"
+        payload = {
+            "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+            "cycle": cycle_id,
+            "dry_run": True,
+            "analysis_provider": ((report.get("config") or {}).get("analysis_provider")),
+            "results_count": len(analysis_rows),
+            "results": analysis_rows,
+        }
+        try:
+            with open(out_path, "w") as f:
+                json.dump(payload, f, indent=2)
+            return out_path
+        except Exception as e:
+            logger.warning(f"Failed to write dry-run analysis JSON: {e}")
+            return None
 
     async def _set_recent_reasoning_prompt_context(self, markets: List[MarketData]) -> None:
         """
@@ -816,6 +846,12 @@ class AdvancedTradingBot:
             key=lambda row: float(row["edge"]) if isinstance(row["edge"], (int, float)) else float("-inf"),
             reverse=True,
         )
+
+        if bool(getattr(self, "single_run_dry_output_json", False)):
+            out_path = self._write_single_run_dry_analysis_json(report, analysis_rows)
+            if out_path:
+                logger.info(f"Saved dry-run analysis JSON: {out_path}")
+            return
 
         headers = ["Market", "Question", "Selection", "YES", "Fair", "Edge", "Conf", "Signal", "Size", "Why"]
         rows = []

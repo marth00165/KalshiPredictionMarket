@@ -181,6 +181,12 @@ def _build_safe_config_view(cfg: ConfigManager) -> dict:
             "allow_runtime_override": cfg.analysis.allow_runtime_override,
             "context_json_path": cfg.analysis.context_json_path,
             "context_max_chars": cfg.analysis.context_max_chars,
+            "nba_elo_enabled": cfg.analysis.nba_elo_enabled,
+            "nba_elo_data_path": cfg.analysis.nba_elo_data_path,
+            "nba_elo_output_path": cfg.analysis.nba_elo_output_path,
+            "llm_adjustment_max_delta": cfg.analysis.llm_adjustment_max_delta,
+            "persist_reasoning_to_db": cfg.analysis.persist_reasoning_to_db,
+            "use_recent_reasoning_context": cfg.analysis.use_recent_reasoning_context,
         },
         "api": {
             "batch_size": cfg.api.batch_size,
@@ -862,6 +868,7 @@ async def main():
 
         effective_dry_run = bool(bot.config.is_dry_run)
         is_non_interactive = bool(bot.config.is_non_interactive)
+        bot.single_run_dry_output_json = bool(effective_dry_run and args.once)
 
         # DB path safety: if the config did not explicitly set database.path, enforce mode-specific defaults
         # after CLI mode overrides (e.g., --dry-run).

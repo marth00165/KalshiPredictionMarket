@@ -2,5 +2,6 @@ aiohttp
 aiosqlite
 python-dotenv
 cryptography
+pandas
 pytest
 pytest-asyncio

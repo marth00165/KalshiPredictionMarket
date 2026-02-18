@@ -126,6 +126,71 @@ class ClaudeResponseParser:
             logger.error(f"Error parsing fair value estimate: {e}\nData: {data}")
             return None
 
+    @staticmethod
+    def parse_elo_adjusted_estimate(
+        response_text: str,
+        market_id: str,
+        market_price: float,
+        base_probability: float,
+        max_delta: float = 0.03,
+    ) -> Optional[FairValueEstimate]:
+        """
+        Parse LLM output where Elo probability is the baseline and model returns only a delta.
+
+        Expected JSON shape:
+        {
+          "delta": <float -0.03..0.03>,  // may also be named probability_adjustment
+          "confidence": <float 0-100>,
+          "reasoning": "...",
+          "key_factors": [...],
+          "data_sources": [...]
+        }
+        """
+        data = ClaudeResponseParser.extract_json_from_text(response_text)
+        if not data:
+            logger.error("Could not extract JSON from Elo adjustment response")
+            return None
+
+        try:
+            delta_value = data.get("delta", data.get("probability_adjustment", 0.0))
+            delta = float(delta_value)
+            # Allow both fraction and percent inputs.
+            if abs(delta) > 1:
+                delta = delta / 100.0
+            max_delta = abs(float(max_delta))
+            if max_delta <= 0:
+                max_delta = 0.03
+            delta = max(-max_delta, min(max_delta, delta))
+
+            confidence = float(data.get("confidence", 0.0))
+            if confidence > 1:
+                confidence = confidence / 100.0
+            confidence = max(0.0, min(1.0, confidence))
+
+            final_probability = max(0.01, min(0.99, float(base_probability) + delta))
+            edge = final_probability - float(market_price)
+            reasoning = str(data.get("reasoning", "") or "").strip()
+            if reasoning:
+                reasoning = (
+                    f"Elo base={base_probability:.3f}, llm_delta={delta:+.3f}. "
+                    f"{reasoning}"
+                )
+            else:
+                reasoning = f"Elo base={base_probability:.3f}, llm_delta={delta:+.3f}."
+
+            return FairValueEstimate(
+                market_id=market_id,
+                estimated_probability=final_probability,
+                confidence_level=confidence,
+                reasoning=reasoning,
+                data_sources=data.get("data_sources", []),
+                key_factors=data.get("key_factors", []),
+                edge=edge,
+            )
+        except Exception as e:
+            logger.error(f"Error parsing Elo-adjusted estimate: {e}\nData: {data}")
+            return None
+
 
 # ============================================================================
 # API RESPONSE PARSING

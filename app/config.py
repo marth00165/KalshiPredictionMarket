@@ -51,6 +51,10 @@ class AnalysisConfig:
     allow_runtime_override: bool = True
     context_json_path: Optional[str] = None
     context_max_chars: int = 12000
+    nba_elo_enabled: bool = True
+    nba_elo_data_path: str = "context/kaggleGameData.csv"
+    nba_elo_output_path: str = "app/outputs/elo_ratings.json"
+    llm_adjustment_max_delta: float = 0.03
     persist_reasoning_to_db: bool = True
     use_recent_reasoning_context: bool = True
     recent_reasoning_entries: int = 12
@@ -62,6 +66,12 @@ class AnalysisConfig:
             raise ValueError(f"provider must be 'claude' or 'openai', got {self.provider!r}")
         if self.context_max_chars < 1:
             raise ValueError("context_max_chars must be >= 1")
+        if not str(self.nba_elo_data_path or "").strip():
+            raise ValueError("nba_elo_data_path cannot be empty")
+        if not str(self.nba_elo_output_path or "").strip():
+            raise ValueError("nba_elo_output_path cannot be empty")
+        if not (0 <= self.llm_adjustment_max_delta <= 0.25):
+            raise ValueError("llm_adjustment_max_delta must be between 0 and 0.25")
         if self.recent_reasoning_entries < 1:
             raise ValueError("recent_reasoning_entries must be >= 1")
         if self.recent_reasoning_max_chars < 1:
@@ -463,6 +473,10 @@ class ConfigManager:
             allow_runtime_override=analysis_raw.get('allow_runtime_override', True),
             context_json_path=analysis_raw.get('context_json_path'),
             context_max_chars=analysis_raw.get('context_max_chars', 12000),
+            nba_elo_enabled=analysis_raw.get('nba_elo_enabled', True),
+            nba_elo_data_path=analysis_raw.get('nba_elo_data_path', 'context/kaggleGameData.csv'),
+            nba_elo_output_path=analysis_raw.get('nba_elo_output_path', 'app/outputs/elo_ratings.json'),
+            llm_adjustment_max_delta=analysis_raw.get('llm_adjustment_max_delta', 0.03),
             persist_reasoning_to_db=analysis_raw.get('persist_reasoning_to_db', True),
             use_recent_reasoning_context=analysis_raw.get('use_recent_reasoning_context', True),
             recent_reasoning_entries=analysis_raw.get('recent_reasoning_entries', 12),
@@ -785,6 +799,12 @@ class ConfigManager:
         if self.analysis.context_json_path:
             logger.info(f"   Context JSON: {self.analysis.context_json_path}")
         logger.info(
+            "   NBA Elo: "
+            f"{'✅ enabled' if self.analysis.nba_elo_enabled else '❌ disabled'} | "
+            f"data={self.analysis.nba_elo_data_path} | "
+            f"max_llm_delta=±{self.analysis.llm_adjustment_max_delta:.1%}"
+        )
+        logger.info(
             "   DB reasoning memory: "
             f"{'✅ persist' if self.analysis.persist_reasoning_to_db else '❌ off'}, "
             f"{'✅ prompt context' if self.analysis.use_recent_reasoning_context else '❌ prompt off'}"
@@ -936,6 +956,10 @@ class ConfigManager:
                 'provider': self.analysis.provider,
                 'context_json_path': self.analysis.context_json_path,
                 'context_max_chars': self.analysis.context_max_chars,
+                'nba_elo_enabled': self.analysis.nba_elo_enabled,
+                'nba_elo_data_path': self.analysis.nba_elo_data_path,
+                'nba_elo_output_path': self.analysis.nba_elo_output_path,
+                'llm_adjustment_max_delta': self.analysis.llm_adjustment_max_delta,
                 'persist_reasoning_to_db': self.analysis.persist_reasoning_to_db,
                 'use_recent_reasoning_context': self.analysis.use_recent_reasoning_context,
                 'recent_reasoning_entries': self.analysis.recent_reasoning_entries,
