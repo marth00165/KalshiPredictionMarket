@@ -670,6 +670,7 @@ class AdvancedTradingBot:
             # Step 4.5: Mark and filter duplicate opportunities for reporting
             open_market_keys = self.position_manager.get_open_market_keys()
             filtered_opportunities = []
+            seen_opportunities_in_cycle = set()
 
             for market, est in opportunities:
                 row = market_rows_by_id.get(market.market_id)
@@ -681,8 +682,9 @@ class AdvancedTradingBot:
                     }
 
                 market_key = f"{market.platform}:{market.market_id}"
-                if market_key in open_market_keys:
-                    logger.info(f"Skipping opportunity for {market_key} (duplicate_market_guard: already open)")
+                if market_key in open_market_keys or market_key in seen_opportunities_in_cycle:
+                    reason = "already open" if market_key in open_market_keys else "duplicate in cycle"
+                    logger.info(f"Skipping opportunity for {market_key} (duplicate_market_guard: {reason})")
                     report["counts"]["skipped_duplicates"] += 1
                     if row is not None:
                         row["execution"] = {
@@ -693,6 +695,7 @@ class AdvancedTradingBot:
                     continue
 
                 filtered_opportunities.append((market, est))
+                seen_opportunities_in_cycle.add(market_key)
             
             # Step 5: Generate trade signals
             logger.info("\n📐 Step 5: Calculating position sizes (Kelly)...")

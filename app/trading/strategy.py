@@ -302,6 +302,7 @@ class Strategy:
                 max_allowed=max_positions
             )
         available_slots = max_positions - current_open_positions
+        seen_in_cycle = set()
 
         for market, estimate in opportunities:
             if len(signals) >= available_slots:
@@ -311,6 +312,10 @@ class Strategy:
             market_key = f"{market.platform}:{market.market_id}"
             if current_open_market_keys and market_key in current_open_market_keys:
                 logger.info(f"Skipping signal for {market_key} (duplicate_market_guard: already open)")
+                continue
+
+            if market_key in seen_in_cycle:
+                logger.info(f"Skipping signal for {market_key} (duplicate_market_guard: duplicate in cycle)")
                 continue
 
             # Determine action based on edge direction
@@ -372,6 +377,7 @@ class Strategy:
                     reasoning=estimate.reasoning[:200] if estimate.reasoning else ""
                 )
                 signals.append(signal)
+                seen_in_cycle.add(market_key)
                 logger.debug(f"Generated signal: {signal}")
             
             except ValueError as e:
