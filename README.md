@@ -1,139 +1,168 @@
-# 🤖 Kalshi & Polymarket Trading Bot
+# Kalshi NBA Elo Trading Bot (V1)
 
-An easy-to-use, AI-powered trading bot for prediction markets. It scans markets, uses AI to figure out the "true" odds, and places smart bets automatically.
+This repo is now tuned for an NBA-first workflow:
 
----
+- Elo is the primary probability engine.
+- LLM does not set probabilities directly.
+- LLM can only provide bounded Elo adjustments for context like injuries/rest/lineups.
+- Final trade probability always comes from Elo math.
 
-## 🌟 What This Bot Does
+## Core Pipeline
 
-- **Scans Markets**: Automatically finds active bets on Kalshi and Polymarket.
-- **AI Analysis**: Uses Claude or OpenAI to analyze news and data to find the real probability of an event happening.
-- **Smart Sizing**: Uses the "Kelly Criterion" (a math formula) to decide exactly how much to bet based on the bot's confidence.
-- **Autonomous**: Once started, it handles everything—tracking your money, managing open bets, and syncing with your exchange.
+`kaggleGameData.csv` -> Elo ratings -> base probability -> LLM Elo adjustment -> adjusted Elo -> final probability -> edge/risk checks -> execution
 
----
+## Setup
 
-## 🚀 Beginner's Quick Start Guide
-
-### 1. Install the Bot
-
-First, make sure you have Python installed. Then, open your terminal and run:
+### 1. Install dependencies
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Set Up Your API Keys
-
-You need to tell the bot how to access your accounts and the AI.
-
-1. Copy the example file: `cp .env.example .env`
-2. Open the new `.env` file in a text editor.
-3. Add your keys:
-   - `KALSHI_API_KEY`: From your Kalshi settings.
-   - `ANTHROPIC_API_KEY`: From Anthropic (for Claude AI).
-   - `KALSHI_PRIVATE_KEY`: Needed for placing real bets.
-
-### 3. Configure Your Settings
-
-1. Copy the template: `cp advanced_config.template.json advanced_config.json`
-2. Open `advanced_config.json`.
-3. **Important for Beginners**: Make sure `"dry_run": true` is set. This lets the bot "pretend" to trade so you don't lose money while learning.
-4. On startup, the bot now prompts you to either use defaults from `advanced_config.json` or enter interactive edit mode to update/validate key settings.
-
----
-
-## 🛡️ Safety First: Testing Your Bot
-
-Before using real money, run these commands to make sure everything is working:
-
-### 📡 Test Data Collection (Free)
-
-This checks if the bot can see the markets.
+### 2. Environment variables
 
 ```bash
-python -m app --mode collect --once
+cp .env.example .env
 ```
 
-### 🧠 Test AI Analysis (Costs a few cents in AI tokens)
+Set at least:
 
-This runs a full cycle, analyzes a few markets, but **will not** place any real bets.
+- `KALSHI_API_KEY`
+- `KALSHI_PRIVATE_KEY` or `KALSHI_PRIVATE_KEY_FILE` (live mode)
+- `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY`
+
+### 3. Config file
+
+```bash
+cp advanced_config.template.json advanced_config.json
+```
+
+Recommended for NBA dry runs:
+
+- `analysis.provider = "openai"` (or `"claude"`)
+- `analysis.nba_elo_enabled = true`
+- `analysis.nba_elo_data_path = "context/kaggleGameData.csv"`
+- `analysis.context_json_path = "context/llm_context.json"`
+- `trading.dry_run = true`
+- `platforms.kalshi.enabled = true`
+- `platforms.polymarket.enabled = false`
+
+## Quick Start: NBA Dry Run (One Cycle)
+
+### 1. Scope bot to NBA game winner markets
+
+```bash
+python -m app --set-allowed-series-tickers KXNBAGAME
+```
+
+### 2. (Optional) lower filters for testing
+
+```bash
+python -m app --set-config filters.min_volume=0 --set-config filters.min_liquidity=0
+```
+
+### 3. Run one non-interactive dry-run cycle
+
+```bash
+python -m app --mode trade --once --dry-run --skip-setup-wizard --non-interactive
+```
+
+For one-cycle dry runs, the bot writes JSON output to `reports/dry_run_analysis/` and does not print the full table.
+
+## Interactive Dry Run (Optional)
 
 ```bash
 python -m app --mode trade --once --dry-run
 ```
 
----
+This mode supports:
 
-## 💸 Going Live
+- setup wizard edits
+- market picker
+- pre-scan NBA scope discovery and manual series selection
 
-Once you are confident the bot is making good choices in Dry Run mode, you can go live:
+## Where Outputs Go
 
-1. Edit `advanced_config.json`.
-2. Change `"dry_run": false`.
-3. Set your `"initial_bankroll": 100` (Start small!).
-4. Run the bot:
+- Dry-run analysis JSON: `reports/dry_run_analysis/`
+- Daily trade journal (dry + live): `reports/trade_journal/YYYY-MM-DD.json`
+- Heartbeat: `reports/heartbeat.json`
+- SQLite DBs:
+  - Dry-run: `kalshi_dryrun.sqlite`
+  - Live: `kalshi.sqlite`
+
+## V1 Safeguards Implemented
+
+- Duplicate market/event guards (no overlapping same-event positions in cycle).
+- Buy-NO Kelly sizing fix (uses NO-side probability).
+- Execution-time revalidation:
+  - price drift
+  - minimum edge at execution
+  - submit slippage
+- Risk guards:
+  - per-cycle order/notional caps
+  - daily loss guard
+  - optional kill switch via env var
+  - market/day frequency cap
+- Execution-path exposure enforcement:
+  - `risk.max_new_exposure_per_day_fraction`
+  - `risk.max_total_exposure_fraction`
+- Structured pre-trade logs:
+  - `TRADE_DECISION`
+  - `MODEL_DIVERGENCE_WARNING` (logging only, no block)
+- Live bankroll startup check:
+  - verifies Kalshi cash >= `trading.initial_bankroll` before live run
+
+## Useful Commands
+
+### Config and validation
 
 ```bash
+python -m app --show-config
+python -m app --verify-config --mode trade
+python -m app --set-config analysis.provider=openai
+python -m app --set-config trading.dry_run=true
+```
+
+### Scope controls
+
+```bash
+python -m app --set-allowed-series-tickers KXNBAGAME
+python -m app --set-allowed-market-ids KXNBAGAME-26FEB19DETNYK-DET
+python -m app --set-allowed-event-tickers KXNBAGAME-26FEB19DETNYK
+```
+
+### Trading runs
+
+```bash
+python -m app --mode trade --once --dry-run
+python -m app --mode trade --once --dry-run --skip-setup-wizard --non-interactive
+python -m app --mode trade --dry-run
 python -m app --mode trade
 ```
 
-#Todo
-
-- Add https://textual.textualize.io/
-- Make Application much more user friendly
-
----
-
-## 📖 Common Commands
-
-### Run Modes
-
-| Command                                       | What it does                                            |
-| --------------------------------------------- | ------------------------------------------------------- |
-| `python -m app --mode collect --once`         | One collection cycle only (safe test).                  |
-| `python -m app --mode collect`                | Continuous collection every hour.                       |
-| `python -m app --mode trade --once --dry-run` | One dry-run trade cycle with analysis + no real orders. |
-| `python -m app --mode trade --dry-run`        | Continuous dry-run trade cycles.                        |
-| `python -m app --mode trade`                  | Live trade mode (real orders if config is live).        |
-| `python -m app --mode trade --once --dry-run --skip-setup-wizard --non-interactive` | One autonomous-style dry-run cycle (no prompts). |
-
-### Autonomous Live Run (VPS)
-
-Required `advanced_config.json` keys:
-
-- `trading.dry_run = false`
-- `trading.autonomous_mode = true`
-- `trading.non_interactive = true`
-- `trading.require_scope_in_live = true`
-- One scope must be set:
-  - `platforms.kalshi.series_tickers`, or
-  - `trading.allowed_market_ids`, or
-  - `trading.allowed_event_tickers`
-- Risk rails:
-  - `risk.max_orders_per_cycle`
-  - `risk.max_notional_per_cycle`
-  - `risk.daily_loss_limit_fraction`
-  - `risk.max_trades_per_market_per_day` (optional, `0` disables)
-  - `risk.failure_streak_cooldown_threshold` + `risk.failure_cooldown_cycles` (optional, `0` disables)
-- Execution rails:
-  - `execution.max_price_drift`
-  - `execution.min_edge_at_execution`
-  - `execution.max_submit_slippage`
-  - `execution.pending_not_found_retries`
-  - `execution.pending_timeout_minutes`
-
-Autonomous one-cycle run:
+### Utility
 
 ```bash
-python -m app --mode trade --once --skip-setup-wizard --non-interactive
+python -m app --discover-series --category Sports
+python -m app --backup
+python scripts/kalshi_user_details.py
 ```
 
-Continuous autonomous run:
+## Context for LLM
 
-```bash
-python -m app --mode trade --skip-setup-wizard --non-interactive
-```
+Add custom context in `context/llm_context.json` (or your configured `analysis.context_json_path`).  
+This context is loaded into analysis prompts as supplemental information.
+
+## Live/VPS Notes (DigitalOcean-ready)
+
+Before enabling live:
+
+1. Keep strict scope (`KXNBAGAME` or narrower).
+2. Start with small bankroll and conservative risk caps.
+3. Run at least one full dry-run cycle on VPS using your production command.
+4. Confirm journals/logs/heartbeat update correctly.
 
 Kill switch:
 
@@ -141,56 +170,21 @@ Kill switch:
 export BOT_DISABLE_TRADING=1
 ```
 
-### Dry-Run UX Commands
+Run non-interactive autonomous style:
 
-| Command                                                           | What it does                                                                                        |
-| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `python -m app --mode trade --once --dry-run --pick-markets`      | Lets you choose filtered markets interactively before analysis and prints a dry-run analysis table. |
-| `python -m app --mode trade --once --dry-run --skip-setup-wizard` | Runs without the startup questionnaire (good for automation).                                       |
+```bash
+python -m app --mode trade --skip-setup-wizard --non-interactive
+```
 
-Note: In interactive dry-run `trade`/`analyze` runs, the CLI also asks after setup whether you want market picking for that run.
-Note: Before scanning starts, interactive `trade`/`analyze` runs now offer a pre-scan scope menu. For discovery-based scopes (`Sports->NBA` or `category+keyword`), you get an indexed ticker-to-title list, can choose up to 10 IDs, and then confirm before scan starts.
+## Troubleshooting
 
-### Config + Validation
+- `ModuleNotFoundError: app`: run from repo root and use the venv.
+- `.env parse warning`: fix malformed `.env` line format (`KEY=value`).
+- No markets found: verify scope and filters.
+- Live startup fails bankroll check: fund account or lower `trading.initial_bankroll`.
 
-| Command                                                                                           | What it does                                 |
-| ------------------------------------------------------------------------------------------------- | -------------------------------------------- |
-| `python -m app --show-config`                                                                     | Prints effective non-secret config values.   |
-| `python -m app --verify-config --mode trade`                                                      | Validates config for trade mode.             |
-| `python -m app --set-max-positions 3 --set-max-position-size 100 --set-dry-run true`              | Updates core risk/trading settings.          |
-| `python -m app --set-max-total-exposure-fraction 0.8 --set-max-new-exposure-per-day-fraction 0.8` | Updates total/day exposure caps.             |
-| `python -m app --set-config risk.max_kelly_fraction=0.1`                                          | Updates any config key via `dot.path=value`. |
+## Technical Docs
 
-### Utility
-
-| Command                           | What it does                        |
-| --------------------------------- | ----------------------------------- |
-| `python -m app --discover-series` | Lists Kalshi series you can target. |
-| `python -m app --backup`          | Creates a DB backup.                |
-| `python scripts/kalshi_user_details.py` | Prints current Kalshi account details, cash balance, open positions, and recent orders. |
-
-Live safety note:
-- In live mode, bot startup now verifies Kalshi available cash is at least `trading.initial_bankroll`. If not, startup fails fast.
-- You can disable this only if needed with `trading.enforce_live_cash_check=false` (not recommended).
-
----
-
-## ❓ Frequently Asked Questions
-
-**"Does this cost money?"**
-
-- Running the bot in `collect` mode is free.
-- Using the AI (Claude/OpenAI) costs a small amount per scan (usually a few cents).
-- Real trading, of course, uses your Kalshi/Polymarket balance.
-
-**"The bot stopped trading. Why?"**
-
-- Check your bankroll. The bot will automatically stop if your balance hits $0 to protect you.
-- Check if you already have an open position in that market. The bot will not open duplicate positions in the same market.
-- Check the logs. If your API keys expire, it will stop and tell you why.
-
----
-
-## 🛠️ Need Technical Details?
-
-Check out [TECHNICAL_DOCS.md](./TECHNICAL_DOCS.md) for a deep dive into how the bot works, the database structure, and the safety systems.
+- `TECHNICAL_DOCS.md`
+- `OPERATIONS.md`
+- `LIVE_AUTONOMOUS_V1_GAP_LIST.md`
