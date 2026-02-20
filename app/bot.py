@@ -123,6 +123,11 @@ class AdvancedTradingBot:
 
         await self.db.initialize()
 
+        # Sync DB instance to sub-managers in case bot.db was replaced (common in tests)
+        self.bankroll_manager.db = self.db
+        self.position_manager.db = self.db
+        self.executor.db = self.db
+
         # Load cycle count from DB for stable idempotency across restarts
         status = await self.db.get_last_status()
         self.cycle_count = int(status.get('cycle_count', 0))
