@@ -52,7 +52,7 @@ class DatabaseManager:
 
     def connect(self):
         """Get an aiosqlite connection context manager."""
-        return aiosqlite.connect(self.db_path)
+        return aiosqlite.connect(self.db_path, timeout=30.0)
 
     async def _run_migrations(self, db: aiosqlite.Connection):
         """Run pending schema migrations."""
@@ -209,7 +209,7 @@ class DatabaseManager:
         snapshot_hour = datetime.utcnow().strftime("%Y-%m-%dT%H:00:00Z")
         now = datetime.utcnow().isoformat()
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self.connect() as db:
             count = 0
             for market in markets:
                 try:
@@ -240,7 +240,7 @@ class DatabaseManager:
             value: Status value (will be converted to string)
         """
         now = datetime.utcnow().isoformat() + "Z"
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self.connect() as db:
             await db.execute("""
                 INSERT OR REPLACE INTO status (key, value, updated_at_utc)
                 VALUES (?, ?, ?)
@@ -249,7 +249,7 @@ class DatabaseManager:
 
     async def get_last_status(self) -> Dict[str, Any]:
         """Get all status values as a dictionary."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute("SELECT key, value FROM status") as cursor:
                 rows = await cursor.fetchall()
@@ -268,7 +268,7 @@ class DatabaseManager:
         now = datetime.utcnow().isoformat() + "Z"
         written = 0
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self.connect() as db:
             for entry in entries:
                 try:
                     await db.execute(
@@ -360,7 +360,7 @@ class DatabaseManager:
         query += " ORDER BY analyzed_at_utc DESC LIMIT ?"
         params.append(safe_limit)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(query, tuple(params)) as cursor:
                 rows = await cursor.fetchall()

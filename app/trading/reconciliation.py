@@ -226,43 +226,43 @@ class ReconciliationManager:
         timeout_delta = timedelta(minutes=self._pending_timeout_minutes())
         now = datetime.now(timezone.utc)
 
-        async with self.db.connect() as db:
-            for row in pending:
-                coid = row['client_order_id']
-                eoid = row['external_order_id']
+        for row in pending:
+            coid = row['client_order_id']
+            eoid = row['external_order_id']
 
-                order = None
-                if coid and coid in orders_by_client_id:
-                    order = orders_by_client_id[coid]
-                elif eoid and eoid in orders_by_external_id:
-                    order = orders_by_external_id[eoid]
+            order = None
+            if coid and coid in orders_by_client_id:
+                order = orders_by_client_id[coid]
+            elif eoid and eoid in orders_by_external_id:
+                order = orders_by_external_id[eoid]
 
-                if order:
-                    status = str(order.get('status', 'unknown')).lower()
-                    total_count = float(row['quantity'] or 0.0)
+            if order:
+                status = str(order.get('status', 'unknown')).lower()
+                total_count = float(row['quantity'] or 0.0)
 
-                    new_filled = float(order.get('filled_count', 0) or 0.0)
-                    old_filled = float(row['filled_quantity'] or 0.0)
-                    old_avg_price = float(row['avg_fill_price'] or 0.0)
+                new_filled = float(order.get('filled_count', 0) or 0.0)
+                old_filled = float(row['filled_quantity'] or 0.0)
+                old_avg_price = float(row['avg_fill_price'] or 0.0)
 
-                    # Safety fallback: some order payloads omit fill_count even
-                    # when the status is already terminal.
-                    if status in ('filled', 'executed') and new_filled <= 0:
-                        new_filled = total_count
+                # Safety fallback: some order payloads omit fill_count even
+                # when the status is already terminal.
+                if status in ('filled', 'executed') and new_filled <= 0:
+                    new_filled = total_count
 
-                    delta_filled = new_filled - old_filled
-                    remaining_quantity = max(0.0, total_count - new_filled)
+                delta_filled = new_filled - old_filled
+                remaining_quantity = max(0.0, total_count - new_filled)
 
-                    # Update execution record
-                    if order.get('avg_fill_price'):
-                        avg_fill_price = float(order.get('avg_fill_price', 0)) / 100.0
-                    elif old_avg_price > 0:
-                        avg_fill_price = old_avg_price
-                    else:
-                        avg_fill_price = float(row['price'] or 0.0)
+                # Update execution record
+                if order.get('avg_fill_price'):
+                    avg_fill_price = float(order.get('avg_fill_price', 0)) / 100.0
+                elif old_avg_price > 0:
+                    avg_fill_price = old_avg_price
+                else:
+                    avg_fill_price = float(row['price'] or 0.0)
 
-                    logger.info(f"✅ Found order {coid or eoid} on exchange. Status: {status}, New Fill: {delta_filled}")
+                logger.info(f"✅ Found order {coid or eoid} on exchange. Status: {status}, New Fill: {delta_filled}")
 
+                async with self.db.connect() as db:
                     await db.execute("""
                         UPDATE executions SET
                             status = ?,
@@ -282,41 +282,43 @@ class ReconciliationManager:
                         now.isoformat().replace("+00:00", "Z"),
                         row['id'],
                     ))
+                    await db.commit()
 
-                    # If new fills detected, update PositionManager and BankrollManager
-                    if delta_filled > 0:
-                        # For bankroll, we must use the correct incremental cost basis:
-                        # (new_total * new_avg) - (old_total * old_avg)
-                        new_total_cost = new_filled * avg_fill_price
-                        old_total_cost = old_filled * old_avg_price
-                        incremental_cost = new_total_cost - old_total_cost
+                # If new fills detected, update PositionManager and BankrollManager
+                if delta_filled > 0:
+                    # For bankroll, we must use the correct incremental cost basis:
+                    # (new_total * new_avg) - (old_total * old_avg)
+                    new_total_cost = new_filled * avg_fill_price
+                    old_total_cost = old_filled * old_avg_price
+                    incremental_cost = new_total_cost - old_total_cost
 
-                        # When adding to PositionManager, we add the delta quantity.
-                        # To keep cost basis consistent, the "price" for this delta fill
-                        # should be the incremental cost divided by the delta quantity.
-                        effective_incremental_price = incremental_cost / delta_filled if delta_filled > 0 else avg_fill_price
+                    # When adding to PositionManager, we add the delta quantity.
+                    # To keep cost basis consistent, the "price" for this delta fill
+                    # should be the incremental cost divided by the delta quantity.
+                    effective_incremental_price = incremental_cost / delta_filled if delta_filled > 0 else avg_fill_price
 
-                        await self.position_manager.add_fill(
-                            market_id=row['market_id'],
-                            platform=row['platform'],
-                            action=row['action'],
-                            quantity=delta_filled,
-                            price=effective_incremental_price,
-                            external_order_id=order.get('order_id')
+                    await self.position_manager.add_fill(
+                        market_id=row['market_id'],
+                        platform=row['platform'],
+                        action=row['action'],
+                        quantity=delta_filled,
+                        price=effective_incremental_price,
+                        external_order_id=order.get('order_id')
+                    )
+
+                    if self.position_manager.bankroll_manager:
+                        await self.position_manager.bankroll_manager.adjust_balance(
+                            -incremental_cost,
+                            reason="trade_execution_reconciled",
+                            reference_id=order.get('order_id')
                         )
+            else:
+                attempts = int(row["reconcile_attempts"] or 0) + 1
+                pending_since = self._parse_iso_utc(row["executed_at_utc"] or row["created_at_utc"])
+                is_stale = (now - pending_since) >= timeout_delta
+                should_fail = attempts >= max_retries or is_stale
 
-                        if self.position_manager.bankroll_manager:
-                            await self.position_manager.bankroll_manager.adjust_balance(
-                                -incremental_cost,
-                                reason="trade_execution_reconciled",
-                                reference_id=order.get('order_id')
-                            )
-                else:
-                    attempts = int(row["reconcile_attempts"] or 0) + 1
-                    pending_since = self._parse_iso_utc(row["executed_at_utc"] or row["created_at_utc"])
-                    is_stale = (now - pending_since) >= timeout_delta
-                    should_fail = attempts >= max_retries or is_stale
-
+                async with self.db.connect() as db:
                     if should_fail:
                         logger.warning(
                             f"❌ Pending order {coid or eoid} NOT found on exchange "
@@ -348,7 +350,7 @@ class ReconciliationManager:
                             now.isoformat().replace("+00:00", "Z"),
                             row["id"],
                         ))
-            await db.commit()
+                    await db.commit()
 
     async def reconcile(self):
         """
