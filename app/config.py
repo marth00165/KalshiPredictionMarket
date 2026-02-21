@@ -54,6 +54,13 @@ class AnalysisConfig:
     nba_elo_enabled: bool = True
     nba_elo_data_path: str = "context/kaggleGameData.csv"
     nba_elo_output_path: str = "app/outputs/elo_ratings.json"
+    enable_elo_calibration: bool = True
+    calibration_bucket_size: int = 25
+    calibration_prior: int = 100
+    calibration_csv_path: str = "context/historical_elo_matchups.csv"
+    calibration_min_season: Optional[int] = None
+    calibration_recency_mode: str = "none"
+    calibration_recency_halflife_days: int = 365
     llm_adjustment_max_delta: float = 0.03
     persist_reasoning_to_db: bool = True
     use_recent_reasoning_context: bool = True
@@ -70,12 +77,26 @@ class AnalysisConfig:
             raise ValueError("nba_elo_data_path cannot be empty")
         if not str(self.nba_elo_output_path or "").strip():
             raise ValueError("nba_elo_output_path cannot be empty")
+        if self.calibration_bucket_size < 1:
+            raise ValueError("calibration_bucket_size must be >= 1")
+        if self.calibration_prior < 0:
+            raise ValueError("calibration_prior must be >= 0")
+        if not str(self.calibration_csv_path or "").strip():
+            raise ValueError("calibration_csv_path cannot be empty")
+        if self.calibration_min_season is not None and int(self.calibration_min_season) < 1:
+            raise ValueError("calibration_min_season must be >= 1 when provided")
+        recency_mode = str(self.calibration_recency_mode or "none").strip().lower()
+        if recency_mode not in {"none", "exp"}:
+            raise ValueError("calibration_recency_mode must be one of: none, exp")
+        if self.calibration_recency_halflife_days < 1:
+            raise ValueError("calibration_recency_halflife_days must be >= 1")
         if not (0 <= self.llm_adjustment_max_delta <= 0.25):
             raise ValueError("llm_adjustment_max_delta must be between 0 and 0.25")
         if self.recent_reasoning_entries < 1:
             raise ValueError("recent_reasoning_entries must be >= 1")
         if self.recent_reasoning_max_chars < 1:
             raise ValueError("recent_reasoning_max_chars must be >= 1")
+        self.calibration_recency_mode = recency_mode
         self.provider = provider_normalized
 
 
@@ -476,6 +497,13 @@ class ConfigManager:
             nba_elo_enabled=analysis_raw.get('nba_elo_enabled', True),
             nba_elo_data_path=analysis_raw.get('nba_elo_data_path', 'context/kaggleGameData.csv'),
             nba_elo_output_path=analysis_raw.get('nba_elo_output_path', 'app/outputs/elo_ratings.json'),
+            enable_elo_calibration=analysis_raw.get('enable_elo_calibration', True),
+            calibration_bucket_size=analysis_raw.get('calibration_bucket_size', 25),
+            calibration_prior=analysis_raw.get('calibration_prior', 100),
+            calibration_csv_path=analysis_raw.get('calibration_csv_path', 'context/historical_elo_matchups.csv'),
+            calibration_min_season=analysis_raw.get('calibration_min_season'),
+            calibration_recency_mode=analysis_raw.get('calibration_recency_mode', 'none'),
+            calibration_recency_halflife_days=analysis_raw.get('calibration_recency_halflife_days', 365),
             llm_adjustment_max_delta=analysis_raw.get('llm_adjustment_max_delta', 0.03),
             persist_reasoning_to_db=analysis_raw.get('persist_reasoning_to_db', True),
             use_recent_reasoning_context=analysis_raw.get('use_recent_reasoning_context', True),
@@ -805,6 +833,15 @@ class ConfigManager:
             "llm_elo_delta_bounds=[-75,+75]"
         )
         logger.info(
+            "   Elo calibration: "
+            f"{'✅ enabled' if self.analysis.enable_elo_calibration else '❌ disabled'} | "
+            f"csv={self.analysis.calibration_csv_path} | "
+            f"bucket={self.analysis.calibration_bucket_size} | "
+            f"prior={self.analysis.calibration_prior} | "
+            f"min_season={self.analysis.calibration_min_season} | "
+            f"recency={self.analysis.calibration_recency_mode}"
+        )
+        logger.info(
             "   DB reasoning memory: "
             f"{'✅ persist' if self.analysis.persist_reasoning_to_db else '❌ off'}, "
             f"{'✅ prompt context' if self.analysis.use_recent_reasoning_context else '❌ prompt off'}"
@@ -959,6 +996,13 @@ class ConfigManager:
                 'nba_elo_enabled': self.analysis.nba_elo_enabled,
                 'nba_elo_data_path': self.analysis.nba_elo_data_path,
                 'nba_elo_output_path': self.analysis.nba_elo_output_path,
+                'enable_elo_calibration': self.analysis.enable_elo_calibration,
+                'calibration_bucket_size': self.analysis.calibration_bucket_size,
+                'calibration_prior': self.analysis.calibration_prior,
+                'calibration_csv_path': self.analysis.calibration_csv_path,
+                'calibration_min_season': self.analysis.calibration_min_season,
+                'calibration_recency_mode': self.analysis.calibration_recency_mode,
+                'calibration_recency_halflife_days': self.analysis.calibration_recency_halflife_days,
                 'llm_adjustment_max_delta': self.analysis.llm_adjustment_max_delta,
                 'persist_reasoning_to_db': self.analysis.persist_reasoning_to_db,
                 'use_recent_reasoning_context': self.analysis.use_recent_reasoning_context,

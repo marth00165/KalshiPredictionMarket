@@ -1,6 +1,7 @@
 {
-  "last_updated": "2026-02-12",
-  "build_completed_at_utc": "2026-02-18T13:28:26.902335Z",
+  "last_updated": "2026-02-20T23:34:16.190222Z",
+  "last_game_date": "2026-02-12",
+  "build_completed_at_utc": "2026-02-20T23:34:16.190222Z",
   "games_processed": 70897,
   "params": {
     "initial_rating": 1300.0,

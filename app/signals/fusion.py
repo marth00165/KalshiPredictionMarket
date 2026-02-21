@@ -583,10 +583,12 @@ class SignalFusionService:
         estimate.feature_recommendation = recommendation
         estimate.feature_regime = feature.regime
         estimate.feature_provider = feature.provider
-        estimate.fusion_metadata = {
+        existing_metadata = dict(estimate.fusion_metadata or {})
+        existing_metadata.update({
             "feature": feature.as_report_dict(),
             "applied_rules": notes,
             "market_id": estimate.market_id,
             "market_ticker": market.market_id if market else None,
-        }
+        })
+        estimate.fusion_metadata = existing_metadata
         estimate.fusion_tags = list({*estimate.fusion_tags, *feature.tags})

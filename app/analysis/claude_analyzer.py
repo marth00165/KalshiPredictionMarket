@@ -5,6 +5,13 @@ from typing import Dict, List, Optional
 import aiohttp
 
 from app.analytics import EloEngine
+from app.analytics.elo_calibration import (
+    EloCalibrationConfig,
+    blend_probabilities,
+    build_calibration_table,
+    load_matchups_csv,
+    lookup_empirical_rate,
+)
 from app.config import ConfigManager
 from app.models import MarketData, FairValueEstimate
 from app.api_clients.base_client import BaseAPIClient
@@ -50,6 +57,20 @@ class ClaudeAnalyzer:
                 data_path=str(getattr(self.config.analysis, "nba_elo_data_path", "context/kaggleGameData.csv")),
                 output_path=str(getattr(self.config.analysis, "nba_elo_output_path", "app/outputs/elo_ratings.json")),
             )
+        self._elo_calibration_enabled = bool(
+            self._elo_enabled and getattr(self.config.analysis, "enable_elo_calibration", True)
+        )
+        self._elo_calibration_table = None
+        self._elo_calibration_config = EloCalibrationConfig(
+            bucket_size=int(getattr(self.config.analysis, "calibration_bucket_size", 25)),
+            prior=int(getattr(self.config.analysis, "calibration_prior", 100)),
+            key_type="elo_diff",
+            min_season=getattr(self.config.analysis, "calibration_min_season", None),
+            recency_mode=str(getattr(self.config.analysis, "calibration_recency_mode", "none")),
+            recency_halflife_days=int(
+                getattr(self.config.analysis, "calibration_recency_halflife_days", 365)
+            ),
+        )
 
     def set_runtime_context_block(self, context_text: str) -> None:
         """Set optional runtime context block (e.g., prior analysis blurbs)."""
@@ -77,6 +98,9 @@ class ClaudeAnalyzer:
             except Exception as e:
                 logger.warning("NBA Elo initialization failed; disabling Elo path for this run: %s", e)
                 self._elo_enabled = False
+
+        if self._elo_enabled and self._elo_calibration_enabled and self._elo_calibration_table is None:
+            await asyncio.to_thread(self._ensure_elo_calibration_loaded)
 
         async with self.client:
             tasks = [
@@ -135,7 +159,8 @@ class ClaudeAnalyzer:
                 )
                 if estimate is None:
                     estimate = self._build_elo_fallback_estimate(market, nba_elo_context, "llm_parse_failed")
-                else:
+                if estimate is not None:
+                    self._apply_elo_calibration(market, estimate, nba_elo_context)
                     self._log_elo_decision_fields(market, estimate)
             else:
                 estimate = ClaudeResponseParser.parse_fair_value_estimate(
@@ -156,7 +181,10 @@ class ClaudeAnalyzer:
         except Exception as e:
             logger.error(f"Error analyzing market {market.market_id}: {e}")
             if nba_elo_context:
-                return self._build_elo_fallback_estimate(market, nba_elo_context, f"llm_api_error: {e}")
+                estimate = self._build_elo_fallback_estimate(market, nba_elo_context, f"llm_api_error: {e}")
+                self._apply_elo_calibration(market, estimate, nba_elo_context)
+                self._log_elo_decision_fields(market, estimate)
+                return estimate
             return None
 
     def _build_context_section(self) -> str:
@@ -297,6 +325,95 @@ Return ONLY valid JSON."""
             logger.debug("NBA Elo context unavailable for %s: %s", market.market_id, e)
             return None
 
+    def _ensure_elo_calibration_loaded(self) -> None:
+        if not self._elo_calibration_enabled or self._elo_calibration_table is not None:
+            return
+
+        calibration_path = str(
+            getattr(self.config.analysis, "calibration_csv_path", "context/historical_elo_matchups.csv")
+        )
+        try:
+            raw_df = load_matchups_csv(calibration_path)
+            self._elo_calibration_table = build_calibration_table(
+                raw_df,
+                self._elo_calibration_config,
+            )
+            logger.info(
+                "Loaded Elo calibration table from %s (%d buckets)",
+                calibration_path,
+                0 if self._elo_calibration_table is None else len(self._elo_calibration_table),
+            )
+        except Exception as e:
+            self._elo_calibration_enabled = False
+            logger.warning("Failed to load Elo calibration table from %s: %s", calibration_path, e)
+
+    def _apply_elo_calibration(
+        self,
+        market: MarketData,
+        estimate: FairValueEstimate,
+        elo_ctx: Dict[str, object],
+    ) -> None:
+        if not self._elo_calibration_enabled:
+            return
+        if self._elo_calibration_table is None:
+            self._ensure_elo_calibration_loaded()
+        if self._elo_calibration_table is None:
+            return
+
+        metadata = dict(estimate.fusion_metadata or {})
+        elo_meta = metadata.get("elo_adjustment")
+        if not isinstance(elo_meta, dict):
+            return
+
+        yes_team = str(elo_ctx.get("yes_team", "")).strip().upper()
+        home_team = str(elo_ctx.get("home_team", "")).strip().upper()
+        away_team = str(elo_ctx.get("away_team", "")).strip().upper()
+        if yes_team not in {home_team, away_team}:
+            return
+
+        is_home = 1 if yes_team == home_team else 0
+        home_elo = float(elo_ctx.get("home_elo", 0.0))
+        away_elo = float(elo_ctx.get("away_elo", 0.0))
+        yes_base_elo = home_elo if is_home else away_elo
+        opponent_base_elo = away_elo if is_home else home_elo
+        applied_delta = float(elo_meta.get("applied_elo_delta", 0.0))
+        yes_adjusted_elo = yes_base_elo + applied_delta
+        elo_difference = yes_adjusted_elo - opponent_base_elo
+
+        p_elo = float(estimate.estimated_probability)
+        p_emp, n, bucket_key = lookup_empirical_rate(
+            self._elo_calibration_table,
+            is_home=is_home,
+            elo_difference=elo_difference,
+            bucket_size=int(self._elo_calibration_config.bucket_size),
+        )
+        p_final, w = blend_probabilities(
+            p_elo=p_elo,
+            p_emp=p_emp,
+            n=n,
+            prior=float(self._elo_calibration_config.prior),
+        )
+
+        estimate.estimated_probability = float(p_final)
+        estimate.edge = float(p_final) - float(market.yes_price)
+
+        elo_meta["p_elo"] = float(p_elo)
+        elo_meta["p_emp"] = (None if p_emp is None else float(p_emp))
+        elo_meta["p_final"] = float(p_final)
+        elo_meta["calibration_bucket"] = bucket_key
+        elo_meta["calibration_n"] = float(n)
+        elo_meta["calibration_weight_w"] = float(w)
+        elo_meta["calibration_min_season"] = self._elo_calibration_config.min_season
+        elo_meta["calibration_recency_mode"] = self._elo_calibration_config.recency_mode
+        elo_meta["calibration_recency_halflife_days"] = (
+            self._elo_calibration_config.recency_halflife_days
+        )
+        elo_meta["final_probability"] = float(p_final)
+        elo_meta["edge"] = float(estimate.edge)
+
+        metadata["elo_adjustment"] = elo_meta
+        estimate.fusion_metadata = metadata
+
     @staticmethod
     def _build_elo_fallback_estimate(
         market: MarketData,
@@ -349,9 +466,14 @@ Return ONLY valid JSON."""
         if not isinstance(meta, dict):
             return
         try:
+            p_elo = float(meta.get("p_elo", meta.get("final_probability", estimate.estimated_probability)))
+            p_final = float(meta.get("p_final", meta.get("final_probability", estimate.estimated_probability)))
+            p_emp_raw = meta.get("p_emp")
+            p_emp = "na" if p_emp_raw is None else f"{float(p_emp_raw):.4f}"
             logger.info(
                 "ELO_DECISION | team=%s | opponent=%s | elo_base=%.2f | elo_delta=%+.0f | "
-                "elo_adjusted=%.2f | probability_base=%.4f | probability_final=%.4f | "
+                "elo_adjusted=%.2f | probability_base=%.4f | probability_p_elo=%.4f | "
+                "probability_final=%.4f | p_emp=%s | cal_n=%.1f | cal_w=%.4f | "
                 "market_probability=%.4f | edge=%+.4f",
                 str(meta.get("yes_team") or ""),
                 str(meta.get("away_team") if str(meta.get("yes_team")) == str(meta.get("home_team")) else meta.get("home_team")),
@@ -359,7 +481,11 @@ Return ONLY valid JSON."""
                 float(meta.get("applied_elo_delta", 0.0)),
                 float(meta.get("yes_adjusted_elo", 0.0)),
                 float(meta.get("base_probability", 0.0)),
-                float(meta.get("final_probability", estimate.estimated_probability)),
+                p_elo,
+                p_final,
+                p_emp,
+                float(meta.get("calibration_n", 0.0)),
+                float(meta.get("calibration_weight_w", 0.0)),
                 float(meta.get("market_probability", market.yes_price)),
                 float(meta.get("edge", estimate.edge)),
             )
