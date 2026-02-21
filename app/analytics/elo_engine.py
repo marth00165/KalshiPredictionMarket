@@ -373,7 +373,8 @@ class EloEngine:
             "game_type": ("gameType", "GAME_TYPE"),
         }
 
-        df = pd.read_csv(self.data_path)  # type: ignore[union-attr]
+        # Disable chunked dtype inference to avoid noisy mixed-type warnings on Kaggle exports.
+        df = pd.read_csv(self.data_path, low_memory=False)  # type: ignore[union-attr]
         if df.empty:
             return []
 
@@ -400,37 +401,56 @@ class EloEngine:
         if col_game_type:
             df = df[df[col_game_type].isin(self.include_game_types)]
 
+        # Avoid leading-underscore temporary column names here because pandas
+        # may remap those names in namedtuple iteration (e.g. "_22"), which can
+        # break downstream key lookups.
+        norm_date = "game_date_norm"
+        norm_home = "home_team_norm"
+        norm_away = "away_team_norm"
+        norm_home_score = "home_score_norm"
+        norm_away_score = "away_score_norm"
+
         df = df.assign(
-            _game_date=pd.to_datetime(df[col_date], errors="coerce"),
-            _home_team=df[col_home].map(self._normalize_team_code),
-            _away_team=df[col_away].map(self._normalize_team_code),
-            _home_score=pd.to_numeric(df[col_home_score], errors="coerce"),
-            _away_score=pd.to_numeric(df[col_away_score], errors="coerce"),
+            **{
+                norm_date: pd.to_datetime(df[col_date], errors="coerce"),
+                norm_home: df[col_home].map(self._normalize_team_code),
+                norm_away: df[col_away].map(self._normalize_team_code),
+                norm_home_score: pd.to_numeric(df[col_home_score], errors="coerce"),
+                norm_away_score: pd.to_numeric(df[col_away_score], errors="coerce"),
+            }
         )
 
-        df = df.dropna(subset=["_game_date", "_home_team", "_away_team", "_home_score", "_away_score"])
+        df = df.dropna(subset=[norm_date, norm_home, norm_away, norm_home_score, norm_away_score])
         if as_of_date:
             cutoff = pd.to_datetime(as_of_date, errors="coerce")
             if pd.notna(cutoff):
-                df = df[df["_game_date"] < cutoff]
+                df = df[df[norm_date] < cutoff]
 
-        sort_cols = ["_game_date"]
+        sort_cols = [norm_date]
         if col_game_id:
             sort_cols.append(col_game_id)
         df = df.sort_values(sort_cols, kind="mergesort")
 
+        selected_cols = [norm_date, norm_home, norm_away, norm_home_score, norm_away_score]
+        if col_game_id:
+            selected_cols.append(col_game_id)
+
         records: List[GameRecord] = []
-        for row in df.itertuples(index=False):
-            row_dict = row._asdict()
-            game_id = str(row_dict.get(col_game_id, "")) if col_game_id else ""
+        for row in df[selected_cols].itertuples(index=False, name=None):
+            if col_game_id:
+                game_date, home_team, away_team, home_score, away_score, game_id_raw = row
+                game_id = str(game_id_raw)
+            else:
+                game_date, home_team, away_team, home_score, away_score = row
+                game_id = ""
             records.append(
                 GameRecord(
-                    game_date=row_dict["_game_date"].to_pydatetime(),
+                    game_date=game_date.to_pydatetime(),
                     game_id=game_id,
-                    home_team=str(row_dict["_home_team"]),
-                    away_team=str(row_dict["_away_team"]),
-                    home_score=int(row_dict["_home_score"]),
-                    away_score=int(row_dict["_away_score"]),
+                    home_team=str(home_team),
+                    away_team=str(away_team),
+                    home_score=int(home_score),
+                    away_score=int(away_score),
                 )
             )
         return records

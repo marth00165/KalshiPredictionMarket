@@ -147,6 +147,11 @@ class ClaudeResponseParser:
           "elo_delta": <integer in [-75, +75]>,
           "confidence": <float 0-1 or 0-100>,
           "reason": "...",
+          "injury_report": {            // optional but recommended
+            "status": "confirmed|questionable|none|unknown",
+            "impact": "favors_yes|favors_no|neutral|unknown",
+            "notes": "..."
+          },
           "key_factors": [...],      // optional
           "data_sources": [...]      // optional
         }
@@ -167,7 +172,8 @@ class ClaudeResponseParser:
                 logger.warning("Ignoring Elo adjustment due to missing required fields")
                 return None
 
-            delta = validate_llm_elo_delta(data.get("elo_delta"))
+            raw_delta = data.get("elo_delta")
+            delta = validate_llm_elo_delta(raw_delta)
 
             confidence = float(data.get("confidence", 0.0))
             if confidence > 1:
@@ -202,6 +208,12 @@ class ClaudeResponseParser:
                 key_factors = []
             if not isinstance(data_sources, list):
                 data_sources = []
+            injury_report = data.get("injury_report", {})
+            if not isinstance(injury_report, dict):
+                injury_report = {}
+            injury_status = str(injury_report.get("status", "unknown") or "unknown").strip().lower()
+            injury_impact = str(injury_report.get("impact", "unknown") or "unknown").strip().lower()
+            injury_notes = str(injury_report.get("notes", "") or "").strip()
 
             reasoning = reason
             if reasoning:
@@ -235,6 +247,19 @@ class ClaudeResponseParser:
                         "final_probability": float(final_probability),
                         "market_probability": float(market_price),
                         "edge": float(edge),
+                        "llm_suggestion": {
+                            "raw_elo_delta": raw_delta,
+                            "applied_elo_delta": float(delta),
+                            "confidence": float(confidence),
+                            "reason": reason,
+                            "key_factors": key_factors,
+                            "data_sources": data_sources,
+                            "injury_report": {
+                                "status": injury_status,
+                                "impact": injury_impact,
+                                "notes": injury_notes,
+                            },
+                        },
                     }
                 },
             )

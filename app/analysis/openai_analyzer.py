@@ -181,6 +181,8 @@ IMPORTANT:
 - Do NOT generate a probability from scratch.
 - You may only suggest an Elo adjustment for the YES team.
 - Keep elo_delta in [-{max_elo_delta}, +{max_elo_delta}] unless there is concrete, high-confidence evidence.
+- Focus adjustment logic on injury reports, confirmed absences, rest/back-to-back, and lineup changes.
+- If no concrete injury/rest evidence exists, set elo_delta to 0.
 
 MARKET DETAILS:
 Title: {market.title}
@@ -204,6 +206,11 @@ Respond in JSON format:
   "elo_delta": <integer in [-{max_elo_delta}, +{max_elo_delta}]>,
   "confidence": <float 0-1 or 0-100>,
   "reason": "<detailed explanation>",
+  "injury_report": {{
+    "status": "confirmed|questionable|none|unknown",
+    "impact": "favors_yes|favors_no|neutral|unknown",
+    "notes": "<short injury/rest summary>"
+  }},
   "key_factors": ["factor1", "factor2", ...],
   "data_sources": ["source1", "source2", ...]
 }}
@@ -313,6 +320,23 @@ Return ONLY valid JSON."""
                 float(meta.get("market_probability", market.yes_price)),
                 float(meta.get("edge", estimate.edge)),
             )
+            suggestion = meta.get("llm_suggestion", {})
+            if isinstance(suggestion, dict):
+                injury = suggestion.get("injury_report", {})
+                if not isinstance(injury, dict):
+                    injury = {}
+                logger.info(
+                    "ELO_SUGGESTION | market_id=%s | raw_delta=%s | applied_delta=%+.0f | confidence=%.2f | "
+                    "injury_status=%s | injury_impact=%s | factors=%s | sources=%s",
+                    market.market_id,
+                    str(suggestion.get("raw_elo_delta")),
+                    float(suggestion.get("applied_elo_delta", meta.get("applied_elo_delta", 0.0))),
+                    float(suggestion.get("confidence", estimate.confidence_level)),
+                    str(injury.get("status", "unknown")),
+                    str(injury.get("impact", "unknown")),
+                    ",".join(str(x) for x in (suggestion.get("key_factors") or [])[:5]),
+                    ",".join(str(x) for x in (suggestion.get("data_sources") or [])[:5]),
+                )
         except Exception:
             logger.debug("Failed logging Elo decision metadata for %s", market.market_id)
 

@@ -94,6 +94,44 @@ def test_parse_elo_adjusted_estimate_clamps_delta():
     assert 0.0 < est.estimated_probability < 0.5
     assert abs(est.edge - (est.estimated_probability - 0.40)) < 1e-9
     assert est.confidence_level == 0.85
+    meta = (est.fusion_metadata or {}).get("elo_adjustment", {})
+    suggestion = meta.get("llm_suggestion", {})
+    assert suggestion.get("applied_elo_delta") == 75.0
+    assert suggestion.get("raw_elo_delta") == 300
+    assert suggestion.get("injury_report", {}).get("status") == "unknown"
+
+
+def test_parse_elo_adjusted_estimate_captures_injury_report_fields():
+    text = json.dumps(
+        {
+            "elo_delta": -20,
+            "confidence": 0.77,
+            "reason": "Starting guard out, downgrade YES side.",
+            "injury_report": {
+                "status": "confirmed",
+                "impact": "favors_no",
+                "notes": "Starting guard ruled out pre-game.",
+            },
+            "key_factors": ["injury report", "lineup downgrade"],
+            "data_sources": ["team injury report"],
+        }
+    )
+    est = ClaudeResponseParser.parse_elo_adjusted_estimate(
+        response_text=text,
+        market_id="KXNBAGAME-26FEB19BKNCLE-BKN",
+        market_price=0.40,
+        yes_team="BKN",
+        home_team="CLE",
+        away_team="BKN",
+        home_elo=1650.0,
+        away_elo=1450.0,
+        home_court_bonus=100.0,
+    )
+    assert est is not None
+    suggestion = ((est.fusion_metadata or {}).get("elo_adjustment") or {}).get("llm_suggestion") or {}
+    assert suggestion.get("applied_elo_delta") == -20.0
+    assert suggestion.get("injury_report", {}).get("status") == "confirmed"
+    assert suggestion.get("injury_report", {}).get("impact") == "favors_no"
 
 
 def test_parse_elo_adjusted_estimate_missing_required_field_returns_none():

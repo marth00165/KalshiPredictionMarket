@@ -92,6 +92,19 @@ This mode supports:
   - Dry-run: `kalshi_dryrun.sqlite`
   - Live: `kalshi.sqlite`
 
+### Elo Adjustment Observability
+
+When NBA Elo mode is enabled, logs now include:
+
+- `ELO_DECISION`: final Elo-derived probability and edge
+- `ELO_SUGGESTION`: raw LLM Elo-delta suggestion + injury/rest metadata
+
+Dry-run analysis JSON rows also include:
+
+- `elo_adjustment`
+- `llm_suggestion`
+- `injury_report`
+
 ## V1 Safeguards Implemented
 
 - Duplicate market/event guards (no overlapping same-event positions in cycle).
@@ -148,6 +161,7 @@ python -m app --mode trade
 python -m app --discover-series --category Sports
 python -m app --backup
 python scripts/kalshi_user_details.py
+python scripts/walkback_nba_matchup_analysis.py --output reports/walkback_analysis/latest.json
 ```
 
 ## Context for LLM

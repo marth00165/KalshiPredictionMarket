@@ -629,7 +629,9 @@ class AdvancedTradingBot:
         # 3. Daily Loss Limit (true equity in live mode)
         current_equity = await self._compute_current_equity()
 
-        starting_equity = await self.bankroll_manager.get_daily_starting_balance()
+        starting_equity = await self.bankroll_manager.get_daily_starting_balance(
+            dry_run_session_anchored=bool(self.config.is_dry_run)
+        )
 
         loss_limit_fraction = self.config.risk.daily_loss_limit_fraction
         max_allowed_loss = starting_equity * loss_limit_fraction
@@ -899,6 +901,15 @@ class AdvancedTradingBot:
             yes_price = (market.get("prices") or {}).get("yes")
             size = signal.get("position_size")
             reasoning = signal.get("reasoning") or analysis.get("reasoning") or "-"
+            elo_adjustment = analysis.get("elo_adjustment") if isinstance(analysis, dict) else None
+            if not isinstance(elo_adjustment, dict):
+                elo_adjustment = {}
+            llm_suggestion = elo_adjustment.get("llm_suggestion")
+            if not isinstance(llm_suggestion, dict):
+                llm_suggestion = {}
+            injury_report = llm_suggestion.get("injury_report")
+            if not isinstance(injury_report, dict):
+                injury_report = {}
 
             analysis_rows.append({
                 "market_id": market.get("market_id", ""),
@@ -911,6 +922,9 @@ class AdvancedTradingBot:
                 "signal": signal.get("action", "-"),
                 "size": size,
                 "reasoning": reasoning,
+                "elo_adjustment": elo_adjustment,
+                "llm_suggestion": llm_suggestion,
+                "injury_report": injury_report,
             })
 
         if not analysis_rows:

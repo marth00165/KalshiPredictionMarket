@@ -125,11 +125,27 @@ class BankrollManager:
         logger.info(f"💰 Bankroll adjusted: ${old_balance:,.2f} -> ${self._current_balance:,.2f} "
                     f"(change: ${amount:+,.2f}, reason: {reason})")
 
-    async def get_daily_starting_balance(self) -> float:
-        """Get the bankroll balance at the start of the current UTC day."""
+    async def get_daily_starting_balance(self, dry_run_session_anchored: bool = False) -> float:
+        """
+        Get the bankroll balance anchor used by daily loss guards.
+
+        Args:
+            dry_run_session_anchored:
+                When True, prefer the latest dry-run session reset balance so
+                old paper-trading losses do not leak into a fresh dry-run start.
+        """
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
 
         async with self.db.connect() as db:
+            if dry_run_session_anchored:
+                async with db.execute(
+                    "SELECT balance FROM bankroll_history WHERE reason = ? ORDER BY id DESC LIMIT 1",
+                    ("dry_run_session_reset",),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        return float(row[0])
+
             # Try to find the last balance before today began
             async with db.execute(
                 "SELECT balance FROM bankroll_history WHERE timestamp_utc < ? ORDER BY id DESC LIMIT 1",
