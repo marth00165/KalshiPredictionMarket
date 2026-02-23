@@ -8,9 +8,9 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     import pandas as pd  # type: ignore
@@ -70,6 +70,7 @@ ABBR_ALIASES: Dict[str, str] = {
 @dataclass(frozen=True)
 class GameRecord:
     game_date: datetime
+    season: int
     game_id: str
     home_team: str
     away_team: str
@@ -94,12 +95,18 @@ class EloEngine:
     - fast full rebuilds for ~100k rows
     """
 
-    DEFAULT_INITIAL_RATING = 1300.0
+    DEFAULT_INITIAL_RATING = 1500.0
     DEFAULT_HOME_ADVANTAGE = 100.0
     DEFAULT_K_FACTOR = 20.0
+    DEFAULT_REGRESSION_FACTOR = 0.75
+    DEFAULT_USE_MOV_MULTIPLIER = True
+    DEFAULT_ELO_ROUND_DECIMALS = 1
+    DEFAULT_MIN_SEASON = 2004
     DEFAULT_MAX_AGE_HOURS = 24
     DEFAULT_DATA_PATH = "context/kaggleGameData.csv"
     DEFAULT_OUTPUT_PATH = "app/outputs/elo_ratings.json"
+    DEFAULT_SEASON_RATINGS_OUTPUT_PATH = "app/outputs/elo_ratings_by_season.csv"
+    MODEL_VERSION = "seasonal_mov_v2"
 
     _KALSHI_NBA_SERIES = "KXNBAGAME"
 
@@ -110,6 +117,12 @@ class EloEngine:
         initial_rating: float = DEFAULT_INITIAL_RATING,
         home_advantage: float = DEFAULT_HOME_ADVANTAGE,
         k_factor: float = DEFAULT_K_FACTOR,
+        regression_factor: float = DEFAULT_REGRESSION_FACTOR,
+        use_mov_multiplier: bool = DEFAULT_USE_MOV_MULTIPLIER,
+        elo_round_decimals: int = DEFAULT_ELO_ROUND_DECIMALS,
+        min_season: Optional[int] = DEFAULT_MIN_SEASON,
+        allowed_seasons: Optional[Iterable[int]] = None,
+        season_ratings_output_path: Optional[str] = DEFAULT_SEASON_RATINGS_OUTPUT_PATH,
         max_age_hours: int = DEFAULT_MAX_AGE_HOURS,
         include_game_types: Optional[Iterable[str]] = None,
     ) -> None:
@@ -118,6 +131,16 @@ class EloEngine:
         self.initial_rating = float(initial_rating)
         self.home_advantage = float(home_advantage)
         self.k_factor = float(k_factor)
+        self.regression_factor = float(max(0.0, min(1.0, regression_factor)))
+        self.use_mov_multiplier = bool(use_mov_multiplier)
+        self.elo_round_decimals = int(elo_round_decimals)
+        self.min_season = None if min_season is None else int(min_season)
+        self.allowed_seasons = self._normalize_allowed_seasons(allowed_seasons)
+        self.season_ratings_output_path = (
+            Path(season_ratings_output_path).expanduser()
+            if isinstance(season_ratings_output_path, str) and season_ratings_output_path.strip()
+            else None
+        )
         self.max_age_hours = max(1, int(max_age_hours))
         self.include_game_types = set(include_game_types or {
             "Regular Season",
@@ -130,6 +153,9 @@ class EloEngine:
         self.ratings: Dict[str, float] = {}
         self.games_processed: int = 0
         self.last_game_date: Optional[datetime] = None
+        self.last_season: Optional[int] = None
+        self.season_final_ratings: Dict[int, Dict[str, float]] = {}
+        self._season_teams_seen: Dict[int, Set[str]] = {}
 
     def load_games(self, as_of_date: Optional[str] = None) -> List[GameRecord]:
         """
@@ -152,8 +178,17 @@ class EloEngine:
         Apply Elo updates in chronological order.
         """
         for game in games:
+            if self.last_season is None:
+                self.last_season = int(game.season)
+            elif int(game.season) != int(self.last_season):
+                self._finalize_season(int(self.last_season))
+                self._apply_offseason_regression()
+                self.last_season = int(game.season)
+
             home = game.home_team
             away = game.away_team
+            season = int(game.season)
+            self._season_teams_seen.setdefault(season, set()).update({home, away})
             if home not in self.ratings:
                 self.ratings[home] = float(self.initial_rating)
             if away not in self.ratings:
@@ -168,13 +203,62 @@ class EloEngine:
             home_win = 1.0 if game.home_score > game.away_score else 0.0
             away_win = 1.0 - home_win
 
-            new_home = home_elo + self.k_factor * (home_win - expected_home)
-            new_away = away_elo + self.k_factor * (away_win - expected_away)
+            effective_k = self._compute_effective_k(
+                home_elo=home_elo,
+                away_elo=away_elo,
+                home_score=int(game.home_score),
+                away_score=int(game.away_score),
+            )
+            new_home = home_elo + effective_k * (home_win - expected_home)
+            new_away = away_elo + effective_k * (away_win - expected_away)
 
-            self.ratings[home] = float(new_home)
-            self.ratings[away] = float(new_away)
+            self.ratings[home] = self._round_rating(float(new_home))
+            self.ratings[away] = self._round_rating(float(new_away))
             self.games_processed += 1
             self.last_game_date = game.game_date
+
+        if self.last_season is not None:
+            self._finalize_season(int(self.last_season))
+
+    def _apply_offseason_regression(self) -> None:
+        """Regress all existing franchise ratings toward initial Elo each new season."""
+        if not self.ratings:
+            return
+        carry = float(self.regression_factor)
+        reset = 1.0 - carry
+        for team, elo in list(self.ratings.items()):
+            regressed = (carry * float(elo)) + (reset * float(self.initial_rating))
+            self.ratings[team] = self._round_rating(regressed)
+
+    def _finalize_season(self, season: int) -> None:
+        teams = self._season_teams_seen.get(int(season), set())
+        if not teams:
+            return
+        self.season_final_ratings[int(season)] = {
+            team: self._round_rating(self.ratings.get(team, self.initial_rating))
+            for team in sorted(teams)
+        }
+
+    def _compute_effective_k(
+        self,
+        *,
+        home_elo: float,
+        away_elo: float,
+        home_score: int,
+        away_score: int,
+    ) -> float:
+        if not self.use_mov_multiplier:
+            return float(self.k_factor)
+        mov = abs(int(home_score) - int(away_score))
+        elo_diff = abs(float(home_elo) - float(away_elo))
+        mov_multiplier = ((mov + 3.0) ** 0.8) / (7.5 + (0.006 * elo_diff))
+        return float(self.k_factor) * float(mov_multiplier)
+
+    def _round_rating(self, value: float) -> float:
+        decimals = int(self.elo_round_decimals)
+        if decimals < 0:
+            return float(value)
+        return float(round(float(value), decimals))
 
     def export_ratings(self) -> None:
         """
@@ -183,6 +267,7 @@ class EloEngine:
         now_utc = datetime.now(timezone.utc)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "model_version": self.MODEL_VERSION,
             "last_updated": now_utc.isoformat().replace("+00:00", "Z"),
             "last_game_date": (self.last_game_date.strftime("%Y-%m-%d") if self.last_game_date else None),
             "build_completed_at_utc": now_utc.isoformat().replace("+00:00", "Z"),
@@ -191,14 +276,32 @@ class EloEngine:
                 "initial_rating": self.initial_rating,
                 "home_advantage": self.home_advantage,
                 "k_factor": self.k_factor,
+                "regression_factor": self.regression_factor,
+                "use_mov_multiplier": self.use_mov_multiplier,
+                "elo_round_decimals": self.elo_round_decimals,
+                "min_season": self.min_season,
+                "allowed_seasons": sorted(self.allowed_seasons) if self.allowed_seasons else None,
             },
             "ratings": {
-                team: round(value, 6)
+                team: self._round_rating(value)
                 for team, value in sorted(self.ratings.items())
             },
         }
         with self.output_path.open("w") as f:
             json.dump(payload, f, indent=2)
+
+    def export_season_ratings(self) -> None:
+        """Persist per-season final Elo ratings for teams that played in each season."""
+        if not self.season_ratings_output_path:
+            return
+        self.season_ratings_output_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.season_ratings_output_path.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["season", "team", "elo_final"])
+            for season in sorted(self.season_final_ratings):
+                team_map = self.season_final_ratings.get(season, {})
+                for team in sorted(team_map):
+                    writer.writerow([int(season), str(team), self._round_rating(team_map[team])])
 
     def rebuild(self, as_of_date: Optional[str] = None) -> Dict[str, float]:
         """
@@ -207,12 +310,16 @@ class EloEngine:
         games = self.load_games(as_of_date=as_of_date)
         self.games_processed = 0
         self.last_game_date = None
+        self.last_season = None
+        self.season_final_ratings = {}
+        self._season_teams_seen = {}
         teams = set()
         for g in games:
             teams.add(g.home_team)
             teams.add(g.away_team)
         self.initialize_ratings(teams)
         self.update_ratings(games)
+        self.export_season_ratings()
         self.export_ratings()
         return dict(self.ratings)
 
@@ -333,6 +440,8 @@ class EloEngine:
     def _output_is_stale(self) -> bool:
         if not self.output_path.exists():
             return True
+        if self.season_ratings_output_path is not None and not self.season_ratings_output_path.exists():
+            return True
         if not self.data_path.exists():
             data_is_newer = False
         else:
@@ -343,24 +452,38 @@ class EloEngine:
         try:
             with self.output_path.open("r") as f:
                 payload = json.load(f)
-            last_updated = self._parse_last_updated_utc(payload.get("last_updated"))
-            if last_updated is None:
-                return True
-            return datetime.now(timezone.utc) - last_updated > timedelta(hours=self.max_age_hours)
+            return not self._payload_matches_runtime_params(payload)
         except Exception:
             return True
 
-    @staticmethod
-    def _parse_last_updated_utc(value: object) -> Optional[datetime]:
-        if not isinstance(value, str) or not value.strip():
-            return None
-        raw = value.strip()
+    def _payload_matches_runtime_params(self, payload: object) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if str(payload.get("model_version") or "") != self.MODEL_VERSION:
+            return False
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            return False
         try:
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
-                return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+            return (
+                abs(float(params.get("initial_rating")) - float(self.initial_rating)) < 1e-9
+                and abs(float(params.get("home_advantage")) - float(self.home_advantage)) < 1e-9
+                and abs(float(params.get("k_factor")) - float(self.k_factor)) < 1e-9
+                and abs(float(params.get("regression_factor")) - float(self.regression_factor)) < 1e-9
+                and bool(params.get("use_mov_multiplier")) == bool(self.use_mov_multiplier)
+                and int(params.get("elo_round_decimals")) == int(self.elo_round_decimals)
+                and (
+                    (params.get("min_season") is None and self.min_season is None)
+                    or int(params.get("min_season")) == int(self.min_season)
+                )
+                and self._payload_allowed_seasons_match(params.get("allowed_seasons"))
+            )
         except Exception:
-            return None
+            return False
+
+    def _payload_allowed_seasons_match(self, value: object) -> bool:
+        payload_seasons = self._normalize_allowed_seasons(value if isinstance(value, list) else None)
+        return payload_seasons == self.allowed_seasons
 
     def _load_games_with_pandas(self, as_of_date: Optional[str]) -> List[GameRecord]:
         required = {
@@ -369,6 +492,7 @@ class EloEngine:
             "away_team": ("VISITOR_TEAM", "awayteamId", "visitorTeam"),
             "home_score": ("HOME_SCORE", "homeScore"),
             "away_score": ("VISITOR_SCORE", "awayScore", "visitorScore"),
+            "season": ("SEASON", "season", "Season"),
             "game_id": ("gameId", "GAME_ID"),
             "game_type": ("gameType", "GAME_TYPE"),
         }
@@ -383,6 +507,7 @@ class EloEngine:
         col_away = self._pick_column(df.columns, required["away_team"])
         col_home_score = self._pick_column(df.columns, required["home_score"])
         col_away_score = self._pick_column(df.columns, required["away_score"])
+        col_season = self._pick_column(df.columns, required["season"], required=False)
         col_game_id = self._pick_column(df.columns, required["game_id"])
         col_game_type = self._pick_column(df.columns, required["game_type"], required=False)
 
@@ -409,6 +534,7 @@ class EloEngine:
         norm_away = "away_team_norm"
         norm_home_score = "home_score_norm"
         norm_away_score = "away_score_norm"
+        norm_season = "season_norm"
 
         df = df.assign(
             **{
@@ -419,8 +545,22 @@ class EloEngine:
                 norm_away_score: pd.to_numeric(df[col_away_score], errors="coerce"),
             }
         )
+        # NBA season label by ending year:
+        # Oct-Dec 2023 -> season 2024, Jan-Jun 2024 -> season 2024
+        derived_season = df[norm_date].dt.year + (df[norm_date].dt.month >= 10).astype("int64")
+        if col_season:
+            parsed_season = pd.to_numeric(df[col_season], errors="coerce")
+            df = df.assign(**{norm_season: parsed_season.fillna(derived_season)})
+        else:
+            df = df.assign(**{norm_season: derived_season})
 
-        df = df.dropna(subset=[norm_date, norm_home, norm_away, norm_home_score, norm_away_score])
+        df = df.dropna(
+            subset=[norm_date, norm_home, norm_away, norm_home_score, norm_away_score, norm_season]
+        )
+        if self.min_season is not None:
+            df = df[df[norm_season] >= int(self.min_season)]
+        if self.allowed_seasons:
+            df = df[df[norm_season].astype(int).isin(self.allowed_seasons)]
         if as_of_date:
             cutoff = pd.to_datetime(as_of_date, errors="coerce")
             if pd.notna(cutoff):
@@ -431,21 +571,22 @@ class EloEngine:
             sort_cols.append(col_game_id)
         df = df.sort_values(sort_cols, kind="mergesort")
 
-        selected_cols = [norm_date, norm_home, norm_away, norm_home_score, norm_away_score]
+        selected_cols = [norm_date, norm_season, norm_home, norm_away, norm_home_score, norm_away_score]
         if col_game_id:
             selected_cols.append(col_game_id)
 
         records: List[GameRecord] = []
         for row in df[selected_cols].itertuples(index=False, name=None):
             if col_game_id:
-                game_date, home_team, away_team, home_score, away_score, game_id_raw = row
+                game_date, season, home_team, away_team, home_score, away_score, game_id_raw = row
                 game_id = str(game_id_raw)
             else:
-                game_date, home_team, away_team, home_score, away_score = row
+                game_date, season, home_team, away_team, home_score, away_score = row
                 game_id = ""
             records.append(
                 GameRecord(
                     game_date=game_date.to_pydatetime(),
+                    season=int(season),
                     game_id=game_id,
                     home_team=str(home_team),
                     away_team=str(away_team),
@@ -466,6 +607,7 @@ class EloEngine:
             col_away = self._pick_column(fields, ("VISITOR_TEAM", "awayteamId", "visitorTeam"))
             col_home_score = self._pick_column(fields, ("HOME_SCORE", "homeScore"))
             col_away_score = self._pick_column(fields, ("VISITOR_SCORE", "awayScore", "visitorScore"))
+            col_season = self._pick_column(fields, ("SEASON", "season", "Season"), required=False)
             col_game_id = self._pick_column(fields, ("gameId", "GAME_ID"), required=False)
             col_game_type = self._pick_column(fields, ("gameType", "GAME_TYPE"), required=False)
 
@@ -482,6 +624,13 @@ class EloEngine:
                     continue
                 if cutoff is not None and not (game_dt < cutoff):
                     continue
+                season_val = self._parse_season_value(row.get(col_season)) if col_season else None
+                if season_val is None:
+                    season_val = self._derive_season_from_date(game_dt)
+                if self.min_season is not None and int(season_val) < int(self.min_season):
+                    continue
+                if self.allowed_seasons and int(season_val) not in self.allowed_seasons:
+                    continue
                 home_team = self._normalize_team_code(row.get(col_home))
                 away_team = self._normalize_team_code(row.get(col_away))
                 if not home_team or not away_team:
@@ -494,6 +643,7 @@ class EloEngine:
                 records.append(
                     GameRecord(
                         game_date=game_dt,
+                        season=int(season_val),
                         game_id=str(row.get(col_game_id, "")) if col_game_id else "",
                         home_team=home_team,
                         away_team=away_team,
@@ -536,6 +686,36 @@ class EloEngine:
             return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
         except Exception:
             return None
+
+    @staticmethod
+    def _derive_season_from_date(game_date: datetime) -> int:
+        return int(game_date.year + (1 if int(game_date.month) >= 10 else 0))
+
+    @staticmethod
+    def _parse_season_value(value: object) -> Optional[int]:
+        if value is None:
+            return None
+        raw = str(value).strip()
+        if not raw:
+            return None
+        try:
+            return int(float(raw))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_allowed_seasons(value: Optional[Iterable[int]]) -> Set[int]:
+        if value is None:
+            return set()
+        out: Set[int] = set()
+        for item in value:
+            try:
+                season = int(item)
+            except Exception:
+                continue
+            if season >= 1:
+                out.add(season)
+        return out
 
     @staticmethod
     def _normalize_team_code(token: object) -> str:

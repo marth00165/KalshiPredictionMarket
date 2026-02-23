@@ -73,13 +73,22 @@ class AnalysisConfig:
     nba_elo_enabled: bool = True
     nba_elo_data_path: str = "context/kaggleGameData.csv"
     nba_elo_output_path: str = "app/outputs/elo_ratings.json"
+    nba_elo_initial_rating: float = 1500.0
+    nba_elo_home_advantage: float = 100.0
+    nba_elo_k_factor: float = 20.0
+    nba_elo_regression_factor: float = 0.75
+    nba_elo_use_mov_multiplier: bool = True
+    nba_elo_round_decimals: int = 1
+    nba_elo_min_season: Optional[int] = 2004
+    nba_elo_allowed_seasons: Optional[List[int]] = None
+    nba_elo_season_ratings_output_path: str = "app/outputs/elo_ratings_by_season.csv"
     enable_elo_calibration: bool = True
     calibration_bucket_size: int = 25
     calibration_prior: int = 100
     calibration_csv_path: str = "context/historical_elo_matchups.csv"
-    calibration_min_season: Optional[int] = None
-    calibration_recency_mode: str = "none"
-    calibration_recency_halflife_days: int = 365
+    calibration_min_season: Optional[int] = 2004
+    calibration_recency_mode: str = "exp"
+    calibration_recency_halflife_days: int = 730
     enable_live_injury_news: bool = True
     enable_injury_llm_cache: bool = True
     injury_cache_file: str = "context/injury_llm_cache.json"
@@ -109,6 +118,31 @@ class AnalysisConfig:
             raise ValueError("nba_elo_data_path cannot be empty")
         if not str(self.nba_elo_output_path or "").strip():
             raise ValueError("nba_elo_output_path cannot be empty")
+        if self.nba_elo_initial_rating <= 0:
+            raise ValueError("nba_elo_initial_rating must be > 0")
+        if self.nba_elo_home_advantage < 0:
+            raise ValueError("nba_elo_home_advantage must be >= 0")
+        if self.nba_elo_k_factor <= 0:
+            raise ValueError("nba_elo_k_factor must be > 0")
+        if not (0 <= self.nba_elo_regression_factor <= 1):
+            raise ValueError("nba_elo_regression_factor must be between 0 and 1")
+        if self.nba_elo_round_decimals < 0:
+            raise ValueError("nba_elo_round_decimals must be >= 0")
+        if self.nba_elo_min_season is not None and int(self.nba_elo_min_season) < 1:
+            raise ValueError("nba_elo_min_season must be >= 1 when provided")
+        if self.nba_elo_allowed_seasons is not None:
+            normalized_seasons: List[int] = []
+            for value in self.nba_elo_allowed_seasons:
+                try:
+                    season = int(value)
+                except Exception:
+                    raise ValueError(f"nba_elo_allowed_seasons contains non-integer value: {value!r}")
+                if season < 1:
+                    raise ValueError(f"nba_elo_allowed_seasons contains invalid season: {season}")
+                normalized_seasons.append(season)
+            self.nba_elo_allowed_seasons = sorted(set(normalized_seasons))
+        if not str(self.nba_elo_season_ratings_output_path or "").strip():
+            raise ValueError("nba_elo_season_ratings_output_path cannot be empty")
         if self.calibration_bucket_size < 1:
             raise ValueError("calibration_bucket_size must be >= 1")
         if self.calibration_prior < 0:
@@ -549,13 +583,25 @@ class ConfigManager:
             nba_elo_enabled=analysis_raw.get('nba_elo_enabled', True),
             nba_elo_data_path=analysis_raw.get('nba_elo_data_path', 'context/kaggleGameData.csv'),
             nba_elo_output_path=analysis_raw.get('nba_elo_output_path', 'app/outputs/elo_ratings.json'),
+            nba_elo_initial_rating=analysis_raw.get('nba_elo_initial_rating', 1500.0),
+            nba_elo_home_advantage=analysis_raw.get('nba_elo_home_advantage', 100.0),
+            nba_elo_k_factor=analysis_raw.get('nba_elo_k_factor', 20.0),
+            nba_elo_regression_factor=analysis_raw.get('nba_elo_regression_factor', 0.75),
+            nba_elo_use_mov_multiplier=analysis_raw.get('nba_elo_use_mov_multiplier', True),
+            nba_elo_round_decimals=analysis_raw.get('nba_elo_round_decimals', 1),
+            nba_elo_min_season=analysis_raw.get('nba_elo_min_season', 2004),
+            nba_elo_allowed_seasons=analysis_raw.get('nba_elo_allowed_seasons'),
+            nba_elo_season_ratings_output_path=analysis_raw.get(
+                'nba_elo_season_ratings_output_path',
+                'app/outputs/elo_ratings_by_season.csv',
+            ),
             enable_elo_calibration=analysis_raw.get('enable_elo_calibration', True),
             calibration_bucket_size=analysis_raw.get('calibration_bucket_size', 25),
             calibration_prior=analysis_raw.get('calibration_prior', 100),
             calibration_csv_path=analysis_raw.get('calibration_csv_path', 'context/historical_elo_matchups.csv'),
-            calibration_min_season=analysis_raw.get('calibration_min_season'),
-            calibration_recency_mode=analysis_raw.get('calibration_recency_mode', 'none'),
-            calibration_recency_halflife_days=analysis_raw.get('calibration_recency_halflife_days', 365),
+            calibration_min_season=analysis_raw.get('calibration_min_season', 2004),
+            calibration_recency_mode=analysis_raw.get('calibration_recency_mode', 'exp'),
+            calibration_recency_halflife_days=analysis_raw.get('calibration_recency_halflife_days', 730),
             enable_live_injury_news=analysis_raw.get('enable_live_injury_news', True),
             enable_injury_llm_cache=analysis_raw.get('enable_injury_llm_cache', True),
             injury_cache_file=analysis_raw.get('injury_cache_file', 'context/injury_llm_cache.json'),
@@ -909,6 +955,14 @@ class ConfigManager:
             "   NBA Elo: "
             f"{'✅ enabled' if self.analysis.nba_elo_enabled else '❌ disabled'} | "
             f"data={self.analysis.nba_elo_data_path} | "
+            f"ratings_out={self.analysis.nba_elo_output_path} | "
+            f"season_out={self.analysis.nba_elo_season_ratings_output_path} | "
+            f"k={self.analysis.nba_elo_k_factor:.2f} | "
+            f"hca={self.analysis.nba_elo_home_advantage:.1f} | "
+            f"reg={self.analysis.nba_elo_regression_factor:.2f} | "
+            f"mov={'on' if self.analysis.nba_elo_use_mov_multiplier else 'off'} | "
+            f"min_season={self.analysis.nba_elo_min_season} | "
+            f"allowed_seasons={self.analysis.nba_elo_allowed_seasons} | "
             "llm_elo_delta_bounds=[-75,+75]"
         )
         logger.info(
@@ -1100,6 +1154,15 @@ class ConfigManager:
                 'nba_elo_enabled': self.analysis.nba_elo_enabled,
                 'nba_elo_data_path': self.analysis.nba_elo_data_path,
                 'nba_elo_output_path': self.analysis.nba_elo_output_path,
+                'nba_elo_initial_rating': self.analysis.nba_elo_initial_rating,
+                'nba_elo_home_advantage': self.analysis.nba_elo_home_advantage,
+                'nba_elo_k_factor': self.analysis.nba_elo_k_factor,
+                'nba_elo_regression_factor': self.analysis.nba_elo_regression_factor,
+                'nba_elo_use_mov_multiplier': self.analysis.nba_elo_use_mov_multiplier,
+                'nba_elo_round_decimals': self.analysis.nba_elo_round_decimals,
+                'nba_elo_min_season': self.analysis.nba_elo_min_season,
+                'nba_elo_allowed_seasons': self.analysis.nba_elo_allowed_seasons,
+                'nba_elo_season_ratings_output_path': self.analysis.nba_elo_season_ratings_output_path,
                 'enable_elo_calibration': self.analysis.enable_elo_calibration,
                 'calibration_bucket_size': self.analysis.calibration_bucket_size,
                 'calibration_prior': self.analysis.calibration_prior,

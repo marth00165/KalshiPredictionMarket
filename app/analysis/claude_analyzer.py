@@ -67,6 +67,21 @@ class ClaudeAnalyzer:
             self._elo_engine = EloEngine(
                 data_path=str(getattr(self.config.analysis, "nba_elo_data_path", "context/kaggleGameData.csv")),
                 output_path=str(getattr(self.config.analysis, "nba_elo_output_path", "app/outputs/elo_ratings.json")),
+                initial_rating=float(getattr(self.config.analysis, "nba_elo_initial_rating", 1500.0)),
+                home_advantage=float(getattr(self.config.analysis, "nba_elo_home_advantage", 100.0)),
+                k_factor=float(getattr(self.config.analysis, "nba_elo_k_factor", 20.0)),
+                regression_factor=float(getattr(self.config.analysis, "nba_elo_regression_factor", 0.75)),
+                use_mov_multiplier=bool(getattr(self.config.analysis, "nba_elo_use_mov_multiplier", True)),
+                elo_round_decimals=int(getattr(self.config.analysis, "nba_elo_round_decimals", 1)),
+                min_season=getattr(self.config.analysis, "nba_elo_min_season", 2004),
+                allowed_seasons=getattr(self.config.analysis, "nba_elo_allowed_seasons", None),
+                season_ratings_output_path=str(
+                    getattr(
+                        self.config.analysis,
+                        "nba_elo_season_ratings_output_path",
+                        "app/outputs/elo_ratings_by_season.csv",
+                    )
+                ),
             )
         self._elo_calibration_enabled = bool(
             self._elo_enabled and getattr(self.config.analysis, "enable_elo_calibration", True)
@@ -76,10 +91,10 @@ class ClaudeAnalyzer:
             bucket_size=int(getattr(self.config.analysis, "calibration_bucket_size", 25)),
             prior=int(getattr(self.config.analysis, "calibration_prior", 100)),
             key_type="elo_diff",
-            min_season=getattr(self.config.analysis, "calibration_min_season", None),
-            recency_mode=str(getattr(self.config.analysis, "calibration_recency_mode", "none")),
+            min_season=getattr(self.config.analysis, "calibration_min_season", 2004),
+            recency_mode=str(getattr(self.config.analysis, "calibration_recency_mode", "exp")),
             recency_halflife_days=int(
-                getattr(self.config.analysis, "calibration_recency_halflife_days", 365)
+                getattr(self.config.analysis, "calibration_recency_halflife_days", 730)
             ),
         )
         self._injury_refresh = InjuryLLMRefreshService(
