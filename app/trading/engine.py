@@ -6,7 +6,13 @@ import logging
 import math
 from typing import Dict, Optional
 
-from app.analytics import EloEngine, get_win_probability as _get_win_probability, load_ratings as _load_ratings
+from app.analytics import (
+    EloEngine,
+    compute_injury_impact_breakdown,
+    get_win_probability as _get_win_probability,
+    load_ratings as _load_ratings,
+)
+from app.config import PIM_K_FACTOR, PIM_MAX_DELTA
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +107,33 @@ def calculate_adjusted_yes_probability(
         "yes_effective_elo": yes_effective,
         "applied_elo_delta": float(applied_delta),
     }
+
+
+def calculate_pim_elo_adjustment(
+    *,
+    yes_team_players: list[dict],
+    opp_team_players: list[dict],
+    injury_status_map: Dict[str, str],
+    k_factor: float = PIM_K_FACTOR,
+    max_delta: float = PIM_MAX_DELTA,
+) -> Dict[str, float]:
+    """
+    Compute deterministic injury-driven Elo delta from player profile impact.
+
+    Returns:
+        {
+          "yes_team_impact": float,
+          "opp_team_impact": float,
+          "delta_pim": float,
+        }
+    """
+    return compute_injury_impact_breakdown(
+        yes_team_players=yes_team_players,
+        opp_team_players=opp_team_players,
+        injury_status_map=injury_status_map,
+        k_factor=float(k_factor),
+        max_delta=float(max_delta),
+    )
 
 
 def log_model_divergence_warning(

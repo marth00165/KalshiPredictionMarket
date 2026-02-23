@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+PIM_K_FACTOR = 25.0
+PIM_MAX_DELTA = 75.0
+
 
 # ============================================================================
 # CONFIGURATION DATACLASSES
@@ -32,11 +35,27 @@ class APIConfig:
     
     claude_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
+    sportradar_api_key: Optional[str] = None
+    sportradar_access_level: str = "trial"
+    sportradar_base_url: Optional[str] = None
     batch_size: int = 5
     api_cost_limit_per_cycle: float = 5.0
     
     def validate(self) -> None:
         """Validate API configuration"""
+        access_level = str(self.sportradar_access_level or "trial").strip().lower()
+        if access_level not in {"trial", "production"}:
+            raise ValueError(
+                f"sportradar_access_level must be 'trial' or 'production', got {self.sportradar_access_level!r}"
+            )
+        self.sportradar_access_level = access_level
+
+        base_url = str(self.sportradar_base_url or "").strip()
+        if base_url:
+            self.sportradar_base_url = base_url.rstrip("/")
+        else:
+            self.sportradar_base_url = f"https://api.sportradar.com/nba/{access_level}/v8/en"
+
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
         if self.api_cost_limit_per_cycle < 0:
@@ -61,6 +80,19 @@ class AnalysisConfig:
     calibration_min_season: Optional[int] = None
     calibration_recency_mode: str = "none"
     calibration_recency_halflife_days: int = 365
+    enable_live_injury_news: bool = True
+    enable_injury_llm_cache: bool = True
+    injury_cache_file: str = "context/injury_llm_cache.json"
+    llm_refresh_max_age_seconds: int = 1800
+    force_llm_refresh_near_tipoff_minutes: int = 45
+    near_tipoff_llm_stale_seconds: int = 600
+    llm_refresh_on_price_move_pct: float = 0.03
+    injury_analysis_version: str = "injury-v2"
+    injury_prompt_version: str = "injury-prompt-v1"
+    force_injury_llm_refresh: bool = False
+    injury_feed_cache_ttl_seconds: int = 120
+    pim_k_factor: float = PIM_K_FACTOR
+    pim_max_delta: float = PIM_MAX_DELTA
     llm_adjustment_max_delta: float = 0.03
     persist_reasoning_to_db: bool = True
     use_recent_reasoning_context: bool = True
@@ -90,6 +122,26 @@ class AnalysisConfig:
             raise ValueError("calibration_recency_mode must be one of: none, exp")
         if self.calibration_recency_halflife_days < 1:
             raise ValueError("calibration_recency_halflife_days must be >= 1")
+        if not str(self.injury_cache_file or "").strip():
+            raise ValueError("injury_cache_file cannot be empty")
+        if self.llm_refresh_max_age_seconds < 1:
+            raise ValueError("llm_refresh_max_age_seconds must be >= 1")
+        if self.force_llm_refresh_near_tipoff_minutes < 0:
+            raise ValueError("force_llm_refresh_near_tipoff_minutes must be >= 0")
+        if self.near_tipoff_llm_stale_seconds < 0:
+            raise ValueError("near_tipoff_llm_stale_seconds must be >= 0")
+        if self.injury_feed_cache_ttl_seconds < 1:
+            raise ValueError("injury_feed_cache_ttl_seconds must be >= 1")
+        if self.pim_k_factor < 0:
+            raise ValueError("pim_k_factor must be >= 0")
+        if self.pim_max_delta < 0:
+            raise ValueError("pim_max_delta must be >= 0")
+        if not (0 <= self.llm_refresh_on_price_move_pct <= 1):
+            raise ValueError("llm_refresh_on_price_move_pct must be between 0 and 1")
+        if not str(self.injury_analysis_version or "").strip():
+            raise ValueError("injury_analysis_version cannot be empty")
+        if not str(self.injury_prompt_version or "").strip():
+            raise ValueError("injury_prompt_version cannot be empty")
         if not (0 <= self.llm_adjustment_max_delta <= 0.25):
             raise ValueError("llm_adjustment_max_delta must be between 0 and 0.25")
         if self.recent_reasoning_entries < 1:
@@ -504,6 +556,19 @@ class ConfigManager:
             calibration_min_season=analysis_raw.get('calibration_min_season'),
             calibration_recency_mode=analysis_raw.get('calibration_recency_mode', 'none'),
             calibration_recency_halflife_days=analysis_raw.get('calibration_recency_halflife_days', 365),
+            enable_live_injury_news=analysis_raw.get('enable_live_injury_news', True),
+            enable_injury_llm_cache=analysis_raw.get('enable_injury_llm_cache', True),
+            injury_cache_file=analysis_raw.get('injury_cache_file', 'context/injury_llm_cache.json'),
+            llm_refresh_max_age_seconds=analysis_raw.get('llm_refresh_max_age_seconds', 1800),
+            force_llm_refresh_near_tipoff_minutes=analysis_raw.get('force_llm_refresh_near_tipoff_minutes', 45),
+            near_tipoff_llm_stale_seconds=analysis_raw.get('near_tipoff_llm_stale_seconds', 600),
+            llm_refresh_on_price_move_pct=analysis_raw.get('llm_refresh_on_price_move_pct', 0.03),
+            injury_analysis_version=analysis_raw.get('injury_analysis_version', 'injury-v2'),
+            injury_prompt_version=analysis_raw.get('injury_prompt_version', 'injury-prompt-v1'),
+            force_injury_llm_refresh=analysis_raw.get('force_injury_llm_refresh', False),
+            injury_feed_cache_ttl_seconds=analysis_raw.get('injury_feed_cache_ttl_seconds', 120),
+            pim_k_factor=analysis_raw.get('pim_k_factor', PIM_K_FACTOR),
+            pim_max_delta=analysis_raw.get('pim_max_delta', PIM_MAX_DELTA),
             llm_adjustment_max_delta=analysis_raw.get('llm_adjustment_max_delta', 0.03),
             persist_reasoning_to_db=analysis_raw.get('persist_reasoning_to_db', True),
             use_recent_reasoning_context=analysis_raw.get('use_recent_reasoning_context', True),
@@ -521,6 +586,20 @@ class ConfigManager:
             self.api = APIConfig(
                 claude_api_key=self._get_secret('ANTHROPIC_API_KEY', api_raw.get('claude_api_key')),
                 openai_api_key=self._get_secret('OPENAI_API_KEY', api_raw.get('openai_api_key')),
+                sportradar_api_key=self._get_secret(
+                    'SPORTRADAR_API_KEY',
+                    self._get_secret('SPORTSRADAR_API_KEY', api_raw.get('sportradar_api_key')),
+                ),
+                sportradar_access_level=(
+                    os.getenv('SPORTRADAR_ACCESS_LEVEL')
+                    or os.getenv('SPORTSRADAR_ACCESS_LEVEL')
+                    or api_raw.get('sportradar_access_level', 'trial')
+                ),
+                sportradar_base_url=(
+                    os.getenv('SPORTRADAR_BASE_URL')
+                    or os.getenv('SPORTSRADAR_BASE_URL')
+                    or api_raw.get('sportradar_base_url')
+                ),
                 batch_size=api_raw.get('batch_size', 50),
                 api_cost_limit_per_cycle=api_raw.get('api_cost_limit_per_cycle', 5.0),
             )
@@ -842,6 +921,23 @@ class ConfigManager:
             f"recency={self.analysis.calibration_recency_mode}"
         )
         logger.info(
+            "   Live injury news: "
+            f"{'✅ enabled' if self.analysis.enable_live_injury_news else '❌ disabled'} | "
+            f"cache={self.analysis.injury_cache_file} | "
+            f"feed_ttl={self.analysis.injury_feed_cache_ttl_seconds}s | "
+            f"llm_ttl={self.analysis.llm_refresh_max_age_seconds}s"
+        )
+        logger.info(
+            "   Injury PIM: "
+            f"k={self.analysis.pim_k_factor:.2f} | "
+            f"max_delta={self.analysis.pim_max_delta:.2f}"
+        )
+        logger.info(
+            "   SportsRadar feed: "
+            f"access={self.api.sportradar_access_level} | "
+            f"base_url={self.api.sportradar_base_url}"
+        )
+        logger.info(
             "   DB reasoning memory: "
             f"{'✅ persist' if self.analysis.persist_reasoning_to_db else '❌ off'}, "
             f"{'✅ prompt context' if self.analysis.use_recent_reasoning_context else '❌ prompt off'}"
@@ -926,7 +1022,15 @@ class ConfigManager:
         """Convert config to dictionary for debugging/serialization"""
         return {
             'api': {
-                'claude_api_key': self.api.claude_api_key[:20] + '...',  # redact
+                'claude_api_key': (
+                    self.api.claude_api_key[:20] + '...'
+                    if self.api.claude_api_key
+                    else None
+                ),
+                'openai_api_key_set': bool(self.api.openai_api_key),
+                'sportradar_api_key_set': bool(self.api.sportradar_api_key),
+                'sportradar_access_level': self.api.sportradar_access_level,
+                'sportradar_base_url': self.api.sportradar_base_url,
                 'batch_size': self.api.batch_size,
                 'api_cost_limit_per_cycle': self.api.api_cost_limit_per_cycle,
             },
@@ -1003,6 +1107,19 @@ class ConfigManager:
                 'calibration_min_season': self.analysis.calibration_min_season,
                 'calibration_recency_mode': self.analysis.calibration_recency_mode,
                 'calibration_recency_halflife_days': self.analysis.calibration_recency_halflife_days,
+                'enable_live_injury_news': self.analysis.enable_live_injury_news,
+                'enable_injury_llm_cache': self.analysis.enable_injury_llm_cache,
+                'injury_cache_file': self.analysis.injury_cache_file,
+                'llm_refresh_max_age_seconds': self.analysis.llm_refresh_max_age_seconds,
+                'force_llm_refresh_near_tipoff_minutes': self.analysis.force_llm_refresh_near_tipoff_minutes,
+                'near_tipoff_llm_stale_seconds': self.analysis.near_tipoff_llm_stale_seconds,
+                'llm_refresh_on_price_move_pct': self.analysis.llm_refresh_on_price_move_pct,
+                'injury_analysis_version': self.analysis.injury_analysis_version,
+                'injury_prompt_version': self.analysis.injury_prompt_version,
+                'force_injury_llm_refresh': self.analysis.force_injury_llm_refresh,
+                'injury_feed_cache_ttl_seconds': self.analysis.injury_feed_cache_ttl_seconds,
+                'pim_k_factor': self.analysis.pim_k_factor,
+                'pim_max_delta': self.analysis.pim_max_delta,
                 'llm_adjustment_max_delta': self.analysis.llm_adjustment_max_delta,
                 'persist_reasoning_to_db': self.analysis.persist_reasoning_to_db,
                 'use_recent_reasoning_context': self.analysis.use_recent_reasoning_context,

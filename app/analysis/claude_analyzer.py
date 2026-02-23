@@ -16,7 +16,12 @@ from app.config import ConfigManager
 from app.models import MarketData, FairValueEstimate
 from app.api_clients.base_client import BaseAPIClient
 from app.analysis.context_loader import load_context_json_block
-from app.trading.engine import calculate_adjusted_yes_probability
+from app.analysis.injury_llm_cache import (
+    InjuryLLMRefreshConfig,
+    InjuryLLMRefreshService,
+    MarketInjuryContext,
+)
+from app.trading.engine import calculate_adjusted_yes_probability, calculate_pim_elo_adjustment
 from app.utils import ClaudeResponseParser
 from app.api_clients import APIError
 
@@ -71,6 +76,45 @@ class ClaudeAnalyzer:
                 getattr(self.config.analysis, "calibration_recency_halflife_days", 365)
             ),
         )
+        self._injury_refresh = InjuryLLMRefreshService(
+            config=InjuryLLMRefreshConfig(
+                enabled=bool(getattr(self.config.analysis, "enable_live_injury_news", True)),
+                enable_injury_llm_cache=bool(
+                    getattr(self.config.analysis, "enable_injury_llm_cache", True)
+                ),
+                injury_cache_file=str(
+                    getattr(self.config.analysis, "injury_cache_file", "context/injury_llm_cache.json")
+                ),
+                llm_refresh_max_age_seconds=int(
+                    getattr(self.config.analysis, "llm_refresh_max_age_seconds", 1800)
+                ),
+                force_llm_refresh_near_tipoff_minutes=int(
+                    getattr(self.config.analysis, "force_llm_refresh_near_tipoff_minutes", 45)
+                ),
+                near_tipoff_llm_stale_seconds=int(
+                    getattr(self.config.analysis, "near_tipoff_llm_stale_seconds", 600)
+                ),
+                llm_refresh_on_price_move_pct=float(
+                    getattr(self.config.analysis, "llm_refresh_on_price_move_pct", 0.03)
+                ),
+                injury_analysis_version=str(
+                    getattr(self.config.analysis, "injury_analysis_version", "injury-v2")
+                ),
+                injury_prompt_version=str(
+                    getattr(self.config.analysis, "injury_prompt_version", "injury-prompt-v1")
+                ),
+                force_injury_llm_refresh=bool(
+                    getattr(self.config.analysis, "force_injury_llm_refresh", False)
+                ),
+                injury_feed_cache_ttl_seconds=int(
+                    getattr(self.config.analysis, "injury_feed_cache_ttl_seconds", 120)
+                ),
+            ),
+            sportsradar_api_key=getattr(getattr(self.config, "api", None), "sportradar_api_key", None),
+            sportsradar_base_url=str(
+                getattr(getattr(self.config, "api", None), "sportradar_base_url", "https://api.sportradar.com/nba/trial/v8/en")
+            ),
+        )
 
     def set_runtime_context_block(self, context_text: str) -> None:
         """Set optional runtime context block (e.g., prior analysis blurbs)."""
@@ -101,6 +145,8 @@ class ClaudeAnalyzer:
 
         if self._elo_enabled and self._elo_calibration_enabled and self._elo_calibration_table is None:
             await asyncio.to_thread(self._ensure_elo_calibration_loaded)
+        if self._elo_enabled and self._injury_refresh.enabled:
+            await self._injury_refresh.refresh_injury_feed_if_needed()
 
         async with self.client:
             tasks = [
@@ -135,39 +181,81 @@ class ClaudeAnalyzer:
             FairValueEstimate or None if analysis fails
         """
         nba_elo_context = self._get_nba_elo_context(market)
+        injury_ctx: Optional[MarketInjuryContext] = None
         if nba_elo_context:
-            prompt = self._build_nba_elo_adjustment_prompt(market, nba_elo_context)
-        else:
-            prompt = self._build_analysis_prompt(market)
+            injury_ctx = self._injury_refresh.build_context_for_market(
+                matchup_key=market.market_id,
+                home_team=str(nba_elo_context["home_team"]),
+                away_team=str(nba_elo_context["away_team"]),
+                end_date=market.end_date,
+                market_yes_price=float(market.yes_price),
+            )
+            if not injury_ctx.decision.should_refresh:
+                estimate = self._build_cached_delta_estimate(market, nba_elo_context, injury_ctx)
+                self._attach_injury_cache_metadata(
+                    estimate=estimate,
+                    injury_ctx=injury_ctx,
+                    llm_source_tag="cached",
+                    refresh_reason=injury_ctx.decision.reason,
+                )
+                self._injury_refresh.touch_market_price(
+                    context=injury_ctx,
+                    market_yes_price=float(market.yes_price),
+                )
+                self._apply_elo_calibration(market, estimate, nba_elo_context)
+                self._log_elo_decision_fields(market, estimate)
+                return estimate
+            try:
+                estimate = await self._build_pim_delta_estimate(market, nba_elo_context, injury_ctx)
+                self._attach_injury_cache_metadata(
+                    estimate=estimate,
+                    injury_ctx=injury_ctx,
+                    llm_source_tag="pim_refresh",
+                    refresh_reason=injury_ctx.decision.reason,
+                )
+                self._persist_injury_cache(
+                    market=market,
+                    estimate=estimate,
+                    injury_ctx=injury_ctx,
+                )
+                self._apply_elo_calibration(market, estimate, nba_elo_context)
+                self._log_elo_decision_fields(market, estimate)
+                return estimate
+            except Exception as e:
+                logger.error("PIM injury adjustment failed for %s: %s", market.market_id, e)
+                if injury_ctx is not None and isinstance(injury_ctx.cache_entry, dict):
+                    estimate = self._build_cached_delta_estimate(market, nba_elo_context, injury_ctx)
+                    self._attach_injury_cache_metadata(
+                        estimate=estimate,
+                        injury_ctx=injury_ctx,
+                        llm_source_tag="cached",
+                        refresh_reason="pim_error_cache_reuse",
+                    )
+                    self._apply_elo_calibration(market, estimate, nba_elo_context)
+                    self._log_elo_decision_fields(market, estimate)
+                    return estimate
+                estimate = self._build_elo_fallback_estimate(market, nba_elo_context, f"pim_error: {e}")
+                self._attach_injury_cache_metadata(
+                    estimate=estimate,
+                    injury_ctx=injury_ctx,
+                    llm_source_tag="pim_refresh",
+                    refresh_reason="pim_error",
+                )
+                self._apply_elo_calibration(market, estimate, nba_elo_context)
+                self._log_elo_decision_fields(market, estimate)
+                return estimate
 
+        prompt = self._build_analysis_prompt(market)
         try:
             # Call Claude API
             response = await self._call_claude_api(prompt)
 
             # Parse response into FairValueEstimate
-            if nba_elo_context:
-                estimate = ClaudeResponseParser.parse_elo_adjusted_estimate(
-                    response_text=response.get('content_text', ''),
-                    market_id=market.market_id,
-                    market_price=market.yes_price,
-                    yes_team=str(nba_elo_context["yes_team"]),
-                    home_team=str(nba_elo_context["home_team"]),
-                    away_team=str(nba_elo_context["away_team"]),
-                    home_elo=float(nba_elo_context["home_elo"]),
-                    away_elo=float(nba_elo_context["away_elo"]),
-                    home_court_bonus=float(nba_elo_context["home_court_bonus"]),
-                )
-                if estimate is None:
-                    estimate = self._build_elo_fallback_estimate(market, nba_elo_context, "llm_parse_failed")
-                if estimate is not None:
-                    self._apply_elo_calibration(market, estimate, nba_elo_context)
-                    self._log_elo_decision_fields(market, estimate)
-            else:
-                estimate = ClaudeResponseParser.parse_fair_value_estimate(
-                    response_text=response.get('content_text', ''),
-                    market_id=market.market_id,
-                    market_price=market.yes_price
-                )
+            estimate = ClaudeResponseParser.parse_fair_value_estimate(
+                response_text=response.get('content_text', ''),
+                market_id=market.market_id,
+                market_price=market.yes_price
+            )
 
             if estimate:
                 logger.debug(
@@ -180,12 +268,179 @@ class ClaudeAnalyzer:
 
         except Exception as e:
             logger.error(f"Error analyzing market {market.market_id}: {e}")
-            if nba_elo_context:
-                estimate = self._build_elo_fallback_estimate(market, nba_elo_context, f"llm_api_error: {e}")
-                self._apply_elo_calibration(market, estimate, nba_elo_context)
-                self._log_elo_decision_fields(market, estimate)
-                return estimate
             return None
+
+    async def _build_pim_delta_estimate(
+        self,
+        market: MarketData,
+        elo_ctx: Dict[str, object],
+        injury_ctx: MarketInjuryContext,
+    ) -> FairValueEstimate:
+        pim_inputs = await self._injury_refresh.build_pim_inputs_for_market(
+            context=injury_ctx,
+            yes_team=str(elo_ctx["yes_team"]),
+        )
+        pim_summary = calculate_pim_elo_adjustment(
+            yes_team_players=pim_inputs.get("yes_team_players", []),
+            opp_team_players=pim_inputs.get("opp_team_players", []),
+            injury_status_map=pim_inputs.get("injury_status_map", {}),
+            k_factor=float(getattr(self.config.analysis, "pim_k_factor", 25.0)),
+            max_delta=float(getattr(self.config.analysis, "pim_max_delta", 75.0)),
+        )
+        delta_pim = float(pim_summary.get("delta_pim", 0.0))
+        considered_players = pim_inputs.get("considered_players", [])
+        reason = (
+            "Deterministic PIM injury adjustment from SportsRadar team/player profiles."
+            f" impacted_players={len(considered_players)}."
+        )
+        estimate = self._build_elo_estimate_from_delta(
+            market=market,
+            elo_ctx=elo_ctx,
+            elo_delta=delta_pim,
+            confidence=0.70,
+            reason=reason,
+            source_tag="pim_refresh",
+            llm_suggestion={
+                "raw_elo_delta": delta_pim,
+                "applied_elo_delta": delta_pim,
+                "confidence": 0.70,
+                "reason": "deterministic_pim_adjustment",
+                "key_factors": ["player_impact_metric"],
+                "data_sources": ["sportradar_team_profile", "sportradar_player_profile"],
+                "injury_report": {
+                    "status": "confirmed",
+                    "impact": "deterministic",
+                    "notes": f"considered_players={len(considered_players)}",
+                },
+            },
+        )
+        metadata = dict(estimate.fusion_metadata or {})
+        elo_meta = metadata.get("elo_adjustment")
+        if not isinstance(elo_meta, dict):
+            elo_meta = {}
+        elo_meta["player_impact"] = {
+            "yes_team_impact": float(pim_summary.get("yes_team_impact", 0.0)),
+            "opp_team_impact": float(pim_summary.get("opp_team_impact", 0.0)),
+            "delta_pim": delta_pim,
+        }
+        elo_meta["pim_considered_players"] = considered_players
+        metadata["elo_adjustment"] = elo_meta
+        estimate.fusion_metadata = metadata
+        return estimate
+
+    def _build_cached_delta_estimate(
+        self,
+        market: MarketData,
+        elo_ctx: Dict[str, object],
+        injury_ctx: MarketInjuryContext,
+    ) -> FairValueEstimate:
+        cache_entry = injury_ctx.cache_entry or {}
+        try:
+            cached_delta = float(cache_entry.get("llm_delta", 0.0))
+        except Exception:
+            cached_delta = 0.0
+        try:
+            cached_confidence = float(cache_entry.get("llm_confidence", 0.55))
+        except Exception:
+            cached_confidence = 0.55
+        estimate = self._build_elo_estimate_from_delta(
+            market=market,
+            elo_ctx=elo_ctx,
+            elo_delta=cached_delta,
+            confidence=cached_confidence,
+            reason=f"Reused cached injury-adjusted Elo delta ({injury_ctx.decision.reason}).",
+            source_tag="cached",
+            llm_suggestion={
+                "raw_elo_delta": cache_entry.get("llm_delta", cached_delta),
+                "applied_elo_delta": cached_delta,
+                "confidence": cached_confidence,
+                "reason": "cached_injury_delta_reuse",
+                "key_factors": ["injury_cache_reuse"],
+                "data_sources": ["injury_delta_cache"],
+                "injury_report": {
+                    "status": "confirmed",
+                    "impact": "unknown",
+                    "notes": "Cached injury snapshot unchanged.",
+                },
+            },
+        )
+        player_impact = cache_entry.get("player_impact")
+        if isinstance(player_impact, dict):
+            metadata = dict(estimate.fusion_metadata or {})
+            elo_meta = metadata.get("elo_adjustment")
+            if isinstance(elo_meta, dict):
+                elo_meta["player_impact"] = player_impact
+                metadata["elo_adjustment"] = elo_meta
+                estimate.fusion_metadata = metadata
+        return estimate
+
+    def _attach_injury_cache_metadata(
+        self,
+        *,
+        estimate: FairValueEstimate,
+        injury_ctx: Optional[MarketInjuryContext],
+        llm_source_tag: str,
+        refresh_reason: str,
+    ) -> None:
+        if injury_ctx is None:
+            return
+        metadata = dict(estimate.fusion_metadata or {})
+        elo_meta = metadata.get("elo_adjustment")
+        if not isinstance(elo_meta, dict):
+            return
+        age_seconds = injury_ctx.decision.metadata.get("cached_delta_age_seconds")
+        elo_meta["injury_cache_hit"] = bool(llm_source_tag == "cached")
+        elo_meta["injury_fingerprint_changed"] = bool(refresh_reason == "fingerprint_changed")
+        elo_meta["llm_refresh_reason"] = str(refresh_reason)
+        elo_meta["llm_source_tag"] = str(llm_source_tag)
+        elo_meta["cached_delta_age_seconds"] = (
+            None if age_seconds is None else float(age_seconds)
+        )
+        elo_meta["injury_fingerprint"] = injury_ctx.fingerprint_short
+        elo_meta["analysis_version"] = self._injury_refresh.config.injury_analysis_version
+        elo_meta["prompt_version"] = self._injury_refresh.config.injury_prompt_version
+        metadata["elo_adjustment"] = elo_meta
+        estimate.fusion_metadata = metadata
+
+    def _persist_injury_cache(
+        self,
+        *,
+        market: MarketData,
+        estimate: FairValueEstimate,
+        injury_ctx: Optional[MarketInjuryContext],
+    ) -> None:
+        if injury_ctx is None:
+            return
+        metadata = dict(estimate.fusion_metadata or {})
+        elo_meta = metadata.get("elo_adjustment")
+        if not isinstance(elo_meta, dict):
+            return
+        llm_suggestion = elo_meta.get("llm_suggestion", {})
+        if not isinstance(llm_suggestion, dict):
+            llm_suggestion = {}
+        try:
+            llm_delta = float(elo_meta.get("applied_elo_delta", 0.0))
+        except Exception:
+            llm_delta = 0.0
+        llm_confidence = llm_suggestion.get("confidence", estimate.confidence_level)
+        try:
+            llm_confidence = float(llm_confidence)
+        except Exception:
+            llm_confidence = None
+        player_impact = elo_meta.get("player_impact")
+        if not isinstance(player_impact, dict):
+            player_impact = None
+        self._injury_refresh.persist_result(
+            context=injury_ctx,
+            llm_delta=llm_delta,
+            llm_confidence=llm_confidence,
+            llm_model=getattr(self.config.claude, "model", None),
+            prompt_version=self._injury_refresh.config.injury_prompt_version,
+            analysis_version=self._injury_refresh.config.injury_analysis_version,
+            source_tag="pim_refresh",
+            market_yes_price=float(market.yes_price),
+            player_impact=player_impact,
+        )
 
     def _build_context_section(self) -> str:
         context_blocks = []
@@ -241,52 +496,6 @@ Respond in JSON format:
 }}
 
 Think step-by-step and be thorough."""
-
-    def _build_nba_elo_adjustment_prompt(self, market: MarketData, elo_ctx: Dict[str, object]) -> str:
-        context_section = self._build_context_section()
-        max_elo_delta = 75
-        return f"""You are assisting an NBA trading model.
-
-IMPORTANT:
-- Elo is the PRIMARY probability source.
-- Do NOT generate a probability from scratch.
-- You may only suggest an Elo adjustment for the YES team.
-- Keep elo_delta in [-{max_elo_delta}, +{max_elo_delta}] unless there is concrete, high-confidence evidence.
-- Focus adjustment logic on injury reports, confirmed absences, rest/back-to-back, and lineup changes.
-- If no concrete injury/rest evidence exists, set elo_delta to 0.
-
-MARKET DETAILS:
-Title: {market.title}
-Description: {market.description}
-Current Market Price (YES): {market.yes_price:.1%}
-YES Selection: {elo_ctx["yes_team"]}
-Matchup: {elo_ctx["away_team"]} (away) at {elo_ctx["home_team"]} (home)
-Elo(away): {elo_ctx["away_elo"]}
-Elo(home): {elo_ctx["home_elo"]}
-Elo baseline YES probability: {elo_ctx["yes_probability"]}
-Edge from Elo baseline: {elo_ctx["elo_edge"]}
-{context_section}
-
-Adjust only for concrete factors such as:
-- injuries / confirmed absences
-- rest days / back-to-back
-- lineup or rotation changes
-
-Respond in JSON format:
-{{
-  "elo_delta": <integer in [-{max_elo_delta}, +{max_elo_delta}]>,
-  "confidence": <float 0-1 or 0-100>,
-  "reason": "<detailed explanation>",
-  "injury_report": {{
-    "status": "confirmed|questionable|none|unknown",
-    "impact": "favors_yes|favors_no|neutral|unknown",
-    "notes": "<short injury/rest summary>"
-  }},
-  "key_factors": ["factor1", "factor2", ...],
-  "data_sources": ["source1", "source2", ...]
-}}
-
-Return ONLY valid JSON."""
 
     def _is_nba_game_market(self, market: MarketData) -> bool:
         if str(market.platform).strip().lower() != "kalshi":
@@ -415,14 +624,26 @@ Return ONLY valid JSON."""
         estimate.fusion_metadata = metadata
 
     @staticmethod
-    def _build_elo_fallback_estimate(
+    def _build_elo_estimate_from_delta(
         market: MarketData,
         elo_ctx: Dict[str, object],
+        *,
+        elo_delta: float,
+        confidence: float,
         reason: str,
+        source_tag: str,
+        llm_suggestion: Optional[Dict[str, object]] = None,
     ) -> FairValueEstimate:
-        base_prob = float(elo_ctx["yes_probability"])
-        edge = base_prob - float(market.yes_price)
         adjusted = calculate_adjusted_yes_probability(
+            yes_team=str(elo_ctx["yes_team"]),
+            home_team=str(elo_ctx["home_team"]),
+            away_team=str(elo_ctx["away_team"]),
+            home_elo=float(elo_ctx["home_elo"]),
+            away_elo=float(elo_ctx["away_elo"]),
+            llm_elo_delta=elo_delta,
+            home_court_bonus=float(elo_ctx["home_court_bonus"]),
+        )
+        base = calculate_adjusted_yes_probability(
             yes_team=str(elo_ctx["yes_team"]),
             home_team=str(elo_ctx["home_team"]),
             away_team=str(elo_ctx["away_team"]),
@@ -431,16 +652,35 @@ Return ONLY valid JSON."""
             llm_elo_delta=0,
             home_court_bonus=float(elo_ctx["home_court_bonus"]),
         )
+        base_prob = float(base["yes_probability"])
+        final_prob = float(adjusted["yes_probability"])
+        edge = final_prob - float(market.yes_price)
+        confidence_clamped = float(max(0.0, min(1.0, float(confidence))))
+        suggestion_payload = llm_suggestion if isinstance(llm_suggestion, dict) else {}
+        if not suggestion_payload:
+            suggestion_payload = {
+                "raw_elo_delta": float(elo_delta),
+                "applied_elo_delta": float(elo_delta),
+                "confidence": confidence_clamped,
+                "reason": str(reason or ""),
+                "key_factors": [],
+                "data_sources": [],
+                "injury_report": {
+                    "status": "unknown",
+                    "impact": "unknown",
+                    "notes": "",
+                },
+            }
         return FairValueEstimate(
             market_id=market.market_id,
-            estimated_probability=base_prob,
-            confidence_level=0.60,
+            estimated_probability=final_prob,
+            confidence_level=confidence_clamped,
             reasoning=(
-                f"Elo-only fallback ({reason}). "
-                f"base_probability={base_prob:.3f}, edge={edge:+.3f}."
-            ),
-            data_sources=["nba_elo"],
-            key_factors=["elo_baseline_only"],
+                f"Elo base={base_prob:.3f}, elo_delta={float(elo_delta):+0.0f}. "
+                f"{reason}"
+            ).strip(),
+            data_sources=["nba_elo", "sportradar_injuries"],
+            key_factors=["elo_with_injury_delta"],
             edge=edge,
             fusion_metadata={
                 "elo_adjustment": {
@@ -450,14 +690,44 @@ Return ONLY valid JSON."""
                     "home_elo": float(elo_ctx["home_elo"]),
                     "away_elo": float(elo_ctx["away_elo"]),
                     "base_probability": float(base_prob),
-                    "applied_elo_delta": 0.0,
+                    "applied_elo_delta": float(adjusted["applied_elo_delta"]),
                     "yes_adjusted_elo": float(adjusted["yes_adjusted_elo"]),
                     "yes_effective_elo": float(adjusted["yes_effective_elo"]),
                     "opponent_effective_elo": float(adjusted["opponent_effective_elo"]),
-                    "final_probability": float(base_prob),
+                    "final_probability": float(final_prob),
                     "market_probability": float(market.yes_price),
                     "edge": float(edge),
+                    "llm_suggestion": suggestion_payload,
+                    "llm_source_tag": str(source_tag),
                 }
+            },
+        )
+
+    @staticmethod
+    def _build_elo_fallback_estimate(
+        market: MarketData,
+        elo_ctx: Dict[str, object],
+        reason: str,
+    ) -> FairValueEstimate:
+        return ClaudeAnalyzer._build_elo_estimate_from_delta(
+            market=market,
+            elo_ctx=elo_ctx,
+            elo_delta=0.0,
+            confidence=0.60,
+            reason=f"Elo-only fallback ({reason}).",
+            source_tag="llm_refresh",
+            llm_suggestion={
+                "raw_elo_delta": 0.0,
+                "applied_elo_delta": 0.0,
+                "confidence": 0.60,
+                "reason": f"Elo-only fallback ({reason}).",
+                "key_factors": ["elo_baseline_only"],
+                "data_sources": ["nba_elo"],
+                "injury_report": {
+                    "status": "unknown",
+                    "impact": "neutral",
+                    "notes": "",
+                },
             },
         )
 
@@ -474,7 +744,7 @@ Return ONLY valid JSON."""
                 "ELO_DECISION | team=%s | opponent=%s | elo_base=%.2f | elo_delta=%+.0f | "
                 "elo_adjusted=%.2f | probability_base=%.4f | probability_p_elo=%.4f | "
                 "probability_final=%.4f | p_emp=%s | cal_n=%.1f | cal_w=%.4f | "
-                "market_probability=%.4f | edge=%+.4f",
+                "market_probability=%.4f | edge=%+.4f | llm_source=%s | refresh_reason=%s",
                 str(meta.get("yes_team") or ""),
                 str(meta.get("away_team") if str(meta.get("yes_team")) == str(meta.get("home_team")) else meta.get("home_team")),
                 float(meta.get("home_elo") if str(meta.get("yes_team")) == str(meta.get("home_team")) else meta.get("away_elo")),
@@ -488,6 +758,8 @@ Return ONLY valid JSON."""
                 float(meta.get("calibration_weight_w", 0.0)),
                 float(meta.get("market_probability", market.yes_price)),
                 float(meta.get("edge", estimate.edge)),
+                str(meta.get("llm_source_tag", "llm_refresh")),
+                str(meta.get("llm_refresh_reason", "")),
             )
             suggestion = meta.get("llm_suggestion", {})
             if isinstance(suggestion, dict):

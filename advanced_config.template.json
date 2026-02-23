@@ -14,6 +14,19 @@
     "calibration_min_season": null,
     "calibration_recency_mode": "none",
     "calibration_recency_halflife_days": 365,
+    "enable_live_injury_news": true,
+    "enable_injury_llm_cache": true,
+    "injury_cache_file": "context/injury_llm_cache.json",
+    "llm_refresh_max_age_seconds": 1800,
+    "force_llm_refresh_near_tipoff_minutes": 45,
+    "near_tipoff_llm_stale_seconds": 600,
+    "llm_refresh_on_price_move_pct": 0.03,
+    "injury_analysis_version": "injury-v2",
+    "injury_prompt_version": "injury-prompt-v1",
+    "force_injury_llm_refresh": false,
+    "injury_feed_cache_ttl_seconds": 120,
+    "pim_k_factor": 25,
+    "pim_max_delta": 75,
     "llm_adjustment_max_delta": 0.03,
     "persist_reasoning_to_db": true,
     "use_recent_reasoning_context": true,
@@ -21,6 +34,8 @@
     "recent_reasoning_max_chars": 4000
   },
   "api": {
+    "sportradar_access_level": "trial",
+    "sportradar_base_url": null,
     "batch_size": 5,
     "api_cost_limit_per_cycle": 5.00
   },

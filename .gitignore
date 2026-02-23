@@ -216,6 +216,7 @@ config_with_keys.json
 *.log
 trades_*.json
 performance_*.json
+context/injury_llm_cache.json
 
 # Generated cycle reports
 reports/

@@ -923,6 +923,7 @@ class AdvancedTradingBot:
                 "size": size,
                 "reasoning": reasoning,
                 "elo_adjustment": elo_adjustment,
+                "player_impact": elo_adjustment.get("player_impact"),
                 "llm_suggestion": llm_suggestion,
                 "injury_report": injury_report,
             })
@@ -964,6 +965,40 @@ class AdvancedTradingBot:
 
         print("\nDRY RUN ANALYSIS RESULTS")
         print(self._format_text_table(headers, rows))
+
+    @staticmethod
+    def _build_analysis_payload(est: FairValueEstimate) -> Dict[str, Any]:
+        """Build a consistent analysis payload for dry-run/report rows."""
+        metadata = est.fusion_metadata or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        elo_adjustment = metadata.get("elo_adjustment")
+        if not isinstance(elo_adjustment, dict):
+            elo_adjustment = None
+        feature_meta = metadata.get("feature")
+        if not isinstance(feature_meta, dict):
+            feature_meta = {}
+        return {
+            "estimated_probability": est.estimated_probability,
+            "confidence": est.confidence_level,
+            "edge": est.edge,
+            "effective_probability": est.effective_probability,
+            "effective_confidence": est.effective_confidence,
+            "effective_edge": est.effective_edge,
+            "reasoning": est.reasoning,
+            "key_factors": est.key_factors,
+            "data_sources": est.data_sources,
+            "feature_confidence": est.feature_confidence,
+            "feature_signal_score": est.feature_signal_score,
+            "feature_anomaly": est.feature_anomaly,
+            "feature_recommendation": est.feature_recommendation,
+            "feature_regime": est.feature_regime,
+            "feature_provider": est.feature_provider,
+            "feature_reason": feature_meta.get("reason"),
+            "feature_rules": metadata.get("applied_rules", []),
+            "elo_adjustment": elo_adjustment,
+            "player_impact": (elo_adjustment or {}).get("player_impact"),
+        }
 
     async def discover_kalshi_series(self, category: Optional[str] = None) -> List[dict]:
         """
@@ -1180,24 +1215,7 @@ class AdvancedTradingBot:
                     row = market_rows_by_id.get(est.market_id)
                     if not row:
                         continue
-                    row["analysis"] = {
-                        "estimated_probability": est.estimated_probability,
-                        "confidence": est.confidence_level,
-                        "edge": est.edge,
-                        "effective_probability": est.effective_probability,
-                        "effective_confidence": est.effective_confidence,
-                        "effective_edge": est.effective_edge,
-                        "reasoning": est.reasoning,
-                        "feature_confidence": est.feature_confidence,
-                        "feature_signal_score": est.feature_signal_score,
-                        "feature_anomaly": est.feature_anomaly,
-                        "feature_recommendation": est.feature_recommendation,
-                        "feature_regime": est.feature_regime,
-                        "feature_provider": est.feature_provider,
-                        "feature_reason": (est.fusion_metadata or {}).get("feature", {}).get("reason"),
-                        "feature_rules": (est.fusion_metadata or {}).get("applied_rules", []),
-                        "elo_adjustment": (est.fusion_metadata or {}).get("elo_adjustment"),
-                    }
+                    row["analysis"] = self._build_analysis_payload(est)
                     if est.has_significant_edge(min_edge, min_confidence):
                         report["counts"]["opportunities"] += 1
                         row["opportunity"] = {
@@ -1474,18 +1492,7 @@ class AdvancedTradingBot:
                 for est in batch_estimates:
                     row = market_rows_by_id.get(est.market_id)
                     if row is not None:
-                        row["analysis"] = {
-                            "estimated_probability": est.estimated_probability,
-                            "confidence": est.confidence_level,
-                            "edge": est.edge,
-                            "effective_probability": est.effective_probability,
-                            "effective_confidence": est.effective_confidence,
-                            "effective_edge": est.effective_edge,
-                            "reasoning": est.reasoning,
-                            "key_factors": est.key_factors,
-                            "data_sources": est.data_sources,
-                            "elo_adjustment": (est.fusion_metadata or {}).get("elo_adjustment"),
-                        }
+                        row["analysis"] = self._build_analysis_payload(est)
 
                 # Stop early if we hit the configured API spend limit.
                 try:
@@ -1510,22 +1517,7 @@ class AdvancedTradingBot:
                 for est in estimates:
                     row = market_rows_by_id.get(est.market_id)
                     if row is not None:
-                        row["analysis"] = {
-                            "estimated_probability": est.estimated_probability,
-                            "confidence": est.confidence_level,
-                            "edge": est.edge,
-                            "effective_probability": est.effective_probability,
-                            "effective_confidence": est.effective_confidence,
-                            "effective_edge": est.effective_edge,
-                            "reasoning": est.reasoning,
-                            "key_factors": est.key_factors,
-                            "data_sources": est.data_sources,
-                            "feature_confidence": est.feature_confidence,
-                            "feature_recommendation": est.feature_recommendation,
-                            "feature_provider": est.feature_provider,
-                            "feature_reason": (est.fusion_metadata or {}).get("feature", {}).get("reason"),
-                            "elo_adjustment": (est.fusion_metadata or {}).get("elo_adjustment"),
-                        }
+                        row["analysis"] = self._build_analysis_payload(est)
 
             # Snapshot cost stats if available
             try:

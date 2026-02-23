@@ -8,6 +8,7 @@ from .base_client import (
 )
 from .polymarket_client import PolymarketClient, PolymarketConfig
 from .kalshi_client import KalshiClient, KalshiConfig
+from .sportradar_client import SportsRadarClient, SportsRadarConfig
 from .scanner import MarketScanner
 
 __all__ = [
@@ -21,5 +22,7 @@ __all__ = [
     'PolymarketConfig',
     'KalshiClient',
     'KalshiConfig',
+    'SportsRadarClient',
+    'SportsRadarConfig',
     'MarketScanner',
 ]
