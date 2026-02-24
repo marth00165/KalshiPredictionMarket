@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional
 
-PIM_K_FACTOR = 25.0
+PIM_K_FACTOR = 5.0
 PIM_MAX_DELTA = 75.0
 
 STATUS_WEIGHTS: Dict[str, float] = {
@@ -180,4 +180,3 @@ def compute_injury_impact_breakdown(
         "opp_team_impact": float(opp_team_impact),
         "delta_pim": float(delta),
     }
-

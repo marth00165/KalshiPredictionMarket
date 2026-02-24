@@ -16,8 +16,8 @@ from app.config import PIM_K_FACTOR, PIM_MAX_DELTA
 
 logger = logging.getLogger(__name__)
 
-MIN_ELO_DELTA = -75
-MAX_ELO_DELTA = 75
+MIN_ELO_DELTA = -int(round(PIM_MAX_DELTA))
+MAX_ELO_DELTA = int(round(PIM_MAX_DELTA))
 DEFAULT_HOME_COURT_BONUS = 100.0
 MODEL_DIVERGENCE_WARNING_THRESHOLD = 0.25
 

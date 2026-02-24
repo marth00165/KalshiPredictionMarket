@@ -827,18 +827,6 @@ class AdvancedTradingBot:
             persisted,
         )
 
-        try:
-            log_model_divergence_warning(
-                team=str(fields["team"]),
-                opponent=str(fields["opponent"]),
-                probability_final=float(fields["probability_final"]),
-                market_probability=float(fields["market_probability"]),
-                edge=float(fields["edge"]),
-            )
-        except Exception:
-            # Divergence warning is informational and must never break execution.
-            logger.debug("Failed to evaluate divergence warning for %s", signal.market.market_id)
-
     @staticmethod
     def _format_text_table(headers: List[str], rows: List[List[str]]) -> str:
         """Render a simple ASCII table for terminal output."""

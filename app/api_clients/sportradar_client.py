@@ -18,6 +18,7 @@ class SportsRadarConfig:
 
     api_key: Optional[str] = None
     base_url: str = "https://api.sportradar.com/nba/trial/v8/en"
+    max_retries: int = 0
 
 
 class SportsRadarClient(BaseAPIClient):
@@ -28,6 +29,7 @@ class SportsRadarClient(BaseAPIClient):
             platform_name="sportradar",
             api_key=config.api_key,
             base_url=config.base_url.rstrip("/"),
+            max_retries=max(0, int(config.max_retries)),
         )
         self.config = config
 
