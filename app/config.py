@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-PIM_K_FACTOR = 25.0
-PIM_MAX_DELTA = 75.0
+PIM_K_FACTOR = 5.0
+PIM_MAX_DELTA = 30.0
 
 
 # ============================================================================
@@ -100,6 +100,9 @@ class AnalysisConfig:
     injury_prompt_version: str = "injury-prompt-v1"
     force_injury_llm_refresh: bool = False
     injury_feed_cache_ttl_seconds: int = 120
+    injury_profile_cache_ttl_seconds: int = 14400
+    team_profile_budget_window_seconds: int = 120
+    max_team_profiles_per_cycle: int = 12
     pim_k_factor: float = PIM_K_FACTOR
     pim_max_delta: float = PIM_MAX_DELTA
     llm_adjustment_max_delta: float = 0.03
@@ -166,6 +169,12 @@ class AnalysisConfig:
             raise ValueError("near_tipoff_llm_stale_seconds must be >= 0")
         if self.injury_feed_cache_ttl_seconds < 1:
             raise ValueError("injury_feed_cache_ttl_seconds must be >= 1")
+        if self.injury_profile_cache_ttl_seconds < 1:
+            raise ValueError("injury_profile_cache_ttl_seconds must be >= 1")
+        if self.team_profile_budget_window_seconds < 1:
+            raise ValueError("team_profile_budget_window_seconds must be >= 1")
+        if self.max_team_profiles_per_cycle < 1:
+            raise ValueError("max_team_profiles_per_cycle must be >= 1")
         if self.pim_k_factor < 0:
             raise ValueError("pim_k_factor must be >= 0")
         if self.pim_max_delta < 0:
@@ -640,6 +649,9 @@ class ConfigManager:
             injury_prompt_version=analysis_raw.get('injury_prompt_version', 'injury-prompt-v1'),
             force_injury_llm_refresh=analysis_raw.get('force_injury_llm_refresh', False),
             injury_feed_cache_ttl_seconds=analysis_raw.get('injury_feed_cache_ttl_seconds', 120),
+            injury_profile_cache_ttl_seconds=analysis_raw.get('injury_profile_cache_ttl_seconds', 14400),
+            team_profile_budget_window_seconds=analysis_raw.get('team_profile_budget_window_seconds', 120),
+            max_team_profiles_per_cycle=analysis_raw.get('max_team_profiles_per_cycle', 12),
             pim_k_factor=analysis_raw.get('pim_k_factor', PIM_K_FACTOR),
             pim_max_delta=analysis_raw.get('pim_max_delta', PIM_MAX_DELTA),
             llm_adjustment_max_delta=analysis_raw.get('llm_adjustment_max_delta', 0.03),
@@ -1001,7 +1013,7 @@ class ConfigManager:
             f"mov={'on' if self.analysis.nba_elo_use_mov_multiplier else 'off'} | "
             f"min_season={self.analysis.nba_elo_min_season} | "
             f"allowed_seasons={self.analysis.nba_elo_allowed_seasons} | "
-            "llm_elo_delta_bounds=[-75,+75]"
+            f"llm_elo_delta_bounds=[-{int(self.analysis.pim_max_delta):d},+{int(self.analysis.pim_max_delta):d}]"
         )
         logger.info(
             "   Elo calibration: "
@@ -1017,6 +1029,8 @@ class ConfigManager:
             f"{'✅ enabled' if self.analysis.enable_live_injury_news else '❌ disabled'} | "
             f"cache={self.analysis.injury_cache_file} | "
             f"feed_ttl={self.analysis.injury_feed_cache_ttl_seconds}s | "
+            f"profile_ttl={self.analysis.injury_profile_cache_ttl_seconds}s | "
+            f"profile_budget={self.analysis.max_team_profiles_per_cycle}/{self.analysis.team_profile_budget_window_seconds}s | "
             f"llm_ttl={self.analysis.llm_refresh_max_age_seconds}s"
         )
         logger.info(
@@ -1246,6 +1260,9 @@ class ConfigManager:
                 'injury_prompt_version': self.analysis.injury_prompt_version,
                 'force_injury_llm_refresh': self.analysis.force_injury_llm_refresh,
                 'injury_feed_cache_ttl_seconds': self.analysis.injury_feed_cache_ttl_seconds,
+                'injury_profile_cache_ttl_seconds': self.analysis.injury_profile_cache_ttl_seconds,
+                'team_profile_budget_window_seconds': self.analysis.team_profile_budget_window_seconds,
+                'max_team_profiles_per_cycle': self.analysis.max_team_profiles_per_cycle,
                 'pim_k_factor': self.analysis.pim_k_factor,
                 'pim_max_delta': self.analysis.pim_max_delta,
                 'llm_adjustment_max_delta': self.analysis.llm_adjustment_max_delta,

@@ -12,7 +12,7 @@ from app.analytics.elo_calibration import (
     build_calibration_table,
     load_matchups_csv,
 )
-from app.api_clients.base_client import BaseAPIClient, APIError
+from app.api_clients.base_client import BaseAPIClient, APIError, RateLimitError
 from app.analysis.context_loader import load_context_json_block
 from app.analysis.injury_llm_cache import (
     InjuryLLMRefreshConfig,
@@ -118,6 +118,15 @@ class OpenAIAnalyzer:
                 injury_feed_cache_ttl_seconds=int(
                     getattr(self.config.analysis, "injury_feed_cache_ttl_seconds", 120)
                 ),
+                injury_profile_cache_ttl_seconds=int(
+                    getattr(self.config.analysis, "injury_profile_cache_ttl_seconds", 14400)
+                ),
+                team_profile_budget_window_seconds=int(
+                    getattr(self.config.analysis, "team_profile_budget_window_seconds", 120)
+                ),
+                max_team_profiles_per_cycle=int(
+                    getattr(self.config.analysis, "max_team_profiles_per_cycle", 12)
+                ),
             ),
             sportsradar_api_key=getattr(getattr(self.config, "api", None), "sportradar_api_key", None),
             sportsradar_base_url=str(
@@ -172,13 +181,36 @@ class OpenAIAnalyzer:
         nba_elo_context = self._get_nba_elo_context(market)
         injury_ctx: Optional[MarketInjuryContext] = None
         if nba_elo_context:
+            matchup_cache_key = self._injury_refresh.build_game_cache_key(
+                market_id=market.market_id,
+                series_ticker=getattr(market, "series_ticker", ""),
+                home_team=str(nba_elo_context["home_team"]),
+                away_team=str(nba_elo_context["away_team"]),
+            )
             injury_ctx = self._injury_refresh.build_context_for_market(
-                matchup_key=market.market_id,
+                matchup_key=matchup_cache_key,
+                legacy_matchup_key=market.market_id,
+                yes_team=str(nba_elo_context["yes_team"]),
                 home_team=str(nba_elo_context["home_team"]),
                 away_team=str(nba_elo_context["away_team"]),
                 end_date=market.end_date,
                 market_yes_price=float(market.yes_price),
             )
+            if injury_ctx.decision.reason == "rate_limited_no_cache":
+                estimate = self._build_elo_fallback_estimate(
+                    market,
+                    nba_elo_context,
+                    "sportsradar_rate_limited_no_cache",
+                )
+                self._attach_injury_cache_metadata(
+                    estimate=estimate,
+                    injury_ctx=injury_ctx,
+                    llm_source_tag="rate_limited_no_cache",
+                    refresh_reason=injury_ctx.decision.reason,
+                )
+                self._apply_elo_calibration(market, estimate, nba_elo_context)
+                self._log_elo_decision_fields(market, estimate)
+                return estimate
             if not injury_ctx.decision.should_refresh:
                 estimate = self._build_cached_delta_estimate(market, nba_elo_context, injury_ctx)
                 self._attach_injury_cache_metadata(
@@ -206,6 +238,32 @@ class OpenAIAnalyzer:
                     market=market,
                     estimate=estimate,
                     injury_ctx=injury_ctx,
+                )
+                self._apply_elo_calibration(market, estimate, nba_elo_context)
+                self._log_elo_decision_fields(market, estimate)
+                return estimate
+            except RateLimitError as e:
+                logger.warning(
+                    "SportsRadar rate limited for %s; reusing cache if available, otherwise Elo-only.",
+                    market.market_id,
+                )
+                if injury_ctx is not None and isinstance(injury_ctx.cache_entry, dict):
+                    estimate = self._build_cached_delta_estimate(market, nba_elo_context, injury_ctx)
+                    self._attach_injury_cache_metadata(
+                        estimate=estimate,
+                        injury_ctx=injury_ctx,
+                        llm_source_tag="cached",
+                        refresh_reason="rate_limited_cache_reuse",
+                    )
+                    self._apply_elo_calibration(market, estimate, nba_elo_context)
+                    self._log_elo_decision_fields(market, estimate)
+                    return estimate
+                estimate = self._build_elo_fallback_estimate(market, nba_elo_context, "sportsradar_rate_limited")
+                self._attach_injury_cache_metadata(
+                    estimate=estimate,
+                    injury_ctx=injury_ctx,
+                    llm_source_tag="rate_limited_no_cache",
+                    refresh_reason="rate_limited_no_cache",
                 )
                 self._apply_elo_calibration(market, estimate, nba_elo_context)
                 self._log_elo_decision_fields(market, estimate)
@@ -270,14 +328,16 @@ class OpenAIAnalyzer:
             yes_team_players=pim_inputs.get("yes_team_players", []),
             opp_team_players=pim_inputs.get("opp_team_players", []),
             injury_status_map=pim_inputs.get("injury_status_map", {}),
-            k_factor=float(getattr(self.config.analysis, "pim_k_factor", 25.0)),
+            k_factor=float(getattr(self.config.analysis, "pim_k_factor", 5.0)),
             max_delta=float(getattr(self.config.analysis, "pim_max_delta", 75.0)),
         )
         delta_pim = float(pim_summary.get("delta_pim", 0.0))
         considered_players = pim_inputs.get("considered_players", [])
+        low_minutes_filtered_players = pim_inputs.get("low_minutes_filtered_players", [])
         reason = (
             "Deterministic PIM injury adjustment from SportsRadar team/player profiles."
             f" impacted_players={len(considered_players)}."
+            f" filtered_low_minutes={len(low_minutes_filtered_players)}."
         )
         estimate = self._build_elo_estimate_from_delta(
             market=market,
@@ -296,7 +356,10 @@ class OpenAIAnalyzer:
                 "injury_report": {
                     "status": "confirmed",
                     "impact": "deterministic",
-                    "notes": f"considered_players={len(considered_players)}",
+                    "notes": (
+                        f"considered_players={len(considered_players)}; "
+                        f"filtered_low_minutes={len(low_minutes_filtered_players)}"
+                    ),
                 },
             },
         )
@@ -310,6 +373,8 @@ class OpenAIAnalyzer:
             "delta_pim": delta_pim,
         }
         elo_meta["pim_considered_players"] = considered_players
+        elo_meta["pim_low_minutes_filtered_players"] = low_minutes_filtered_players
+        elo_meta["pim_low_minutes_thresholds"] = pim_inputs.get("low_minutes_thresholds", {})
         metadata["elo_adjustment"] = elo_meta
         estimate.fusion_metadata = metadata
         return estimate
