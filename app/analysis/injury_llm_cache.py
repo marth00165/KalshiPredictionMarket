@@ -10,9 +10,9 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from app.api_clients.sportradar_client import SportsRadarClient, SportsRadarConfig
 
@@ -461,15 +461,100 @@ class InjuryLLMRefreshService:
         self._feed_payload: Dict[str, Any] = {}
         self._feed_updated_at: float = 0.0
         self._sportsradar_base_url = sportsradar_base_url
+        self._team_id_by_code: Dict[str, str] = {}
+        self._active_slate_team_codes: Optional[Set[str]] = None
         self._team_profile_cache: Dict[str, Dict[str, Any]] = {}
         self._team_profile_updated_at: Dict[str, float] = {}
+        self._team_profile_inflight: Dict[str, asyncio.Task] = {}
         self._player_profile_cache: Dict[str, Dict[str, Any]] = {}
         self._player_profile_updated_at: Dict[str, float] = {}
-        self._schedule_cache: Dict[str, Dict[str, Any]] = {}
-        self._schedule_updated_at: Dict[str, float] = {}
+        self._player_profile_inflight: Dict[str, asyncio.Task] = {}
 
         if self.config.enabled and not self.sportsradar_api_key:
             logger.warning("Live injury news enabled but SportsRadar API key missing; proceeding without feed.")
+
+    @staticmethod
+    def _is_nba_kalshi_market_id(market_id: str, series_ticker: object = "") -> bool:
+        series = str(series_ticker or "").strip().upper()
+        market = str(market_id or "").strip().upper()
+        return series == "KXNBAGAME" or market.startswith("KXNBAGAME-")
+
+    @classmethod
+    def _extract_team_codes_from_market_id(cls, market_id: str, series_ticker: object = "") -> Tuple[str, str]:
+        if not cls._is_nba_kalshi_market_id(market_id=market_id, series_ticker=series_ticker):
+            return ("", "")
+        parts = str(market_id or "").strip().upper().split("-")
+        if len(parts) < 2:
+            return ("", "")
+        matchup_chunk = parts[1]
+        if len(matchup_chunk) < 6:
+            return ("", "")
+        tail = matchup_chunk[-6:]
+        if not re.fullmatch(r"[A-Z]{6}", tail):
+            return ("", "")
+        away_team = normalize_team_code(tail[:3])
+        home_team = normalize_team_code(tail[3:])
+        if not away_team or not home_team:
+            return ("", "")
+        return (away_team, home_team)
+
+    @classmethod
+    def _extract_market_date_from_market_id(
+        cls,
+        market_id: str,
+        series_ticker: object = "",
+    ) -> Optional[date]:
+        if not cls._is_nba_kalshi_market_id(market_id=market_id, series_ticker=series_ticker):
+            return None
+        token = str(market_id or "").strip().upper()
+        match = re.search(r"-(\d{2}[A-Z]{3}\d{2})", token)
+        if not match:
+            return None
+        code = match.group(1).title()
+        try:
+            return datetime.strptime(code, "%y%b%d").date()
+        except Exception:
+            return None
+
+    def build_slate_team_set_from_markets(
+        self,
+        markets: Iterable[object],
+        *,
+        today_only: bool = True,
+    ) -> Set[str]:
+        team_set: Set[str] = set()
+        today_utc = datetime.now(timezone.utc).date()
+        for market in markets:
+            market_id = getattr(market, "market_id", "")
+            series_ticker = getattr(market, "series_ticker", "")
+            market_date = self._extract_market_date_from_market_id(
+                market_id=str(market_id),
+                series_ticker=series_ticker,
+            )
+            if today_only and market_date != today_utc:
+                continue
+            away_team, home_team = self._extract_team_codes_from_market_id(
+                market_id=str(market_id),
+                series_ticker=series_ticker,
+            )
+            if away_team:
+                team_set.add(away_team)
+            if home_team:
+                team_set.add(home_team)
+        return team_set
+
+    def _index_team_ids_from_injuries_payload(self, payload: Dict[str, Any]) -> None:
+        teams = payload.get("teams")
+        if not isinstance(teams, list):
+            return
+        for team in teams:
+            if not isinstance(team, dict):
+                continue
+            team_code = normalize_team_code(team.get("reference") or team.get("alias") or team.get("abbr"))
+            team_id = str(team.get("id") or "").strip()
+            if not team_code or not team_id:
+                continue
+            self._team_id_by_code[team_code] = team_id
 
     async def refresh_injury_feed_if_needed(self, *, force: bool = False) -> None:
         if not self.enabled:
@@ -496,6 +581,7 @@ class InjuryLLMRefreshService:
                 if isinstance(payload, dict):
                     self._feed_payload = payload
                     self._feed_updated_at = time.time()
+                    self._index_team_ids_from_injuries_payload(payload)
                     logger.info(
                         "Injury feed refreshed from SportsRadar (teams=%d)",
                         len(payload.get("teams") or []) if isinstance(payload.get("teams"), list) else 0,
@@ -515,110 +601,53 @@ class InjuryLLMRefreshService:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
 
-    def _parse_market_date_from_matchup_key(self, matchup_key: str) -> Optional[date]:
-        # Example market id: KXNBAGAME-26FEB23SACMEM-MEM
-        token = str(matchup_key or "").strip().upper()
-        match = re.search(r"-(\d{2}[A-Z]{3}\d{2})", token)
-        if not match:
-            return None
-        code = match.group(1).title()
-        try:
-            return datetime.strptime(code, "%y%b%d").date()
-        except Exception:
-            return None
-
-    def _candidate_schedule_dates(self, context: MarketInjuryContext) -> List[date]:
-        dates: List[date] = []
-        market_date = self._parse_market_date_from_matchup_key(context.matchup_key)
-        if isinstance(market_date, date):
-            dates.append(market_date)
-        if context.tipoff_time is not None:
-            tipoff_date = context.tipoff_time.astimezone(timezone.utc).date()
-            if tipoff_date not in dates:
-                dates.append(tipoff_date)
-            prev = tipoff_date - timedelta(days=1)
-            if prev not in dates:
-                dates.append(prev)
-        return dates
-
-    async def _get_schedule_payload(self, game_date: date) -> Dict[str, Any]:
-        key = game_date.isoformat()
-        ttl = max(int(self.config.injury_feed_cache_ttl_seconds), 1)
-        now = time.time()
-        cached = self._schedule_cache.get(key)
-        updated = self._schedule_updated_at.get(key, 0.0)
-        if isinstance(cached, dict) and (now - updated) < ttl:
-            return cached
-
-        client = SportsRadarClient(
-            SportsRadarConfig(
-                api_key=self.sportsradar_api_key,
-                base_url=self._sportsradar_base_url,
-            )
-        )
-        async with client:
-            payload = await client.fetch_daily_schedule(game_date)
-        if isinstance(payload, dict):
-            self._schedule_cache[key] = payload
-            self._schedule_updated_at[key] = now
-            return payload
-        return {}
-
     async def _resolve_team_profile_id(
         self,
         *,
         team_code: str,
-        context: MarketInjuryContext,
     ) -> Optional[str]:
         team_norm = normalize_team_code(team_code)
         if not team_norm:
             return None
 
-        teams = self._feed_payload.get("teams")
-        if isinstance(teams, list):
-            for team in teams:
-                if not isinstance(team, dict):
-                    continue
-                code = normalize_team_code(team.get("reference") or team.get("alias") or team.get("abbr"))
-                if code != team_norm:
-                    continue
-                team_id = str(team.get("id") or "").strip()
-                if team_id:
-                    return team_id
+        team_id = str(self._team_id_by_code.get(team_norm) or "").strip()
+        if team_id:
+            return team_id
+        self._index_team_ids_from_injuries_payload(self._feed_payload)
+        team_id = str(self._team_id_by_code.get(team_norm) or "").strip()
+        return team_id or None
 
-        for game_date in self._candidate_schedule_dates(context):
-            try:
-                sched = await self._get_schedule_payload(game_date)
-            except Exception as e:
-                logger.debug("Schedule lookup failed for %s: %s", game_date.isoformat(), e)
-                continue
-            games = sched.get("games")
-            if not isinstance(games, list):
-                continue
-            for game in games:
-                if not isinstance(game, dict):
-                    continue
-                for side in ("home", "away"):
-                    team_obj = game.get(side)
-                    if not isinstance(team_obj, dict):
-                        continue
-                    code = normalize_team_code(
-                        team_obj.get("alias") or team_obj.get("reference") or team_obj.get("abbr")
-                    )
-                    if code != team_norm:
-                        continue
-                    team_id = str(team_obj.get("id") or "").strip()
-                    if team_id:
-                        return team_id
-        return None
+    @staticmethod
+    def _team_code_from_profile_payload(payload: Dict[str, Any]) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        candidate = normalize_team_code(payload.get("reference") or payload.get("alias") or payload.get("abbr"))
+        if candidate:
+            return candidate
+        team_obj = payload.get("team")
+        if isinstance(team_obj, dict):
+            candidate = normalize_team_code(
+                team_obj.get("reference") or team_obj.get("alias") or team_obj.get("abbr")
+            )
+        return candidate
 
     async def _get_team_profile(
         self,
         *,
         team_code: str,
-        context: MarketInjuryContext,
     ) -> Dict[str, Any]:
-        team_id = await self._resolve_team_profile_id(team_code=team_code, context=context)
+        team_norm = normalize_team_code(team_code)
+        if not team_norm:
+            return {}
+        if self._active_slate_team_codes is not None and team_norm not in self._active_slate_team_codes:
+            team_id_cached = str(self._team_id_by_code.get(team_norm) or "").strip()
+            if team_id_cached:
+                cached_payload = self._team_profile_cache.get(team_id_cached)
+                if isinstance(cached_payload, dict) and cached_payload:
+                    return cached_payload
+            return {}
+
+        team_id = await self._resolve_team_profile_id(team_code=team_norm)
         if not team_id:
             return {}
 
@@ -629,17 +658,33 @@ class InjuryLLMRefreshService:
         if isinstance(cached, dict) and (now - updated) < ttl:
             return cached
 
-        client = SportsRadarClient(
-            SportsRadarConfig(
-                api_key=self.sportsradar_api_key,
-                base_url=self._sportsradar_base_url,
-            )
-        )
-        async with client:
-            payload = await client.fetch_team_profile(team_id)
+        inflight = self._team_profile_inflight.get(team_id)
+        if inflight is not None:
+            payload = await inflight
+        else:
+            async def _fetch() -> Dict[str, Any]:
+                client = SportsRadarClient(
+                    SportsRadarConfig(
+                        api_key=self.sportsradar_api_key,
+                        base_url=self._sportsradar_base_url,
+                    )
+                )
+                async with client:
+                    fetched = await client.fetch_team_profile(team_id)
+                return fetched if isinstance(fetched, dict) else {}
+
+            task = asyncio.create_task(_fetch())
+            self._team_profile_inflight[team_id] = task
+            try:
+                payload = await task
+            finally:
+                self._team_profile_inflight.pop(team_id, None)
         if isinstance(payload, dict):
             self._team_profile_cache[team_id] = payload
             self._team_profile_updated_at[team_id] = now
+            profile_team_code = self._team_code_from_profile_payload(payload)
+            if profile_team_code:
+                self._team_id_by_code[profile_team_code] = team_id
             return payload
         return {}
 
@@ -654,19 +699,48 @@ class InjuryLLMRefreshService:
         if isinstance(cached, dict) and (now - updated) < ttl:
             return cached
 
-        client = SportsRadarClient(
-            SportsRadarConfig(
-                api_key=self.sportsradar_api_key,
-                base_url=self._sportsradar_base_url,
-            )
-        )
-        async with client:
-            payload = await client.fetch_player_profile(player_id_norm)
+        inflight = self._player_profile_inflight.get(player_id_norm)
+        if inflight is not None:
+            payload = await inflight
+        else:
+            async def _fetch() -> Dict[str, Any]:
+                client = SportsRadarClient(
+                    SportsRadarConfig(
+                        api_key=self.sportsradar_api_key,
+                        base_url=self._sportsradar_base_url,
+                    )
+                )
+                async with client:
+                    fetched = await client.fetch_player_profile(player_id_norm)
+                return fetched if isinstance(fetched, dict) else {}
+
+            task = asyncio.create_task(_fetch())
+            self._player_profile_inflight[player_id_norm] = task
+            try:
+                payload = await task
+            finally:
+                self._player_profile_inflight.pop(player_id_norm, None)
         if isinstance(payload, dict):
             self._player_profile_cache[player_id_norm] = payload
             self._player_profile_updated_at[player_id_norm] = now
             return payload
         return {}
+
+    async def prime_for_markets(self, markets: Iterable[object]) -> None:
+        if not self.enabled:
+            return
+        team_codes = sorted(self.build_slate_team_set_from_markets(markets, today_only=True))
+        self._active_slate_team_codes = set(team_codes)
+        if not team_codes:
+            logger.info("SportsRadar slate prefetch skipped (no NBA teams detected for today's market slate)")
+            return
+        mapped = sum(1 for team in team_codes if team in self._team_id_by_code)
+        logger.info(
+            "SportsRadar slate prepared (teams=%d, mapped_ids=%d, cache_ttl=%ds; profiles fetched on-demand)",
+            len(team_codes),
+            mapped,
+            max(int(self.config.injury_feed_cache_ttl_seconds), 1),
+        )
 
     @staticmethod
     def _is_official_nba_roster_player(profile_player: Dict[str, Any]) -> bool:
@@ -733,12 +807,8 @@ class InjuryLLMRefreshService:
             }
         opp_team_code = away if yes_team_code == home else home
 
-        yes_profile_task = asyncio.create_task(
-            self._get_team_profile(team_code=yes_team_code, context=context)
-        )
-        opp_profile_task = asyncio.create_task(
-            self._get_team_profile(team_code=opp_team_code, context=context)
-        )
+        yes_profile_task = asyncio.create_task(self._get_team_profile(team_code=yes_team_code))
+        opp_profile_task = asyncio.create_task(self._get_team_profile(team_code=opp_team_code))
         yes_team_profile, opp_team_profile = await asyncio.gather(yes_profile_task, opp_profile_task)
 
         injury_status_map: Dict[str, str] = {}

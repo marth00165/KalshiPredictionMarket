@@ -129,6 +129,12 @@ class OpenAIAnalyzer:
         """Set optional runtime context block (e.g., prior analysis blurbs)."""
         self._runtime_context_block = str(context_text or "").strip()
 
+    async def prime_injury_inputs_for_markets(self, markets: List[MarketData]) -> None:
+        if not (self._elo_enabled and self._injury_refresh.enabled):
+            return
+        await self._injury_refresh.refresh_injury_feed_if_needed()
+        await self._injury_refresh.prime_for_markets(markets)
+
     async def analyze_market_batch(
         self,
         markets: List[MarketData],
@@ -148,6 +154,7 @@ class OpenAIAnalyzer:
             await asyncio.to_thread(self._ensure_elo_calibration_loaded)
         if self._elo_enabled and self._injury_refresh.enabled:
             await self._injury_refresh.refresh_injury_feed_if_needed()
+            await self._injury_refresh.prime_for_markets(markets)
 
         async with self.client:
             tasks = [self.analyze_single_market(m) for m in markets]
