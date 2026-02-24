@@ -221,6 +221,20 @@ class ClaudeAnalyzer:
         nba_elo_context = self._get_nba_elo_context(market)
         injury_ctx: Optional[MarketInjuryContext] = None
         if nba_elo_context:
+            if self._injury_refresh.enabled and not self._injury_refresh.is_market_for_current_date(
+                market_id=market.market_id,
+                series_ticker=getattr(market, "series_ticker", ""),
+            ):
+                estimate = self._build_elo_fallback_estimate(
+                    market,
+                    nba_elo_context,
+                    "outside_current_date_injury_scan_window",
+                    source_tag="date_filtered_no_scan",
+                )
+                self._apply_elo_calibration(market, estimate, nba_elo_context)
+                self._log_elo_decision_fields(market, estimate)
+                return estimate
+
             matchup_cache_key = self._injury_refresh.build_game_cache_key(
                 market_id=market.market_id,
                 series_ticker=getattr(market, "series_ticker", ""),
@@ -668,12 +682,13 @@ Think step-by-step and be thorough."""
         market: MarketData,
         elo_ctx: Dict[str, object],
         reason: str,
+        source_tag: str = "llm_refresh",
     ) -> FairValueEstimate:
         return build_shared_elo_fallback_estimate(
             market=market,
             elo_ctx=elo_ctx,
             reason=reason,
-            source_tag="llm_refresh",
+            source_tag=source_tag,
         )
 
     def _log_elo_decision_fields(self, market: MarketData, estimate: FairValueEstimate) -> None:

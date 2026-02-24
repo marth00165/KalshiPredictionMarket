@@ -809,6 +809,21 @@ class InjuryLLMRefreshService:
                 team_set.add(home_team)
         return team_set
 
+    def is_market_for_current_date(
+        self,
+        *,
+        market_id: str,
+        series_ticker: object = "",
+    ) -> bool:
+        """True when an NBA market maps to today's UTC date."""
+        market_date = self._extract_market_date_from_market_id(
+            market_id=str(market_id or ""),
+            series_ticker=series_ticker,
+        )
+        if market_date is None:
+            return False
+        return market_date == datetime.now(timezone.utc).date()
+
     @classmethod
     def build_game_cache_key(
         cls,
