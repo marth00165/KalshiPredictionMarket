@@ -22,6 +22,9 @@ class TradeSignal:
     position_size: float  # Dollar amount to invest in this trade
     expected_value: float  # Expected profit/loss in dollars
     reasoning: str  # Summary of why this trade is recommended
+    gross_edge: float = 0.0  # Gross edge before fee adjustment (YES perspective sign)
+    net_edge: float = 0.0  # Net edge after fee adjustment (YES perspective sign)
+    estimated_fee: float = 0.0  # Estimated fee in dollars for the order
     
     def __post_init__(self):
         """Validate trade signal after initialization"""

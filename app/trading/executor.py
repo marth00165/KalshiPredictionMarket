@@ -9,6 +9,7 @@ from datetime import datetime
 from app.models import TradeSignal
 from app.storage.db import DatabaseManager
 from app.api_clients.kalshi_client import KalshiClient
+from app.trading.fees import estimate_kalshi_fee_from_count
 from app.utils import (
     ConfigManager,
     ExecutionFailedError,
@@ -478,23 +479,13 @@ class TradeExecutor:
                     "status": "skipped_drift"
                 }
 
-            # 4. Revalidate edge
-            # edge = fair_value - latest_price (for buy_yes)
-            # edge = (1 - fair_value) - latest_price (for buy_no)
+            # 4. Revalidate net edge (gross edge minus estimated fee edge).
             if signal.action == 'buy_yes':
-                new_edge = signal.fair_value - latest_price
+                gross_side_edge = signal.fair_value - latest_price
             elif signal.action == 'buy_no':
-                new_edge = (1.0 - signal.fair_value) - latest_price
+                gross_side_edge = (1.0 - signal.fair_value) - latest_price
             else:
-                new_edge = signal.edge # fallback for sells
-
-            if new_edge < self.config.min_edge_at_execution:
-                return {
-                    "success": False,
-                    "error": f"Edge decayed below minimum: {new_edge:.3f} < {self.config.min_edge_at_execution}",
-                    "skipped": True,
-                    "status": "skipped_edge"
-                }
+                gross_side_edge = abs(float(signal.edge))  # fallback for sells
 
             # Price in cents
             price_cents = int(latest_price * 100)
@@ -520,6 +511,31 @@ class TradeExecutor:
 
             if count <= 0:
                 return {"success": False, "error": f"Calculated count is zero: size=${signal.position_size}, price={price_cents}c"}
+
+            submitted_notional = float(count) * float(submitted_price)
+            use_fee_aware_edge = bool(getattr(self.config.execution, "apply_kalshi_fees_to_edge", True))
+            kalshi_fee_rate = float(getattr(self.config.execution, "kalshi_fee_rate", 0.0))
+            estimated_fee = (
+                estimate_kalshi_fee_from_count(count, submitted_price, kalshi_fee_rate)
+                if use_fee_aware_edge
+                else 0.0
+            )
+            fee_edge_penalty = (
+                (estimated_fee / submitted_notional) if submitted_notional > 0 else 0.0
+            )
+            new_edge = gross_side_edge - fee_edge_penalty
+
+            if new_edge < self.config.min_edge_at_execution:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Net edge decayed below minimum: {new_edge:.3f} < "
+                        f"{self.config.min_edge_at_execution} "
+                        f"(gross={gross_side_edge:.3f}, fee_edge={fee_edge_penalty:.3f})"
+                    ),
+                    "skipped": True,
+                    "status": "skipped_edge"
+                }
 
             result = await self.kalshi_client.place_order(
                 ticker=signal.market.market_id,
@@ -548,8 +564,6 @@ class TradeExecutor:
             if filled_quantity > 0 and avg_fill_price <= 0:
                 avg_fill_price = latest_price
 
-            submitted_notional = float(count) * float(submitted_price)
-
             return {
                 "success": result.get("order_id") is not None,
                 "order_id": result.get("order_id"),
@@ -559,6 +573,9 @@ class TradeExecutor:
                 "submitted_price": submitted_price,
                 "submitted_quantity": float(count),
                 "submitted_notional": submitted_notional,
+                "estimated_fee": estimated_fee,
+                "gross_edge": gross_side_edge,
+                "net_edge": new_edge,
                 "raw": raw
             }
 
@@ -577,6 +594,9 @@ class TradeExecutor:
         logger.info(f"Fair Value: {signal.fair_value:.1%}")
         logger.info(f"Market Price: {signal.market_price:.1%}")
         logger.info(f"Edge: {signal.edge:+.1%}")
+        logger.info(f"Gross Edge: {signal.gross_edge:+.1%}")
+        logger.info(f"Net Edge: {signal.net_edge:+.1%}")
+        logger.info(f"Estimated Fee: ${signal.estimated_fee:,.2f}")
         logger.info(f"Kelly Fraction: {signal.kelly_fraction:.2%}")
         logger.info(f"Position Size: ${signal.position_size:,.2f}")
         logger.info(f"Expected Value: ${signal.expected_value:+,.2f}")

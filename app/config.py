@@ -423,6 +423,8 @@ class ExecutionConfig:
     max_price_drift: float = 0.05  # Absolute probability diff (5%)
     min_edge_at_execution: float = 0.02  # 2% minimum edge right before order
     max_submit_slippage: float = 0.10  # Absolute probability diff allowed at submit
+    apply_kalshi_fees_to_edge: bool = True
+    kalshi_fee_rate: float = 0.07
     pending_not_found_retries: int = 3
     pending_timeout_minutes: int = 30
     order_reconciliation_max_pages: int = 5
@@ -436,6 +438,8 @@ class ExecutionConfig:
             raise ValueError(f"min_edge_at_execution must be >= 0, got {self.min_edge_at_execution}")
         if self.max_submit_slippage < 0:
             raise ValueError(f"max_submit_slippage must be >= 0, got {self.max_submit_slippage}")
+        if not (0 <= self.kalshi_fee_rate <= 1):
+            raise ValueError(f"kalshi_fee_rate must be between 0 and 1, got {self.kalshi_fee_rate}")
         if self.pending_not_found_retries < 1:
             raise ValueError(f"pending_not_found_retries must be >= 1, got {self.pending_not_found_retries}")
         if self.pending_timeout_minutes < 1:
@@ -758,6 +762,8 @@ class ConfigManager:
             max_price_drift=execution_raw.get('max_price_drift', 0.05),
             min_edge_at_execution=execution_raw.get('min_edge_at_execution', 0.02),
             max_submit_slippage=execution_raw.get('max_submit_slippage', 0.10),
+            apply_kalshi_fees_to_edge=execution_raw.get('apply_kalshi_fees_to_edge', True),
+            kalshi_fee_rate=execution_raw.get('kalshi_fee_rate', 0.07),
             pending_not_found_retries=execution_raw.get('pending_not_found_retries', 3),
             pending_timeout_minutes=execution_raw.get('pending_timeout_minutes', 30),
             order_reconciliation_max_pages=execution_raw.get('order_reconciliation_max_pages', 5),
@@ -1060,6 +1066,11 @@ class ConfigManager:
         logger.info(f"   Min edge at execution: {self.execution.min_edge_at_execution:.1%}")
         logger.info(f"   Max submit slippage: {self.execution.max_submit_slippage:.1%}")
         logger.info(
+            "   Fee-aware edge: "
+            f"{'on' if self.execution.apply_kalshi_fees_to_edge else 'off'} | "
+            f"kalshi_fee_rate={self.execution.kalshi_fee_rate:.2%}"
+        )
+        logger.info(
             "   Pending reconcile: "
             f"retries={self.execution.pending_not_found_retries}, "
             f"timeout={self.execution.pending_timeout_minutes}m, "
@@ -1134,6 +1145,8 @@ class ConfigManager:
                 'max_price_drift': self.execution.max_price_drift,
                 'min_edge_at_execution': self.execution.min_edge_at_execution,
                 'max_submit_slippage': self.execution.max_submit_slippage,
+                'apply_kalshi_fees_to_edge': self.execution.apply_kalshi_fees_to_edge,
+                'kalshi_fee_rate': self.execution.kalshi_fee_rate,
                 'pending_not_found_retries': self.execution.pending_not_found_retries,
                 'pending_timeout_minutes': self.execution.pending_timeout_minutes,
                 'order_reconciliation_max_pages': self.execution.order_reconciliation_max_pages,

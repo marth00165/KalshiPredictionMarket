@@ -4,6 +4,7 @@ import logging
 from typing import List, Tuple, Optional, Set
 
 from app.models import MarketData, FairValueEstimate, TradeSignal
+from app.trading.fees import estimate_kalshi_fee_edge, estimate_kalshi_fee_from_count
 from app.utils import (
     ConfigManager,
     InsufficientCapitalError,
@@ -292,10 +293,31 @@ class Strategy:
         min_confidence = self.config.strategy.min_confidence
         
         for est in estimates:
-            if est.has_significant_edge(min_edge, min_confidence):
-                market = market_dict.get(est.market_id)
-                if market:
-                    opportunities.append((market, est))
+            market = market_dict.get(est.market_id)
+            if not market:
+                continue
+
+            confidence = float(est.effective_confidence)
+            if confidence < float(min_confidence):
+                continue
+
+            if est.is_buy_yes_signal():
+                market_price = float(market.yes_price)
+                probability_for_side = float(est.effective_probability)
+            else:
+                market_price = float(market.no_price)
+                probability_for_side = float(1.0 - est.effective_probability)
+
+            side_edge = probability_for_side - market_price
+            if (
+                str(market.platform).strip().lower() == "kalshi"
+                and getattr(self.config.execution, "apply_kalshi_fees_to_edge", True)
+            ):
+                fee_rate = float(getattr(self.config.execution, "kalshi_fee_rate", 0.0))
+                side_edge -= estimate_kalshi_fee_edge(market_price, fee_rate)
+
+            if side_edge >= float(min_edge):
+                opportunities.append((market, est))
         
         # Sort by edge * confidence (best opportunities first)
         opportunities.sort(
@@ -444,11 +466,40 @@ class Strategy:
             if estimate.is_buy_yes_signal():
                 action = 'buy_yes'
                 market_price = market.yes_price
-                probability_for_kelly = estimate.effective_probability
+                probability_for_side = estimate.effective_probability
             else:
                 action = 'buy_no'
                 market_price = market.no_price
-                probability_for_kelly = 1 - estimate.effective_probability
+                probability_for_side = 1 - estimate.effective_probability
+
+            use_fee_aware_edge = bool(
+                str(market.platform).strip().lower() == "kalshi"
+                and getattr(self.config.execution, "apply_kalshi_fees_to_edge", True)
+            )
+            kalshi_fee_rate = float(getattr(self.config.execution, "kalshi_fee_rate", 0.0))
+
+            gross_edge_side = float(probability_for_side) - float(market_price)
+            fee_edge_penalty = (
+                estimate_kalshi_fee_edge(market_price, kalshi_fee_rate)
+                if use_fee_aware_edge
+                else 0.0
+            )
+            net_edge_side = gross_edge_side - fee_edge_penalty
+
+            # Fee-aware minimum-edge gate in the traded side perspective.
+            if net_edge_side < float(min_edge):
+                logger.debug(
+                    "Skipping %s: net edge %.4f below min_edge %.4f (gross=%.4f fee=%.4f)",
+                    market.market_id,
+                    net_edge_side,
+                    float(min_edge),
+                    gross_edge_side,
+                    fee_edge_penalty,
+                )
+                continue
+
+            # Kelly uses a fee-adjusted effective probability.
+            probability_for_kelly = min(1.0, max(0.0, float(market_price) + net_edge_side))
 
             # Guardrail: avoid fading heavy favorites with buy_no unless
             # edge/confidence are materially stronger than baseline thresholds.
@@ -506,30 +557,45 @@ class Strategy:
                 )
                 continue
             
-            # Calculate expected value
-            probability = estimate.effective_probability
-            no_probability = 1 - probability
-            if estimate.is_buy_yes_signal():
-                # Buying YES at market_price
-                ev = (probability * (1 - market_price) - 
-                      (1 - probability) * market_price) * position_size
-            else:
-                # Buying NO at market_price
-                ev = (no_probability * (1 - market_price) - 
-                      (1 - no_probability) * market_price) * position_size
+            # Estimate expected fees based on approximate contract count.
+            estimated_count = int(position_size / max(0.01, market_price))
+            estimated_fee = (
+                estimate_kalshi_fee_from_count(estimated_count, market_price, kalshi_fee_rate)
+                if use_fee_aware_edge
+                else 0.0
+            )
+
+            # Keep EV formula consistent with existing strategy implementation,
+            # but deduct fee estimate so reported EV is net.
+            gross_ev = gross_edge_side * position_size
+            ev = gross_ev - estimated_fee
+            if ev <= 0:
+                logger.debug(
+                    "Skipping %s: net EV <= 0 after fees (gross_ev=%.4f fee=%.4f)",
+                    market.market_id,
+                    gross_ev,
+                    estimated_fee,
+                )
+                continue
+
+            signed_gross_edge = gross_edge_side if action == "buy_yes" else -gross_edge_side
+            signed_net_edge = net_edge_side if action == "buy_yes" else -net_edge_side
             
             # Create signal
             try:
                 signal = TradeSignal(
                     market=market,
                     action=action,
-                    fair_value=probability,
+                    fair_value=float(estimate.effective_probability),
                     market_price=market_price,
-                    edge=estimate.effective_edge,
+                    edge=signed_net_edge,
                     kelly_fraction=kelly_frac,
                     position_size=position_size,
                     expected_value=ev,
-                    reasoning=estimate.reasoning[:200] if estimate.reasoning else ""
+                    reasoning=estimate.reasoning[:200] if estimate.reasoning else "",
+                    gross_edge=signed_gross_edge,
+                    net_edge=signed_net_edge,
+                    estimated_fee=estimated_fee,
                 )
                 signals.append(signal)
                 seen_in_cycle.add(market_key)

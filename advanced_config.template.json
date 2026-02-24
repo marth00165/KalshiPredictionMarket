@@ -91,6 +91,13 @@
     "max_total_exposure_fraction": 0.80,
     "max_new_exposure_per_day_fraction": 0.80
   },
+  "execution": {
+    "max_price_drift": 0.05,
+    "min_edge_at_execution": 0.02,
+    "max_submit_slippage": 0.10,
+    "apply_kalshi_fees_to_edge": true,
+    "kalshi_fee_rate": 0.07
+  },
   "filters": {
     "min_volume": 1000,
     "min_liquidity": 500

@@ -284,6 +284,8 @@ def _build_safe_config_view(cfg: ConfigManager) -> dict:
             "max_price_drift": cfg.execution.max_price_drift,
             "min_edge_at_execution": cfg.execution.min_edge_at_execution,
             "max_submit_slippage": cfg.execution.max_submit_slippage,
+            "apply_kalshi_fees_to_edge": cfg.execution.apply_kalshi_fees_to_edge,
+            "kalshi_fee_rate": cfg.execution.kalshi_fee_rate,
             "pending_not_found_retries": cfg.execution.pending_not_found_retries,
             "pending_timeout_minutes": cfg.execution.pending_timeout_minutes,
             "order_reconciliation_max_pages": cfg.execution.order_reconciliation_max_pages,

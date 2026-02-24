@@ -896,7 +896,8 @@ class AdvancedTradingBot:
 
             signal = market.get("signal") or {}
             fair = analysis.get("effective_probability", analysis.get("estimated_probability"))
-            edge = analysis.get("effective_edge", analysis.get("edge"))
+            signal_edge = signal.get("edge")
+            edge = signal_edge if isinstance(signal_edge, (int, float)) else analysis.get("effective_edge", analysis.get("edge"))
             conf = analysis.get("effective_confidence", analysis.get("confidence"))
             yes_price = (market.get("prices") or {}).get("yes")
             size = signal.get("position_size")
@@ -1697,6 +1698,9 @@ class AdvancedTradingBot:
                     "fair_value": s.fair_value,
                     "market_price": s.market_price,
                     "edge": s.edge,
+                    "gross_edge": s.gross_edge,
+                    "net_edge": s.net_edge,
+                    "estimated_fee": s.estimated_fee,
                     "kelly_fraction": s.kelly_fraction,
                     "position_size": s.position_size,
                     "expected_value": s.expected_value,
