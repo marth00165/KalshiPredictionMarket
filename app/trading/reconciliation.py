@@ -9,6 +9,7 @@ import aiosqlite
 from app.api_clients.kalshi_client import KalshiClient
 from app.trading.position_manager import PositionManager
 from app.storage.db import DatabaseManager
+from app.utils.kalshi_utils import normalize_settlement_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -76,35 +77,7 @@ class ReconciliationManager:
         """
         Normalize settlement outcome to 'yes' or 'no' when determinable.
         """
-        # Direct textual fields first
-        direct_fields = (
-            market.get("result"),
-            market.get("outcome"),
-            market.get("settlement_result"),
-            market.get("winner"),
-            market.get("settlement"),
-        )
-        for raw in direct_fields:
-            norm = str(raw or "").strip().lower()
-            if norm in {"yes", "y", "true", "1"}:
-                return "yes"
-            if norm in {"no", "n", "false", "0"}:
-                return "no"
-
-        # Numeric settlement fields as fallback.
-        for key in ("settlement_price", "settle_price", "yes_settlement_price"):
-            val = market.get(key)
-            if val is None:
-                continue
-            try:
-                num = float(val)
-            except (TypeError, ValueError):
-                continue
-            if num > 1:
-                num = num / 100.0
-            if 0.0 <= num <= 1.0:
-                return "yes" if num >= 0.5 else "no"
-        return None
+        return normalize_settlement_outcome(market)
 
     async def _resolve_exit_price(self, ticker: str, side: str, fallback: float) -> float:
         """

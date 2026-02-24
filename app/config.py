@@ -314,6 +314,7 @@ class TradingConfig:
     non_interactive: Optional[bool] = None
     enforce_live_cash_check: bool = True
     require_scope_in_live: bool = True
+    shadow_decision_jsonl_path: str = "reports/trade_opportunities/opportunities.jsonl"
     allowed_market_ids: List[str] = field(default_factory=list)
     allowed_event_tickers: List[str] = field(default_factory=list)
     
@@ -321,6 +322,8 @@ class TradingConfig:
         """Validate trading configuration"""
         if self.initial_bankroll <= 0:
             raise ValueError(f"initial_bankroll must be > 0, got {self.initial_bankroll}")
+        if not str(self.shadow_decision_jsonl_path or "").strip():
+            raise ValueError("shadow_decision_jsonl_path cannot be empty")
 
 
 @dataclass
@@ -328,7 +331,10 @@ class StrategyConfig:
     """Configuration for trading strategy"""
     
     min_edge: float = 0.10  # 10% edge minimum
+    min_edge_net: float = 0.025  # 2.5% net edge minimum for shadow decisions
     min_confidence: float = 0.75  # 75% confidence minimum
+    enable_shadow_decision_logging: bool = True
+    log_all_opportunities: bool = True
     heavy_favorite_yes_price_threshold: float = 0.80
     heavy_favorite_buy_no_min_edge: float = 0.15
     heavy_favorite_buy_no_min_confidence: float = 0.85
@@ -337,6 +343,8 @@ class StrategyConfig:
         """Validate strategy configuration"""
         if not (0 <= self.min_edge <= 1):
             raise ValueError(f"min_edge must be between 0 and 1, got {self.min_edge}")
+        if not (0 <= self.min_edge_net <= 1):
+            raise ValueError(f"min_edge_net must be between 0 and 1, got {self.min_edge_net}")
         if not (0 <= self.min_confidence <= 1):
             raise ValueError(f"min_confidence must be between 0 and 1, got {self.min_confidence}")
         if not (0 <= self.heavy_favorite_yes_price_threshold <= 1):
@@ -425,6 +433,9 @@ class ExecutionConfig:
     max_submit_slippage: float = 0.10  # Absolute probability diff allowed at submit
     apply_kalshi_fees_to_edge: bool = True
     kalshi_fee_rate: float = 0.07
+    kalshi_taker_fee_pct: float = 0.0075
+    estimated_slippage_pct: float = 0.005
+    use_dynamic_slippage: bool = False
     pending_not_found_retries: int = 3
     pending_timeout_minutes: int = 30
     order_reconciliation_max_pages: int = 5
@@ -440,6 +451,14 @@ class ExecutionConfig:
             raise ValueError(f"max_submit_slippage must be >= 0, got {self.max_submit_slippage}")
         if not (0 <= self.kalshi_fee_rate <= 1):
             raise ValueError(f"kalshi_fee_rate must be between 0 and 1, got {self.kalshi_fee_rate}")
+        if not (0 <= self.kalshi_taker_fee_pct <= 1):
+            raise ValueError(
+                f"kalshi_taker_fee_pct must be between 0 and 1, got {self.kalshi_taker_fee_pct}"
+            )
+        if not (0 <= self.estimated_slippage_pct <= 1):
+            raise ValueError(
+                f"estimated_slippage_pct must be between 0 and 1, got {self.estimated_slippage_pct}"
+            )
         if self.pending_not_found_retries < 1:
             raise ValueError(f"pending_not_found_retries must be >= 1, got {self.pending_not_found_retries}")
         if self.pending_timeout_minutes < 1:
@@ -559,6 +578,10 @@ class ConfigManager:
             non_interactive=trading_raw.get('non_interactive'),
             enforce_live_cash_check=trading_raw.get('enforce_live_cash_check', True),
             require_scope_in_live=trading_raw.get('require_scope_in_live', True),
+            shadow_decision_jsonl_path=trading_raw.get(
+                'shadow_decision_jsonl_path',
+                "reports/trade_opportunities/opportunities.jsonl",
+            ),
             allowed_market_ids=trading_raw.get('allowed_market_ids', []),
             allowed_event_tickers=trading_raw.get('allowed_event_tickers', []),
         )
@@ -724,7 +747,10 @@ class ConfigManager:
         strategy_raw = raw_config.get('strategy', {})
         self.strategy = StrategyConfig(
             min_edge=strategy_raw.get('min_edge', 0.10),
+            min_edge_net=strategy_raw.get('min_edge_net', 0.025),
             min_confidence=strategy_raw.get('min_confidence', 0.75),
+            enable_shadow_decision_logging=strategy_raw.get('enable_shadow_decision_logging', True),
+            log_all_opportunities=strategy_raw.get('log_all_opportunities', True),
             heavy_favorite_yes_price_threshold=strategy_raw.get('heavy_favorite_yes_price_threshold', 0.80),
             heavy_favorite_buy_no_min_edge=strategy_raw.get('heavy_favorite_buy_no_min_edge', 0.15),
             heavy_favorite_buy_no_min_confidence=strategy_raw.get('heavy_favorite_buy_no_min_confidence', 0.85),
@@ -764,6 +790,12 @@ class ConfigManager:
             max_submit_slippage=execution_raw.get('max_submit_slippage', 0.10),
             apply_kalshi_fees_to_edge=execution_raw.get('apply_kalshi_fees_to_edge', True),
             kalshi_fee_rate=execution_raw.get('kalshi_fee_rate', 0.07),
+            kalshi_taker_fee_pct=execution_raw.get(
+                'kalshi_taker_fee_pct',
+                execution_raw.get('kalshi_fee_rate', 0.0075),
+            ),
+            estimated_slippage_pct=execution_raw.get('estimated_slippage_pct', 0.005),
+            use_dynamic_slippage=execution_raw.get('use_dynamic_slippage', False),
             pending_not_found_retries=execution_raw.get('pending_not_found_retries', 3),
             pending_timeout_minutes=execution_raw.get('pending_timeout_minutes', 30),
             order_reconciliation_max_pages=execution_raw.get('order_reconciliation_max_pages', 5),
@@ -1029,10 +1061,17 @@ class ConfigManager:
         logger.info(f"   Initial bankroll: ${self.trading.initial_bankroll:,.2f}")
         logger.info(f"   Mode: {'🏁 DRY RUN' if self.is_dry_run else '💸 LIVE TRADING'}")
         logger.info(f"   Enforce live cash check: {'✅' if self.trading.enforce_live_cash_check else '❌'}")
+        logger.info(f"   Shadow decision JSONL: {self.trading.shadow_decision_jsonl_path}")
         
         logger.info(f"\n📈 Strategy:")
         logger.info(f"   Min edge: {self.min_edge_percentage:.1f}%")
+        logger.info(f"   Min net edge (shadow): {self.strategy.min_edge_net:.1%}")
         logger.info(f"   Min confidence: {self.min_confidence_percentage:.1f}%")
+        logger.info(
+            "   Shadow decision logging: "
+            f"{'✅ enabled' if self.strategy.enable_shadow_decision_logging else '❌ disabled'} | "
+            f"log_all_opportunities={'yes' if self.strategy.log_all_opportunities else 'no'}"
+        )
         logger.info(
             "   Heavy-favorite buy_no guard: "
             f"yes>={self.strategy.heavy_favorite_yes_price_threshold:.1%} "
@@ -1069,6 +1108,12 @@ class ConfigManager:
             "   Fee-aware edge: "
             f"{'on' if self.execution.apply_kalshi_fees_to_edge else 'off'} | "
             f"kalshi_fee_rate={self.execution.kalshi_fee_rate:.2%}"
+        )
+        logger.info(
+            "   Shadow costs: "
+            f"taker_fee={self.execution.kalshi_taker_fee_pct:.2%} | "
+            f"slippage={self.execution.estimated_slippage_pct:.2%} | "
+            f"dynamic={'on' if self.execution.use_dynamic_slippage else 'off'}"
         )
         logger.info(
             "   Pending reconcile: "
@@ -1120,10 +1165,14 @@ class ConfigManager:
                 'initial_bankroll': self.trading.initial_bankroll,
                 'dry_run': self.trading.dry_run,
                 'enforce_live_cash_check': self.trading.enforce_live_cash_check,
+                'shadow_decision_jsonl_path': self.trading.shadow_decision_jsonl_path,
             },
             'strategy': {
                 'min_edge': self.strategy.min_edge,
+                'min_edge_net': self.strategy.min_edge_net,
                 'min_confidence': self.strategy.min_confidence,
+                'enable_shadow_decision_logging': self.strategy.enable_shadow_decision_logging,
+                'log_all_opportunities': self.strategy.log_all_opportunities,
                 'heavy_favorite_yes_price_threshold': self.strategy.heavy_favorite_yes_price_threshold,
                 'heavy_favorite_buy_no_min_edge': self.strategy.heavy_favorite_buy_no_min_edge,
                 'heavy_favorite_buy_no_min_confidence': self.strategy.heavy_favorite_buy_no_min_confidence,
@@ -1147,6 +1196,9 @@ class ConfigManager:
                 'max_submit_slippage': self.execution.max_submit_slippage,
                 'apply_kalshi_fees_to_edge': self.execution.apply_kalshi_fees_to_edge,
                 'kalshi_fee_rate': self.execution.kalshi_fee_rate,
+                'kalshi_taker_fee_pct': self.execution.kalshi_taker_fee_pct,
+                'estimated_slippage_pct': self.execution.estimated_slippage_pct,
+                'use_dynamic_slippage': self.execution.use_dynamic_slippage,
                 'pending_not_found_retries': self.execution.pending_not_found_retries,
                 'pending_timeout_minutes': self.execution.pending_timeout_minutes,
                 'order_reconciliation_max_pages': self.execution.order_reconciliation_max_pages,

@@ -75,11 +75,15 @@
   },
   "trading": {
     "initial_bankroll": 10000,
-    "dry_run": true
+    "dry_run": true,
+    "shadow_decision_jsonl_path": "reports/trade_opportunities/opportunities.jsonl"
   },
   "strategy": {
     "min_edge": 0.10,
+    "min_edge_net": 0.025,
     "min_confidence": 0.75,
+    "enable_shadow_decision_logging": true,
+    "log_all_opportunities": true,
     "heavy_favorite_yes_price_threshold": 0.80,
     "heavy_favorite_buy_no_min_edge": 0.15,
     "heavy_favorite_buy_no_min_confidence": 0.85
@@ -95,6 +99,9 @@
     "max_price_drift": 0.05,
     "min_edge_at_execution": 0.02,
     "max_submit_slippage": 0.10,
+    "kalshi_taker_fee_pct": 0.0075,
+    "estimated_slippage_pct": 0.005,
+    "use_dynamic_slippage": false,
     "apply_kalshi_fees_to_edge": true,
     "kalshi_fee_rate": 0.07
   },

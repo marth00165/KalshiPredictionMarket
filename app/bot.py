@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import json
+from dataclasses import asdict
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from pathlib import Path
@@ -16,6 +17,7 @@ from app.analysis.claude_analyzer import ClaudeAnalyzer
 from app.analysis import OpenAIAnalyzer
 from app.trading import PositionManager, Strategy, TradeExecutor
 from app.trading.engine import log_model_divergence_warning
+from app.trading.decision_engine import append_decision_jsonl, evaluate_opportunity
 from app.trading.bankroll_manager import BankrollManager
 from app.trading.reconciliation import ReconciliationManager
 from app.signals import SignalFusionService
@@ -768,6 +770,63 @@ class AdvancedTradingBot:
         }
         logger.info("TRADE_DECISION | %s", json.dumps(payload, sort_keys=True, default=str))
 
+    def _run_shadow_decision_logging(
+        self,
+        opportunities: List[tuple[MarketData, FairValueEstimate]],
+        market_rows_by_id: Dict[str, Dict[str, Any]],
+        report: Dict[str, Any],
+    ) -> None:
+        if not bool(getattr(self.config.strategy, "enable_shadow_decision_logging", True)):
+            return
+
+        decisions_path = str(
+            getattr(
+                self.config.trading,
+                "shadow_decision_jsonl_path",
+                "reports/trade_opportunities/opportunities.jsonl",
+            )
+        )
+        log_all = bool(getattr(self.config.strategy, "log_all_opportunities", True))
+
+        considered = 0
+        take_count = 0
+        skip_count = 0
+        reason_counts: Dict[str, int] = {}
+        persisted = 0
+
+        for market, est in opportunities:
+            record = evaluate_opportunity(market, est, self.config)
+            considered += 1
+            reason_counts[record.reason] = int(reason_counts.get(record.reason, 0)) + 1
+            if record.decision == "take":
+                take_count += 1
+            else:
+                skip_count += 1
+
+            row = market_rows_by_id.get(market.market_id)
+            if isinstance(row, dict):
+                row["shadow_decision"] = asdict(record)
+
+            if log_all or record.decision == "take":
+                append_decision_jsonl(record, decisions_path)
+                persisted += 1
+
+        report_counts = report.setdefault("counts", {})
+        report_counts["opportunities_considered"] = considered
+        report_counts["shadow_take_count"] = take_count
+        report_counts["shadow_skip_count"] = skip_count
+        report.setdefault("shadow_decisions", {})["skip_reasons"] = reason_counts
+        report.setdefault("shadow_decisions", {})["log_path"] = decisions_path
+        report.setdefault("shadow_decisions", {})["persisted_records"] = persisted
+
+        logger.info(
+            "Shadow decisions evaluated: considered=%d take=%d skip=%d persisted=%d",
+            considered,
+            take_count,
+            skip_count,
+            persisted,
+        )
+
         try:
             log_model_divergence_warning(
                 team=str(fields["team"]),
@@ -1104,7 +1163,18 @@ class AdvancedTradingBot:
                 "signal_fusion": self.signal_fusion_service.report_status(),
                 "strategy": {
                     "min_edge": self.config.strategy.min_edge,
+                    "min_edge_net": self.config.strategy.min_edge_net,
                     "min_confidence": self.config.strategy.min_confidence,
+                    "enable_shadow_decision_logging": self.config.strategy.enable_shadow_decision_logging,
+                    "log_all_opportunities": self.config.strategy.log_all_opportunities,
+                },
+                "execution": {
+                    "kalshi_taker_fee_pct": self.config.execution.kalshi_taker_fee_pct,
+                    "estimated_slippage_pct": self.config.execution.estimated_slippage_pct,
+                    "use_dynamic_slippage": self.config.execution.use_dynamic_slippage,
+                },
+                "trading": {
+                    "shadow_decision_jsonl_path": self.config.trading.shadow_decision_jsonl_path,
                 },
             },
             "counts": {
@@ -1113,6 +1183,9 @@ class AdvancedTradingBot:
                 "analyzed": 0,
                 "estimates": 0,
                 "opportunities": 0,
+                "opportunities_considered": 0,
+                "shadow_take_count": 0,
+                "shadow_skip_count": 0,
                 "signals": 0,
                 "skipped_duplicates": 0,
                 "executed": 0,
@@ -1120,6 +1193,11 @@ class AdvancedTradingBot:
             "api_cost": None,
             "markets": [],
             "signals": [],
+            "shadow_decisions": {
+                "skip_reasons": {},
+                "log_path": self.config.trading.shadow_decision_jsonl_path,
+                "persisted_records": 0,
+            },
             "errors": [],
         }
         
@@ -1157,6 +1235,7 @@ class AdvancedTradingBot:
                     "filters": evaluation,
                     "analysis": None,
                     "opportunity": None,
+                    "shadow_decision": None,
                     "signal": None,
                     "execution": None,
                 }
@@ -1295,7 +1374,18 @@ class AdvancedTradingBot:
                 },
                 "strategy": {
                     "min_edge": self.config.strategy.min_edge,
+                    "min_edge_net": self.config.strategy.min_edge_net,
                     "min_confidence": self.config.strategy.min_confidence,
+                    "enable_shadow_decision_logging": self.config.strategy.enable_shadow_decision_logging,
+                    "log_all_opportunities": self.config.strategy.log_all_opportunities,
+                },
+                "execution": {
+                    "kalshi_taker_fee_pct": self.config.execution.kalshi_taker_fee_pct,
+                    "estimated_slippage_pct": self.config.execution.estimated_slippage_pct,
+                    "use_dynamic_slippage": self.config.execution.use_dynamic_slippage,
+                },
+                "trading": {
+                    "shadow_decision_jsonl_path": self.config.trading.shadow_decision_jsonl_path,
                 },
                 "signal_fusion": self.signal_fusion_service.report_status(),
                 "risk": {
@@ -1312,6 +1402,9 @@ class AdvancedTradingBot:
                 "analyzed": 0,
                 "estimates": 0,
                 "opportunities": 0,
+                "opportunities_considered": 0,
+                "shadow_take_count": 0,
+                "shadow_skip_count": 0,
                 "signals": 0,
                 "skipped_duplicates": 0,
                 "executed": 0,
@@ -1319,6 +1412,11 @@ class AdvancedTradingBot:
             "api_cost": None,
             "markets": [],
             "signals": [],
+            "shadow_decisions": {
+                "skip_reasons": {},
+                "log_path": self.config.trading.shadow_decision_jsonl_path,
+                "persisted_records": 0,
+            },
             "errors": [],
         }
         
@@ -1392,6 +1490,7 @@ class AdvancedTradingBot:
                     "filters": evaluation,
                     "analysis": None,
                     "opportunity": None,
+                    "shadow_decision": None,
                     "signal": None,
                     "execution": None,
                 }
@@ -1635,6 +1734,12 @@ class AdvancedTradingBot:
                 filtered_opportunities.append((market, est))
                 seen_market_in_cycle.add(market_key)
                 seen_event_in_cycle.add(event_key)
+
+            self._run_shadow_decision_logging(
+                opportunities=filtered_opportunities,
+                market_rows_by_id=market_rows_by_id,
+                report=report,
+            )
             
             # Step 5: Generate trade signals
             logger.info("\n📐 Step 5: Calculating position sizes (Kelly)...")
